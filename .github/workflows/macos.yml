@@ -1,0 +1,66 @@
+name: macOS
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  cargo:
+    # Apple Silicon. `-latest` tracks the macOS users run and follows the
+    # repository's `ubuntu-latest`; an image migration is the breakage this job
+    # exists to catch.
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The image ships rustup with the current stable, which is also what
+      # nixpkgs-unstable builds the package with; this only refreshes it.
+      - name: Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Pull requests restore main's cache but never write their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo check
+        run: cargo check --all-targets --locked
+
+      - name: cargo test
+        run: cargo test --locked
+
+      # macOS lo0 carries only 127.0.0.1, so these fed_p1 tests are ignored on
+      # macOS. Hosted runners have passwordless sudo: add the aliases and run
+      # exactly those three. Other ignored tests stay skipped (Linux user
+      # namespaces, manual probes).
+      - name: lo0 aliases 127.0.0.2-17
+        run: |
+          for n in $(seq 2 17); do
+            sudo ifconfig lo0 alias "127.0.0.$n" up
+          done
+          ifconfig lo0
+
+      # A renamed test would match nothing and pass silently, so all three
+      # must be reported as passed.
+      - name: cargo test (fed_p1, loopback aliases)
+        shell: bash
+        run: |
+          cargo test --locked --test fed_p1 -- --ignored --exact \
+            test_n3_unauthenticated_socket_bound_leaves_slot_for_peer \
+            test_n7_mf6_tcp_peer_address_source \
+            test_n7_f5b_semaphore_bound | tee "$RUNNER_TEMP/fed_p1.log"
+          grep -q '^test result: ok\. 3 passed' "$RUNNER_TEMP/fed_p1.log"
