@@ -594,13 +594,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let addr: std::net::SocketAddr = fed_listen_addr
             .parse()
             .map_err(|e| format!("invalid --fed-listen address '{fed_listen_addr}': {e}"))?;
-        if addr.ip().is_unspecified() {
-            return Err(format!(
-                "unspecified address '{}' is forbidden for --fed-listen",
-                addr.ip()
-            )
-            .into());
-        }
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| format!("failed to bind federation listener on {fed_listen_addr}: {e}"))?;

@@ -3790,8 +3790,10 @@ async fn test_n7_f6_bind_fatal() {
     );
 }
 
+// Every peer authenticates by mTLS, so the federation listener may bind all interfaces; the host
+// firewall decides who can reach it.
 #[tokio::test]
-async fn test_n7_f6_unspecified_address_refused() {
+async fn test_n7_f6_unspecified_address_binds() {
     let tmp = TempDir::new().unwrap();
     let cert_file = tmp.path().join("cert.pem");
     let key_file = tmp.path().join("key.pem");
@@ -3803,14 +3805,14 @@ async fn test_n7_f6_unspecified_address_refused() {
     std::fs::write(&peers_file, "{}").unwrap();
 
     let bin = env!("CARGO_BIN_EXE_xmsg");
-    let output = std::process::Command::new(bin)
+    let mut child = std::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", tmp.path())
         .args([
             "serve",
             "--listen",
             "127.0.0.1:0",
             "--fed-listen",
-            "0.0.0.0:9999",
+            "0.0.0.0:0",
             "--peers-file",
             peers_file.to_str().unwrap(),
             "--fed-cert",
@@ -3822,17 +3824,39 @@ async fn test_n7_f6_unspecified_address_refused() {
             "--sessions-dir",
             tmp.path().join("sessions").to_str().unwrap(),
         ])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
 
+    // The bind is logged before the server starts serving; wait for it, or for the child to exit.
+    let (tx, rx) = std::sync::mpsc::channel();
+    for out in [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufRead::lines(std::io::BufReader::new(out)).map_while(Result::ok)
+            {
+                let _ = tx.send(line);
+            }
+        });
+    }
+    drop(tx);
+    let mut seen = Vec::new();
+    let bound = loop {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(line) if line.contains("bound federation mTLS listener") => break true,
+            Ok(line) => seen.push(line),
+            Err(_) => break false,
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
     assert!(
-        !output.status.success(),
-        "0.0.0.0 address must be refused for --fed-listen"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("unspecified address") && stderr.contains("forbidden"),
-        "Stderr must name unspecified address forbidden, got: {stderr}"
+        bound,
+        "0.0.0.0 must bind for --fed-listen; output: {seen:#?}"
     );
 }
 
