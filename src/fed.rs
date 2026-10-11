@@ -54,6 +54,14 @@ pub struct PeerConfig {
     pub principals: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub targets: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial: Option<String>,
+}
+
+impl PeerConfig {
+    pub fn is_outbound(&self) -> bool {
+        self.dial.as_deref() == Some("outbound")
+    }
 }
 
 pub(crate) fn target_matches_allowlist(
@@ -344,6 +352,10 @@ impl PeersMap {
         self.peers_by_name.keys()
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &PeerConfig)> {
+        self.peers_by_name.iter()
+    }
+
     pub fn values(&self) -> impl Iterator<Item = &PeerConfig> {
         self.peers_by_name.values()
     }
@@ -425,7 +437,7 @@ impl PeersMap {
             for k in obj.keys() {
                 match k.as_str() {
                     "name" | "address" | "pin" | "ca" | "identities" | "allow" | "from"
-                    | "leaf" | "principals" | "targets" => {}
+                    | "leaf" | "principals" | "targets" | "dial" => {}
                     other => {
                         return Err(format!(
                             "unknown field '{other}' in peer config for '{name}'"
@@ -562,6 +574,26 @@ impl PeersMap {
 
             let leaf = obj.get("leaf").and_then(|l| l.as_bool()).unwrap_or(false);
 
+            let dial: Option<String> = if let Some(d) = obj.get("dial") {
+                let s = d
+                    .as_str()
+                    .ok_or_else(|| format!("peer '{name}': 'dial' must be a string"))?;
+                if s != "outbound" {
+                    return Err(format!(
+                        "peer '{name}': invalid value '{s}' for 'dial': expected 'outbound'"
+                    ));
+                }
+                Some(s.to_string())
+            } else {
+                None
+            };
+
+            if leaf && dial.is_some() {
+                return Err(format!(
+                    "peer '{name}': cannot specify both 'leaf' and 'dial'"
+                ));
+            }
+
             let principals: Vec<String> = if let Some(pr) = obj.get("principals") {
                 let arr = pr
                     .as_array()
@@ -626,6 +658,7 @@ impl PeersMap {
                 leaf,
                 principals,
                 targets,
+                dial,
             };
             if let Some(anchors) = ca_anchors {
                 map.insert_with_anchors(peer_config, anchors)?;
@@ -1534,6 +1567,139 @@ pub fn build_fed_router(fed_state: Arc<FedState>) -> Router {
         .with_state(fed_state)
 }
 
+pub(crate) async fn deliver_to_resolved_target(
+    fed_state: &FedState,
+    target: &crate::http::ResolvedTarget,
+    from_name: &str,
+    message_id: &str,
+    body: &str,
+    origin: storage::SvcOrigin,
+) -> Result<(String, String, &'static str), AppError> {
+    match target {
+        crate::http::ResolvedTarget::Claude(session, socket_path) => {
+            let body_with_footer = format!(
+                "{body}\n\n[xmsg] message_id={message_id} — reply with the xmsg reply tool"
+            );
+            match inbox::encode_transport_line(from_name, &body_with_footer) {
+                Ok(line) => inbox::deliver_to_socket(socket_path, &line).await.map(|_| {
+                    (
+                        session.session_id.clone(),
+                        "claude".to_string(),
+                        "delivered",
+                    )
+                }),
+                Err(e) => Err(e),
+            }
+        }
+        crate::http::ResolvedTarget::Agy(session) => {
+            let has_creds = {
+                let store_lock = fed_state.agy_store.read().unwrap();
+                store_lock
+                    .get(&session.session_id)
+                    .or_else(|| {
+                        store_lock.values().find(|info| {
+                            info.conversation_id == session.session_id
+                                || session.name.as_deref() == Some(&info.conversation_id)
+                        })
+                    })
+                    .map(|info| info.has_credentials())
+                    .unwrap_or(false)
+            };
+
+            if has_creds {
+                crate::agy::deliver_agy(
+                    &fed_state.agy_config,
+                    &fed_state.agy_store,
+                    session,
+                    from_name,
+                    message_id,
+                    body,
+                )
+                .await
+                .map(|_| (session.session_id.clone(), "agy".to_string(), "delivered"))
+            } else {
+                let envelope_text = format!(
+                    "[xmsg] from={from_name} message_id={message_id} — reply with the xmsg reply tool\n\n{body}"
+                );
+                let agy_msg = storage::AgyPendingMessage {
+                    id: message_id.to_string(),
+                    session_id: session.session_id.clone(),
+                    created_at: storage::now_epoch_secs(),
+                    from_name: from_name.to_string(),
+                    bytes: body.len(),
+                    text: body.to_string(),
+                    envelope: envelope_text,
+                    delivered_at: None,
+                };
+                let db = fed_state
+                    .db
+                    .lock()
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                storage::insert_agy_message(&db, &agy_msg)
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                Ok((session.session_id.clone(), "agy".to_string(), "queued"))
+            }
+        }
+        crate::http::ResolvedTarget::Pi(session) => {
+            let envelope_text = format!(
+                "[xmsg] from={from_name} message_id={message_id} — reply with the xmsg reply tool\n\n{body}"
+            );
+            let pi_msg = storage::PiPendingMessage {
+                id: message_id.to_string(),
+                session_id: session.session_id.clone(),
+                created_at: storage::now_epoch_secs(),
+                from_name: from_name.to_string(),
+                bytes: body.len(),
+                text: body.to_string(),
+                envelope: envelope_text,
+                delivered_at: None,
+            };
+            let db = fed_state
+                .db
+                .lock()
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let inserted = storage::insert_pi_message(&db, &pi_msg)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            if !inserted {
+                return Err(AppError::ServiceUnavailable(
+                    "pi session message queue is full".to_string(),
+                ));
+            }
+            let _ = fed_state.pi_notify_tx.send(session.session_id.clone());
+            Ok((session.session_id.clone(), "pi".to_string(), "delivered"))
+        }
+        crate::http::ResolvedTarget::Svc(session) => {
+            let envelope_text = format!(
+                "[xmsg] from={from_name} message_id={message_id} — reply with the xmsg reply tool\n\n{body}"
+            );
+            let svc_msg = storage::SvcPendingMessage {
+                id: message_id.to_string(),
+                session_id: session.session_id.clone(),
+                created_at: storage::now_epoch_secs(),
+                from_name: from_name.to_string(),
+                bytes: body.len(),
+                text: body.to_string(),
+                envelope: envelope_text,
+                delivered_at: None,
+                origin,
+            };
+            let db = fed_state
+                .db
+                .lock()
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let inserted = storage::insert_svc_message(&db, &svc_msg)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            if !inserted {
+                return Err(AppError::ServiceUnavailable(
+                    "svc session message queue is full".to_string(),
+                ));
+            }
+            let _ = fed_state.svc_notify_tx.send(session.session_id.clone());
+            Ok((session.session_id.clone(), "svc".to_string(), "delivered"))
+        }
+    }
+}
+
 async fn fed_send_message_handler(
     State(fed_state): State<Arc<FedState>>,
     Extension(peer): Extension<Arc<AuthenticatedPeer>>,
@@ -1811,132 +1977,18 @@ async fn fed_send_message_handler(
     }
 
     // 8. Deliver to local target session
-    let deliver_res = match target {
-        crate::http::ResolvedTarget::Claude(session, socket_path) => {
-            let body_with_footer = format!(
-                "{}\n\n[xmsg] message_id={} — reply with the xmsg reply tool",
-                envelope.body, envelope.id
-            );
-            match inbox::encode_transport_line(&from_name, &body_with_footer) {
-                Ok(line) => inbox::deliver_to_socket(&socket_path, &line)
-                    .await
-                    .map(|_| (session.session_id, "claude".to_string(), "delivered")),
-                Err(e) => Err(e),
-            }
-        }
-        crate::http::ResolvedTarget::Agy(session) => {
-            let has_creds = {
-                let store_lock = fed_state.agy_store.read().unwrap();
-                store_lock
-                    .get(&session.session_id)
-                    .or_else(|| {
-                        store_lock.values().find(|info| {
-                            info.conversation_id == session.session_id
-                                || session.name.as_deref() == Some(&info.conversation_id)
-                        })
-                    })
-                    .map(|info| info.has_credentials())
-                    .unwrap_or(false)
-            };
-
-            if has_creds {
-                crate::agy::deliver_agy(
-                    &fed_state.agy_config,
-                    &fed_state.agy_store,
-                    &session,
-                    &from_name,
-                    &envelope.id,
-                    &envelope.body,
-                )
-                .await
-                .map(|_| (session.session_id, "agy".to_string(), "delivered"))
-            } else {
-                let envelope_text = format!(
-                    "[xmsg] from={} message_id={} — reply with the xmsg reply tool\n\n{}",
-                    from_name, envelope.id, envelope.body
-                );
-                let agy_msg = storage::AgyPendingMessage {
-                    id: envelope.id.clone(),
-                    session_id: session.session_id.clone(),
-                    created_at: storage::now_epoch_secs(),
-                    from_name: from_name.clone(),
-                    bytes: body_len,
-                    text: envelope.body.clone(),
-                    envelope: envelope_text,
-                    delivered_at: None,
-                };
-                let db = fed_state
-                    .db
-                    .lock()
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
-                storage::insert_agy_message(&db, &agy_msg)
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
-                Ok((session.session_id, "agy".to_string(), "queued"))
-            }
-        }
-        crate::http::ResolvedTarget::Pi(session) => {
-            let envelope_text = format!(
-                "[xmsg] from={} message_id={} — reply with the xmsg reply tool\n\n{}",
-                from_name, envelope.id, envelope.body
-            );
-            let pi_msg = storage::PiPendingMessage {
-                id: envelope.id.clone(),
-                session_id: session.session_id.clone(),
-                created_at: storage::now_epoch_secs(),
-                from_name: from_name.clone(),
-                bytes: body_len,
-                text: envelope.body.clone(),
-                envelope: envelope_text,
-                delivered_at: None,
-            };
-            let db = fed_state
-                .db
-                .lock()
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            let inserted = storage::insert_pi_message(&db, &pi_msg)
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            if !inserted {
-                return Err(AppError::ServiceUnavailable(
-                    "pi session message queue is full".to_string(),
-                ));
-            }
-            let _ = fed_state.pi_notify_tx.send(session.session_id.clone());
-            Ok((session.session_id, "pi".to_string(), "delivered"))
-        }
-        crate::http::ResolvedTarget::Svc(session) => {
-            let envelope_text = format!(
-                "[xmsg] from={} message_id={} — reply with the xmsg reply tool\n\n{}",
-                from_name, envelope.id, envelope.body
-            );
-            let svc_msg = storage::SvcPendingMessage {
-                id: envelope.id.clone(),
-                session_id: session.session_id.clone(),
-                created_at: storage::now_epoch_secs(),
-                from_name: from_name.clone(),
-                bytes: body_len,
-                text: envelope.body.clone(),
-                envelope: envelope_text,
-                delivered_at: None,
-                origin: storage::SvcOrigin::Fed {
-                    host: peer.name.clone(),
-                    principal: Some(envelope.principal.badge()),
-                },
-            };
-            let db = fed_state
-                .db
-                .lock()
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            let inserted = storage::insert_svc_message(&db, &svc_msg)
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            if !inserted {
-                return Err(AppError::ServiceUnavailable(
-                    "svc session message queue is full".to_string(),
-                ));
-            }
-            let _ = fed_state.svc_notify_tx.send(session.session_id.clone());
-            Ok((session.session_id, "svc".to_string(), "delivered"))
-        }
-    };
+    let deliver_res = deliver_to_resolved_target(
+        &fed_state,
+        &target,
+        &from_name,
+        &envelope.id,
+        &envelope.body,
+        storage::SvcOrigin::Fed {
+            host: peer.name.clone(),
+            principal: Some(envelope.principal.badge()),
+        },
+    )
+    .await;
 
     match deliver_res {
         Ok((target_session_id, _harness, outcome_str)) => {
@@ -1968,6 +2020,192 @@ async fn fed_send_message_handler(
             Err(err)
         }
     }
+}
+
+pub async fn deliver_federated_reply_locally(
+    fed_state: &FedState,
+    peer_name: &str,
+    in_reply_to: &str,
+    reply_id: &str,
+    replier_badge: &str,
+    text: &str,
+    ret_harness: &str,
+    ret_session_id: &str,
+) -> Result<&'static str, AppError> {
+    // Check if reply already inserted (idempotency)
+    let already_inserted = {
+        let db = fed_state
+            .db
+            .lock()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        storage::get_reply_by_pushed_id(&db, reply_id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .is_some()
+    };
+
+    if !already_inserted {
+        let db = fed_state
+            .db
+            .lock()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        storage::insert_reply(
+            &db,
+            in_reply_to,
+            ret_session_id,
+            text,
+            Some("accepted"),
+            Some(reply_id),
+        )
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+
+    let push_res = match ret_harness {
+        "claude" => {
+            match crate::registry::resolve_session(&fed_state.sessions_dir, ret_session_id) {
+                Ok((_session, socket_path)) => {
+                    if !socket_path.exists() {
+                        "sender_gone"
+                    } else {
+                        let body_with_header = format!(
+                            "[xmsg] reply to message_id={} — message_id={}; reply with the xmsg reply tool\n\n{}",
+                            in_reply_to, reply_id, text
+                        );
+                        match inbox::encode_transport_line(replier_badge, &body_with_header) {
+                            Ok(line) => match inbox::deliver_to_socket(&socket_path, &line).await {
+                                Ok(()) => "pushed",
+                                Err(_) => "push_failed",
+                            },
+                            Err(_) => "push_failed",
+                        }
+                    }
+                }
+                Err(_) => "sender_gone",
+            }
+        }
+        "agy" => {
+            let session_opt = crate::agy::resolve_agy_session(
+                &fed_state.agy_config,
+                &fed_state.agy_store,
+                ret_session_id,
+            )
+            .ok()
+            .flatten();
+            if let Some(session) = session_opt {
+                let envelope = format!(
+                    "[xmsg] reply to message_id={} — message_id={}; reply with the xmsg reply tool\n\n{}",
+                    in_reply_to, reply_id, text
+                );
+                match crate::agy::deliver_agy_envelope(
+                    &fed_state.agy_config,
+                    &fed_state.agy_store,
+                    &session,
+                    replier_badge,
+                    &envelope,
+                )
+                .await
+                {
+                    Ok(()) => "pushed",
+                    Err(AppError::Gone { .. }) | Err(AppError::CredentialsStale(_)) => {
+                        "sender_gone"
+                    }
+                    Err(_) => "push_failed",
+                }
+            } else {
+                "sender_gone"
+            }
+        }
+        "pi" => {
+            let session_opt = crate::pi::resolve_pi_session(
+                &fed_state.agy_config.proc_root,
+                &fed_state.pi_store,
+                ret_session_id,
+            )
+            .ok()
+            .flatten();
+            if let Some(session) = session_opt {
+                let envelope_text = format!(
+                    "[xmsg] reply to message_id={} from={} message_id={} — reply with the xmsg reply tool\n\n{}",
+                    in_reply_to, replier_badge, reply_id, text
+                );
+                let pi_msg = storage::PiPendingMessage {
+                    id: reply_id.to_string(),
+                    session_id: session.session_id.clone(),
+                    created_at: storage::now_epoch_secs(),
+                    from_name: replier_badge.to_string(),
+                    bytes: text.len(),
+                    text: text.to_string(),
+                    envelope: envelope_text,
+                    delivered_at: None,
+                };
+                if let Ok(db) = fed_state.db.lock() {
+                    let _ = storage::insert_pi_message(&db, &pi_msg);
+                    let _ = fed_state.pi_notify_tx.send(session.session_id.clone());
+                    "pushed"
+                } else {
+                    "push_failed"
+                }
+            } else {
+                "sender_gone"
+            }
+        }
+        "svc" => {
+            let session_opt = crate::svc::resolve_svc_session(
+                &fed_state.agy_config.proc_root,
+                &fed_state.svc_store,
+                ret_session_id,
+            )
+            .ok()
+            .flatten();
+            if let Some(session) = session_opt {
+                let envelope_text = format!(
+                    "[xmsg] reply to message_id={} from={} message_id={} — reply with the xmsg reply tool\n\n{}",
+                    in_reply_to, replier_badge, reply_id, text
+                );
+                let svc_msg = storage::SvcPendingMessage {
+                    id: reply_id.to_string(),
+                    session_id: session.session_id.clone(),
+                    created_at: storage::now_epoch_secs(),
+                    from_name: replier_badge.to_string(),
+                    bytes: text.len(),
+                    text: text.to_string(),
+                    envelope: envelope_text,
+                    delivered_at: None,
+                    origin: storage::SvcOrigin::Fed {
+                        host: peer_name.to_string(),
+                        principal: Some(replier_badge.to_string()),
+                    },
+                };
+                if let Ok(db) = fed_state.db.lock() {
+                    let inserted = storage::insert_svc_message(&db, &svc_msg).unwrap_or(false);
+                    if inserted {
+                        let _ = fed_state.svc_notify_tx.send(session.session_id.clone());
+                        "pushed"
+                    } else {
+                        "push_failed"
+                    }
+                } else {
+                    "push_failed"
+                }
+            } else {
+                "sender_gone"
+            }
+        }
+        _ => {
+            return Err(AppError::NotRecipient(format!(
+                "unknown recipient harness '{ret_harness}'"
+            )))
+        }
+    };
+
+    {
+        let db = fed_state
+            .db
+            .lock()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let _ = storage::update_reply_push_outcome(&db, reply_id, push_res);
+    }
+    let _ = fed_state.notify_tx.send(in_reply_to.to_string());
+    Ok(push_res)
 }
 
 async fn fed_reply_handler(
@@ -2073,182 +2311,20 @@ async fn fed_reply_handler(
     let ret_harness = orig_msg.return_harness.unwrap();
     let ret_session_id = orig_msg.return_session_id.unwrap();
 
-    if !matches!(ret_harness.as_str(), "claude" | "agy" | "pi") {
-        return Err(AppError::NotRecipient(format!(
-            "unknown recipient harness '{ret_harness}'"
-        )));
-    }
-
-    // Pre-record reply in replies table before delivering to local socket
-    {
-        let db = fed_state
-            .db
-            .lock()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        storage::insert_reply(
-            &db,
-            &reply.in_reply_to,
-            &ret_session_id,
-            &reply.text,
-            Some("accepted"),
-            Some(&reply.id),
-        )
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    }
-
-    // 5. Deliver pushed reply to local session
     let replier_badge =
         inbox::sanitize_attested_from(&peer.name, &reply.replier.harness, &reply.replier.name);
-    let push_res = match ret_harness.as_str() {
-        "claude" => {
-            match crate::registry::resolve_session(&fed_state.sessions_dir, &ret_session_id) {
-                Ok((_session, socket_path)) => {
-                    if !socket_path.exists() {
-                        "sender_gone"
-                    } else {
-                        let body_with_header = format!(
-                            "[xmsg] reply to message_id={} — message_id={}; reply with the xmsg reply tool\n\n{}",
-                            reply.in_reply_to, reply.id, reply.text
-                        );
-                        match inbox::encode_transport_line(&replier_badge, &body_with_header) {
-                            Ok(line) => match inbox::deliver_to_socket(&socket_path, &line).await {
-                                Ok(()) => "pushed",
-                                Err(_) => "push_failed",
-                            },
-                            Err(_) => "push_failed",
-                        }
-                    }
-                }
-                Err(_) => "sender_gone",
-            }
-        }
-        "agy" => {
-            let session_opt = crate::agy::resolve_agy_session(
-                &fed_state.agy_config,
-                &fed_state.agy_store,
-                &ret_session_id,
-            )
-            .ok()
-            .flatten();
-            if let Some(session) = session_opt {
-                let envelope = format!(
-                    "[xmsg] reply to message_id={} — message_id={}; reply with the xmsg reply tool\n\n{}",
-                    reply.in_reply_to, reply.id, reply.text
-                );
-                match crate::agy::deliver_agy_envelope(
-                    &fed_state.agy_config,
-                    &fed_state.agy_store,
-                    &session,
-                    &replier_badge,
-                    &envelope,
-                )
-                .await
-                {
-                    Ok(()) => "pushed",
-                    Err(AppError::Gone { .. }) | Err(AppError::CredentialsStale(_)) => {
-                        "sender_gone"
-                    }
-                    Err(_) => "push_failed",
-                }
-            } else {
-                "sender_gone"
-            }
-        }
-        "pi" => {
-            let session_opt = crate::pi::resolve_pi_session(
-                &fed_state.agy_config.proc_root,
-                &fed_state.pi_store,
-                &ret_session_id,
-            )
-            .ok()
-            .flatten();
-            if let Some(session) = session_opt {
-                let envelope_text = format!(
-                    "[xmsg] reply to message_id={} from={} message_id={} — reply with the xmsg reply tool\n\n{}",
-                    reply.in_reply_to, replier_badge, reply.id, reply.text
-                );
-                let pi_msg = storage::PiPendingMessage {
-                    id: reply.id.clone(),
-                    session_id: session.session_id.clone(),
-                    created_at: storage::now_epoch_secs(),
-                    from_name: replier_badge.clone(),
-                    bytes: reply.text.len(),
-                    text: reply.text.clone(),
-                    envelope: envelope_text,
-                    delivered_at: None,
-                };
-                if let Ok(db) = fed_state.db.lock() {
-                    let _ = storage::insert_pi_message(&db, &pi_msg);
-                    let _ = fed_state.pi_notify_tx.send(session.session_id.clone());
-                    "pushed"
-                } else {
-                    "push_failed"
-                }
-            } else {
-                "sender_gone"
-            }
-        }
-        "svc" => {
-            let session_opt = crate::svc::resolve_svc_session(
-                &fed_state.agy_config.proc_root,
-                &fed_state.svc_store,
-                &ret_session_id,
-            )
-            .ok()
-            .flatten();
-            if let Some(session) = session_opt {
-                let envelope_text = format!(
-                    "[xmsg] reply to message_id={} from={} message_id={} — reply with the xmsg reply tool\n\n{}",
-                    reply.in_reply_to, replier_badge, reply.id, reply.text
-                );
-                let svc_msg = storage::SvcPendingMessage {
-                    id: reply.id.clone(),
-                    session_id: session.session_id.clone(),
-                    created_at: storage::now_epoch_secs(),
-                    from_name: replier_badge.clone(),
-                    bytes: reply.text.len(),
-                    text: reply.text.clone(),
-                    envelope: envelope_text,
-                    delivered_at: None,
-                    origin: storage::SvcOrigin::Fed {
-                        host: peer.name.clone(),
-                        principal: Some(format!(
-                            "{}:{}",
-                            reply.replier.harness, reply.replier.name
-                        )),
-                    },
-                };
-                if let Ok(db) = fed_state.db.lock() {
-                    let inserted = storage::insert_svc_message(&db, &svc_msg).unwrap_or(false);
-                    if inserted {
-                        let _ = fed_state.svc_notify_tx.send(session.session_id.clone());
-                        "pushed"
-                    } else {
-                        "push_failed"
-                    }
-                } else {
-                    "push_failed"
-                }
-            } else {
-                "sender_gone"
-            }
-        }
-        _ => {
-            return Err(AppError::NotRecipient(format!(
-                "unknown recipient harness '{ret_harness}'"
-            )))
-        }
-    };
 
-    // 6. Update reply outcome in replies table and notify subscribers
-    {
-        let db = fed_state
-            .db
-            .lock()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        let _ = storage::update_reply_push_outcome(&db, &reply.id, push_res);
-    }
-    let _ = fed_state.notify_tx.send(reply.in_reply_to.clone());
+    let push_res = deliver_federated_reply_locally(
+        &fed_state,
+        &peer.name,
+        &reply.in_reply_to,
+        &reply.id,
+        &replier_badge,
+        &reply.text,
+        &ret_harness,
+        &ret_session_id,
+    )
+    .await?;
 
     Ok((
         StatusCode::OK,
@@ -3256,6 +3332,302 @@ pub async fn ack_federated_inbox(
     tokio::time::timeout(timeout_duration, ack_fut)
         .await
         .map_err(|_| AppError::PeerUnreachable("ack request timed out".to_string()))?
+}
+
+pub fn spawn_outbound_reply_poller(
+    fed_state: Arc<FedState>,
+    peer_name: String,
+    message_id: String,
+) {
+    tokio::spawn(async move {
+        let mut after_seq = 0i64;
+        let mut backoff_millis = 100u64;
+        let max_backoff_millis = 2000u64;
+        let wait_secs = 5u64;
+        let max_iterations = 60;
+
+        for _ in 0..max_iterations {
+            match poll_federated_replies(&fed_state, &peer_name, &message_id, after_seq, wait_secs)
+                .await
+            {
+                Ok(replies) => {
+                    backoff_millis = 100;
+                    let mut should_stop = false;
+
+                    for r in replies {
+                        after_seq = after_seq.max(r.seq);
+
+                        let orig_msg = {
+                            if let Ok(db) = fed_state.db.lock() {
+                                storage::get_message(&db, &message_id).unwrap_or(None)
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some(orig) = orig_msg {
+                            if let (Some(ret_harness), Some(ret_session_id)) =
+                                (orig.return_harness, orig.return_session_id)
+                            {
+                                let reply_id = r
+                                    .pushed_message_id
+                                    .unwrap_or_else(|| format!("{}-{}", message_id, r.seq));
+                                let replier_badge =
+                                    format!("xmsg@{peer_name} · {}", r.replier_session_id);
+
+                                match deliver_federated_reply_locally(
+                                    &fed_state,
+                                    &peer_name,
+                                    &message_id,
+                                    &reply_id,
+                                    &replier_badge,
+                                    &r.text,
+                                    &ret_harness,
+                                    &ret_session_id,
+                                )
+                                .await
+                                {
+                                    Ok("sender_gone") => {
+                                        should_stop = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    if should_stop {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Outbound reply poller error for message {message_id} on {peer_name}: {e}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_millis)).await;
+                    backoff_millis = (backoff_millis * 2).min(max_backoff_millis);
+                }
+            }
+        }
+    });
+}
+
+pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: String) {
+    info!(peer = %peer_name, "starting outbound link pull loop");
+    let mut backoff_millis = 100u64;
+    let max_backoff_millis = 5000u64;
+    let wait_secs = 30u64;
+
+    loop {
+        match get_federated_inbox(&fed_state, &peer_name, wait_secs).await {
+            Ok(Some(msg)) => {
+                backoff_millis = 100;
+
+                // Idempotency: if message already processed, just ack and continue
+                let already_processed = {
+                    if let Ok(db) = fed_state.db.lock() {
+                        storage::get_message(&db, &msg.id).unwrap_or(None).is_some()
+                    } else {
+                        false
+                    }
+                };
+
+                if already_processed {
+                    let mut ack_backoff = 100u64;
+                    loop {
+                        match ack_federated_inbox(&fed_state, &peer_name, &msg.id).await {
+                            Ok(()) => break,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to ack duplicate message {} to hub {}: {e}, retrying",
+                                    msg.id,
+                                    peer_name
+                                );
+                                tokio::time::sleep(Duration::from_millis(ack_backoff)).await;
+                                ack_backoff = (ack_backoff * 2).min(5000);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                let target_ref = msg.to.as_deref().unwrap_or("");
+                let ret_host = match &msg.origin {
+                    storage::SvcOrigin::Fed { host, .. } => host.clone(),
+                    _ => peer_name.clone(),
+                };
+                let from_name = match &msg.origin {
+                    storage::SvcOrigin::Fed { host, principal } => match principal {
+                        Some(p) => format!("xmsg@{host} · {p}"),
+                        None => format!("xmsg@{host}"),
+                    },
+                    _ => format!("xmsg@{peer_name}"),
+                };
+
+                let resolved = resolve_target_session_fed(&fed_state, target_ref);
+
+                match resolved {
+                    Ok(target) => {
+                        let deliver_res = deliver_to_resolved_target(
+                            &fed_state,
+                            &target,
+                            &from_name,
+                            &msg.id,
+                            &msg.body,
+                            msg.origin.clone(),
+                        )
+                        .await;
+
+                        let (target_session_id, recipient_harness, outcome_str) = match deliver_res
+                        {
+                            Ok((sess_id, harness, outcome)) => (sess_id, harness, outcome),
+                            Err(e) => {
+                                let outcome = match &e {
+                                    AppError::Gone { .. } => "gone",
+                                    AppError::NotFound(_) => "not_found",
+                                    AppError::Ambiguous(_) => "ambiguous",
+                                    _ => "failed",
+                                };
+                                (target_ref.to_string(), "system".to_string(), outcome)
+                            }
+                        };
+
+                        let (return_harness, return_session_id) = match &msg.origin {
+                            storage::SvcOrigin::Fed {
+                                principal: Some(p), ..
+                            } => {
+                                if let Some((h, s)) = p.split_once(':') {
+                                    (Some(h.to_string()), Some(s.to_string()))
+                                } else {
+                                    (Some("claude".to_string()), Some(p.clone()))
+                                }
+                            }
+                            _ => (None, None),
+                        };
+
+                        let msg_record = storage::MessageRecord {
+                            id: msg.id.clone(),
+                            created_at: storage::now_epoch_secs(),
+                            session_id: target_session_id,
+                            from_name: from_name.clone(),
+                            bytes: msg.body.len(),
+                            outcome: outcome_str.to_string(),
+                            recipient_harness,
+                            return_harness,
+                            return_session_id,
+                            push_replies: true,
+                            thread_id: msg.id.clone(),
+                            return_host: Some(ret_host.clone()),
+                        };
+
+                        if let Ok(db) = fed_state.db.lock() {
+                            let _ = storage::insert_message(&db, &msg_record);
+                        }
+
+                        let mut ack_backoff = 100u64;
+                        loop {
+                            match ack_federated_inbox(&fed_state, &peer_name, &msg.id).await {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to ack message {} to hub {}: {e}, retrying",
+                                        msg.id,
+                                        peer_name
+                                    );
+                                    tokio::time::sleep(Duration::from_millis(ack_backoff)).await;
+                                    ack_backoff = (ack_backoff * 2).min(5000);
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "message {} target '{target_ref}' unresolvable ({err}); sending error reply and acking at hub",
+                            msg.id
+                        );
+
+                        let detail = match &err {
+                            AppError::NotFound(r) => format!("no live session matches '{r}'"),
+                            AppError::Gone { session_id, pid } => {
+                                format!("session {session_id} process {pid} exited")
+                            }
+                            AppError::Ambiguous(d) => d.clone(),
+                            _ => format!("no live session matches '{target_ref}'"),
+                        };
+
+                        let reply_text = serde_json::json!({
+                            "error": "not_found",
+                            "detail": detail,
+                        })
+                        .to_string();
+
+                        let replier = FedReplier {
+                            harness: "svc".to_string(),
+                            session_id: "system".to_string(),
+                            name: "system".to_string(),
+                        };
+
+                        let reply_envelope = FedReplyEnvelope {
+                            v: 1,
+                            id: ulid::Ulid::new().to_string(),
+                            in_reply_to: msg.id.clone(),
+                            replier,
+                            text: reply_text,
+                            created_at: storage::now_epoch_secs(),
+                        };
+
+                        let _ = send_federated_reply(&fed_state, &ret_host, &reply_envelope).await;
+
+                        let msg_record = storage::MessageRecord {
+                            id: msg.id.clone(),
+                            created_at: storage::now_epoch_secs(),
+                            session_id: target_ref.to_string(),
+                            from_name: from_name.clone(),
+                            bytes: msg.body.len(),
+                            outcome: "not_found".to_string(),
+                            recipient_harness: "system".to_string(),
+                            return_harness: None,
+                            return_session_id: None,
+                            push_replies: false,
+                            thread_id: msg.id.clone(),
+                            return_host: Some(ret_host.clone()),
+                        };
+
+                        if let Ok(db) = fed_state.db.lock() {
+                            let _ = storage::insert_message(&db, &msg_record);
+                        }
+
+                        let mut ack_backoff = 100u64;
+                        loop {
+                            match ack_federated_inbox(&fed_state, &peer_name, &msg.id).await {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to ack unresolvable message {} to hub {}: {e}, retrying",
+                                        msg.id,
+                                        peer_name
+                                    );
+                                    tokio::time::sleep(Duration::from_millis(ack_backoff)).await;
+                                    ack_backoff = (ack_backoff * 2).min(5000);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                backoff_millis = 100;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Outbound pull loop error from hub {}: {e}, retrying in {backoff_millis}ms",
+                    peer_name
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_millis)).await;
+                backoff_millis = (backoff_millis * 2).min(max_backoff_millis);
+            }
+        }
+    }
 }
 
 pub async fn list_federated_sessions(

@@ -259,6 +259,7 @@ async fn test_oracle_1_attested_cross_host_send() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         None,
         Some((cert_a, key_a, pin_a.clone())),
@@ -279,6 +280,7 @@ async fn test_oracle_1_attested_cross_host_send() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         Some(fed_listener_b),
         Some((cert_b, key_b, pin_b)),
@@ -343,6 +345,7 @@ async fn test_oracle_2_reply_pushed_back_and_recorded() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         Some(fed_listener_a),
         Some((cert_a, key_a, pin_a.clone())),
@@ -363,6 +366,7 @@ async fn test_oracle_2_reply_pushed_back_and_recorded() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         Some(fed_listener_b),
         Some((cert_b, key_b, pin_b)),
@@ -487,6 +491,7 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -524,6 +529,7 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -572,6 +578,7 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -609,6 +616,7 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -670,6 +678,7 @@ async fn test_oracle_2_from_absent_pin_only_accepted() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -707,6 +716,7 @@ async fn test_oracle_2_from_absent_pin_only_accepted() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -793,6 +803,7 @@ async fn test_oracle_4_reply_route_source_check() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -838,6 +849,7 @@ async fn test_oracle_4_reply_route_source_check() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -940,6 +952,7 @@ async fn test_oracle_5_host_field_in_body_rejected() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -1011,6 +1024,7 @@ async fn test_oracle_6_anonymous_from_with_colon_gives_400() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -1046,6 +1060,7 @@ async fn test_oracle_6_anonymous_from_with_colon_gives_400() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -1101,6 +1116,7 @@ async fn test_oracle_7_root_harness_rejected_and_badge_spoof_sanitized() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -1121,6 +1137,7 @@ async fn test_oracle_7_root_harness_rejected_and_badge_spoof_sanitized() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -1217,6 +1234,7 @@ async fn test_n4_attested_name_ascii_only_u0387() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -1237,6 +1255,7 @@ async fn test_n4_attested_name_ascii_only_u0387() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -1306,6 +1325,7 @@ async fn test_oracle_8_no_forward_rejected() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -1326,6 +1346,7 @@ async fn test_oracle_8_no_forward_rejected() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -1396,6 +1417,7 @@ async fn test_oracle_9_forged_reply_id_gives_403() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -1416,6 +1438,7 @@ async fn test_oracle_9_forged_reply_id_gives_403() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -1533,6 +1556,7 @@ async fn test_oracle_10_duplicate_id_delivered_once() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -1553,6 +1577,7 @@ async fn test_oracle_10_duplicate_id_delivered_once() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -1640,6 +1665,7 @@ async fn test_oracle_11_rate_limit_429() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -1660,6 +1686,7 @@ async fn test_oracle_11_rate_limit_429() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -1753,6 +1780,7 @@ async fn test_oracle_12_router_isolation() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -1818,6 +1846,7 @@ async fn test_amendment_a_peer_without_send_gets_403_op_denied() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -1838,6 +1867,7 @@ async fn test_amendment_a_peer_without_send_gets_403_op_denied() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -2033,6 +2063,7 @@ exit 0
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         None,
         Some((cert_b, key_b, pin_b)),
@@ -2071,6 +2102,7 @@ exit 0
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         None,
         Some((cert_a, key_a, pin_a)),
@@ -2193,6 +2225,7 @@ fn make_client_fed_state(
                     leaf: false,
                     principals: principals.into_iter().map(String::from).collect(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -2241,6 +2274,7 @@ async fn test_f2_anon_origin_reply_refused() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -2319,6 +2353,7 @@ async fn test_f2_push_replies_false_refused() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -2396,6 +2431,7 @@ async fn test_f2_unknown_harness_refused() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -2477,6 +2513,7 @@ async fn test_f3_http_origin_federated_send() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -2495,6 +2532,7 @@ async fn test_f3_http_origin_federated_send() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         None,
         Some((cert_a, key_a, pin_a)),
@@ -2544,6 +2582,7 @@ async fn test_f4_empty_allow_pin_refused_at_handshake() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -2590,6 +2629,7 @@ async fn test_f4_one_way_link() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -2608,6 +2648,7 @@ async fn test_f4_one_way_link() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         None,
         Some((cert_a, key_a, pin_a)),
@@ -2746,6 +2787,7 @@ async fn test_f8_verbatim_remote_outcome_relay_and_dedup() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -2814,6 +2856,7 @@ async fn test_f9_kind_qualified_principal_filter() {
             leaf: false,
             principals: vec!["svc:matrix".to_string(), "anon:genie".to_string()],
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -2949,6 +2992,7 @@ async fn test_f10_reply_deduplication_and_rate_limit() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -3065,6 +3109,7 @@ async fn test_oracle_server_pin_verified() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -3139,6 +3184,7 @@ async fn test_oracle_reply_allow_check() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         None,
         Some((cert_a.clone(), key_a.clone(), pin_a.clone())),
@@ -3249,6 +3295,7 @@ async fn test_n1_offsource_replay_known_reply_id_rejected() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -3317,6 +3364,7 @@ async fn test_n1_offsource_flood_leaves_legit_bucket_intact() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -3336,6 +3384,7 @@ async fn test_n1_offsource_flood_leaves_legit_bucket_intact() {
                     leaf: false,
                     principals: Vec::new(),
                     targets: None,
+                    dial: None,
                 },
             )]
             .into_iter()
@@ -3454,6 +3503,7 @@ async fn test_n2_idle_authenticated_connection_closed_within_timeout() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -3497,6 +3547,7 @@ async fn test_n3_unauthenticated_socket_bound_leaves_slot_for_peer() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;
@@ -3638,6 +3689,7 @@ async fn test_n7_mf6_tcp_peer_address_source() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
     )
     .await;

@@ -286,6 +286,7 @@ async fn test_oracle_1_outbound_presents_reloaded_cert() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         },
     );
     let mut b_ca_map = HashMap::new();
@@ -310,6 +311,7 @@ async fn test_oracle_1_outbound_presents_reloaded_cert() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         },
     );
     let mut a_ca_map = HashMap::new();
@@ -380,6 +382,7 @@ async fn test_oracle_2_peer_ca_bundle_reload_refuses_old_ca() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         },
     );
     let mut a_ca_map = HashMap::new();
@@ -404,6 +407,7 @@ async fn test_oracle_2_peer_ca_bundle_reload_refuses_old_ca() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         },
     );
     let mut b_ca_map = HashMap::new();
@@ -477,6 +481,7 @@ async fn test_oracle_3_garbage_cert_preserves_old_config() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         },
     );
     let mut b_ca_map = HashMap::new();
@@ -500,6 +505,7 @@ async fn test_oracle_3_garbage_cert_preserves_old_config() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         },
     );
     let mut a_ca_map = HashMap::new();

@@ -1,0 +1,817 @@
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tempfile::{tempdir, TempDir};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{UnixListener, UnixStream};
+
+use serde_json::Value;
+
+use xmsg::fed::{generate_self_signed_ed25519_pem, normalize_pin};
+
+struct ChildGuard(Option<tokio::process::Child>);
+
+impl ChildGuard {
+    fn new(child: tokio::process::Child) -> Self {
+        Self(Some(child))
+    }
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.0.as_mut().unwrap()
+    }
+    fn take(&mut self) -> Option<tokio::process::Child> {
+        self.0.take()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+fn get_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+    listener.local_addr().expect("local addr").port()
+}
+
+async fn connect_svc(sock_path: &Path) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+    let stream = UnixStream::connect(sock_path).await.unwrap();
+    let (reader, writer) = stream.into_split();
+    (BufReader::new(reader), writer)
+}
+
+async fn read_json_line(reader: &mut BufReader<OwnedReadHalf>) -> Value {
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    serde_json::from_str(line.trim()).unwrap()
+}
+
+async fn send_via_agent_sock(agent_sock: &Path, target_ref: &str, text: &str) -> Value {
+    let stream = UnixStream::connect(agent_sock).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let send_req = serde_json::json!({
+        "action": "send",
+        "ref": target_ref,
+        "text": text,
+        "push_replies": true,
+    });
+    writer
+        .write_all(format!("{send_req}\n").as_bytes())
+        .await
+        .unwrap();
+
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line).await.unwrap();
+    serde_json::from_str(&resp_line).expect("valid json response from agent.sock")
+}
+
+async fn reply_via_agent_sock(agent_sock: &Path, message_id: &str, text: &str) -> Value {
+    let stream = UnixStream::connect(agent_sock).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let reply_req = serde_json::json!({
+        "action": "reply",
+        "messageId": message_id,
+        "text": text,
+    });
+    writer
+        .write_all(format!("{reply_req}\n").as_bytes())
+        .await
+        .unwrap();
+
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line).await.unwrap();
+    serde_json::from_str(&resp_line).expect("valid json response from agent.sock")
+}
+
+fn create_claude_session_fixture(
+    sessions_dir: &Path,
+    session_id: &str,
+    name: &str,
+) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
+    let sock_path = sessions_dir.join(format!("inbox-{session_id}.sock"));
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let rx_clone = received.clone();
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let _ = stream.read_to_end(&mut buf).await;
+                if let Ok(s) = String::from_utf8(buf) {
+                    rx_clone.lock().unwrap().push(s);
+                }
+            }
+        }
+    });
+
+    let my_pid = std::process::id();
+    let live_proc = PathBuf::from(xmsg::process::LIVE_PROC_ROOT);
+    let my_proc_start =
+        xmsg::process::starttime(&live_proc, my_pid).unwrap_or_else(|_| "1000".to_string());
+    let session_json = serde_json::json!({
+        "pid": my_pid,
+        "sessionId": session_id,
+        "name": name,
+        "cwd": "/workspace",
+        "status": "idle",
+        "kind": "interactive",
+        "startedAt": 1000,
+        "updatedAt": 2000,
+        "procStart": my_proc_start,
+        "messagingSocketPath": sock_path.display().to_string()
+    });
+    fs::write(
+        sessions_dir.join(format!("{my_pid}-{session_id}.json")),
+        session_json.to_string(),
+    )
+    .unwrap();
+
+    (sock_path, received)
+}
+
+struct NodeFixture {
+    _tmp: TempDir,
+    agent_sock: PathBuf,
+    register_sock: PathBuf,
+    sessions_dir: PathBuf,
+    db_path: PathBuf,
+    #[allow(dead_code)]
+    child: ChildGuard,
+}
+
+async fn spawn_hub_node(
+    name: &str,
+    fed_port: u16,
+    cert_pem: &str,
+    key_pem: &str,
+    client_name: &str,
+    client_pin: &str,
+) -> NodeFixture {
+    let tmp = tempdir().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let cert_file = tmp.path().join("cert.pem");
+    let key_file = tmp.path().join("key.pem");
+    let peers_file = tmp.path().join("peers.json");
+    let db_path = tmp.path().join("hub.db");
+
+    fs::write(&cert_file, cert_pem.as_bytes()).unwrap();
+    fs::write(&key_file, key_pem.as_bytes()).unwrap();
+
+    let peers_json = serde_json::json!({
+        client_name: {
+            "address": "127.0.0.1:0",
+            "pin": normalize_pin(client_pin),
+            "leaf": true,
+            "allow": ["send", "reply", "inbox"]
+        }
+    });
+    fs::write(&peers_file, peers_json.to_string()).unwrap();
+
+    let run_dir = tmp.path().join("run");
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let sessions_dir = tmp.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let agent_sock = run_dir.join("agent.sock");
+    let register_sock = run_dir.join("register.sock");
+    let http_sock = run_dir.join("http.sock");
+
+    let bin = env!("CARGO_BIN_EXE_xmsg");
+    let child = tokio::process::Command::new(bin)
+        .env("XDG_RUNTIME_DIR", &run_dir)
+        .args([
+            "serve",
+            "--host-label",
+            name,
+            "--listen",
+            "127.0.0.1:0",
+            "--fed-listen",
+            &format!("127.0.0.1:{fed_port}"),
+            "--peers-file",
+            peers_file.to_str().unwrap(),
+            "--fed-cert",
+            cert_file.to_str().unwrap(),
+            "--fed-key",
+            key_file.to_str().unwrap(),
+            "--db-path",
+            db_path.to_str().unwrap(),
+            "--sessions-dir",
+            sessions_dir.to_str().unwrap(),
+            "--register-sock",
+            register_sock.to_str().unwrap(),
+            "--agent-sock",
+            agent_sock.to_str().unwrap(),
+            "--http-sock",
+            http_sock.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hub node");
+
+    let mut guard = ChildGuard::new(child);
+
+    let mut ready = false;
+    for _ in 0..100 {
+        if let Ok(Some(status)) = guard.child_mut().try_wait() {
+            panic!("hub node exited prematurely: {:?}", status);
+        }
+        if agent_sock.exists()
+            && tokio::net::TcpStream::connect(("127.0.0.1", fed_port))
+                .await
+                .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "hub node failed to become ready");
+
+    NodeFixture {
+        _tmp: tmp,
+        agent_sock,
+        register_sock,
+        sessions_dir,
+        db_path,
+        child: guard,
+    }
+}
+
+async fn spawn_client_node(
+    name: &str,
+    cert_pem: &str,
+    key_pem: &str,
+    hub_name: &str,
+    hub_port: u16,
+    hub_pin: &str,
+    extra_svc_exe: Option<String>,
+) -> NodeFixture {
+    let tmp = tempdir().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let cert_file = tmp.path().join("cert.pem");
+    let key_file = tmp.path().join("key.pem");
+    let peers_file = tmp.path().join("peers.json");
+    let db_path = tmp.path().join("client.db");
+
+    fs::write(&cert_file, cert_pem.as_bytes()).unwrap();
+    fs::write(&key_file, key_pem.as_bytes()).unwrap();
+
+    let peers_json = serde_json::json!({
+        hub_name: {
+            "address": format!("127.0.0.1:{hub_port}"),
+            "pin": normalize_pin(hub_pin),
+            "dial": "outbound",
+            "allow": ["send", "reply", "inbox"]
+        }
+    });
+    fs::write(&peers_file, peers_json.to_string()).unwrap();
+
+    let run_dir = tmp.path().join("run");
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let sessions_dir = tmp.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let agent_sock = run_dir.join("agent.sock");
+    let register_sock = run_dir.join("register.sock");
+    let http_sock = run_dir.join("http.sock");
+
+    let bin = env!("CARGO_BIN_EXE_xmsg");
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.env("XDG_RUNTIME_DIR", &run_dir);
+    cmd.args([
+        "serve",
+        "--host-label",
+        name,
+        "--listen",
+        "127.0.0.1:0",
+        "--peers-file",
+        peers_file.to_str().unwrap(),
+        "--fed-cert",
+        cert_file.to_str().unwrap(),
+        "--fed-key",
+        key_file.to_str().unwrap(),
+        "--db-path",
+        db_path.to_str().unwrap(),
+        "--sessions-dir",
+        sessions_dir.to_str().unwrap(),
+        "--register-sock",
+        register_sock.to_str().unwrap(),
+        "--agent-sock",
+        agent_sock.to_str().unwrap(),
+        "--http-sock",
+        http_sock.to_str().unwrap(),
+    ]);
+
+    if let Some(svc_exe) = extra_svc_exe {
+        cmd.args(["--svc-exe", &svc_exe]);
+    }
+
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let child = cmd.spawn().expect("spawn client node");
+    let mut guard = ChildGuard::new(child);
+
+    let mut ready = false;
+    for _ in 0..100 {
+        if let Ok(Some(status)) = guard.child_mut().try_wait() {
+            panic!("client node exited prematurely: {:?}", status);
+        }
+        if agent_sock.exists() && register_sock.exists() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "client node failed to become ready");
+
+    NodeFixture {
+        _tmp: tmp,
+        agent_sock,
+        register_sock,
+        sessions_dir,
+        db_path,
+        child: guard,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Oracle 1: Inbound over outbound link
+// Session on H sends to session on C, C delivers locally and replies, H receives reply.
+// Mutant in src/main.rs: don't spawn outbound peer pull loop => RED
+// -----------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_1_inbound_over_outbound_link() {
+    let (cert_hub, key_hub, pin_hub) = generate_self_signed_ed25519_pem("hub").unwrap();
+    let (cert_client, key_client, pin_client) = generate_self_signed_ed25519_pem("client").unwrap();
+
+    let hub_port = get_free_port();
+    let hub = spawn_hub_node("hub", hub_port, &cert_hub, &key_hub, "client", &pin_client).await;
+    let client = spawn_client_node(
+        "client",
+        &cert_client,
+        &key_client,
+        "hub",
+        hub_port,
+        &pin_hub,
+        None,
+    )
+    .await;
+
+    // Register sess-alice on hub and sess-bob on client
+    let (_sock_alice, rx_alice) =
+        create_claude_session_fixture(&hub.sessions_dir, "sess-alice", "alice");
+    let (_sock_bob, rx_bob) =
+        create_claude_session_fixture(&client.sessions_dir, "sess-bob", "bob");
+
+    // 1. Alice on hub sends to sess-bob@client
+    let send_resp =
+        send_via_agent_sock(&hub.agent_sock, "sess-bob@client", "hello bob from hub").await;
+    assert_eq!(send_resp["status"], "ok");
+    assert_eq!(send_resp["delivery"]["outcome"], "queued");
+    let msg_id = send_resp["delivery"]["messageId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Client's pull loop pulls from hub and delivers to Bob
+    let mut got_message = false;
+    for _ in 0..100 {
+        let lines = rx_bob.lock().unwrap().clone();
+        if let Some(line) = lines.iter().find(|l| l.contains(&msg_id)) {
+            assert!(line.contains("hello bob from hub"));
+            got_message = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        got_message,
+        "Bob on client node should receive message from hub"
+    );
+
+    // 3. Bob on client replies to msg_id
+    let reply_resp =
+        reply_via_agent_sock(&client.agent_sock, &msg_id, "hello alice from client").await;
+    assert_eq!(reply_resp["status"], "ok");
+
+    // 4. Client posts reply back to hub; Alice receives reply
+    let mut got_reply = false;
+    for _ in 0..100 {
+        let lines = rx_alice.lock().unwrap().clone();
+        if let Some(line) = lines
+            .iter()
+            .find(|l| l.contains(&format!("reply to message_id={msg_id}")))
+        {
+            assert!(line.contains("hello alice from client"));
+            got_reply = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        got_reply,
+        "Alice on hub should receive reply from Bob over outbound link"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Oracle 2: Outbound send from undialable node
+// Session on C sends to H, H replies, C pulls reply and delivers locally.
+// Mutant in src/agent.rs: drop spawn_outbound_reply_poller => RED
+// -----------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_2_outbound_send_from_undialable_node() {
+    let (cert_hub, key_hub, pin_hub) = generate_self_signed_ed25519_pem("hub").unwrap();
+    let (cert_client, key_client, pin_client) = generate_self_signed_ed25519_pem("client").unwrap();
+
+    let hub_port = get_free_port();
+    let hub = spawn_hub_node("hub", hub_port, &cert_hub, &key_hub, "client", &pin_client).await;
+    let client = spawn_client_node(
+        "client",
+        &cert_client,
+        &key_client,
+        "hub",
+        hub_port,
+        &pin_hub,
+        None,
+    )
+    .await;
+
+    let (_sock_alice, rx_alice) =
+        create_claude_session_fixture(&hub.sessions_dir, "sess-alice", "alice");
+    let (_sock_bob, rx_bob) =
+        create_claude_session_fixture(&client.sessions_dir, "sess-bob", "bob");
+
+    // 1. Bob on undialable node sends to sess-alice@hub
+    let send_resp =
+        send_via_agent_sock(&client.agent_sock, "sess-alice@hub", "hello alice from bob").await;
+    assert_eq!(send_resp["status"], "ok");
+    assert_eq!(send_resp["delivery"]["outcome"], "delivered");
+    let msg_id = send_resp["delivery"]["messageId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Alice on hub receives message
+    let mut got_message = false;
+    for _ in 0..100 {
+        let lines = rx_alice.lock().unwrap().clone();
+        if let Some(line) = lines.iter().find(|l| l.contains(&msg_id)) {
+            assert!(line.contains("hello alice from bob"));
+            got_message = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        got_message,
+        "Alice on hub should receive message from client"
+    );
+
+    // 3. Alice on hub replies to msg_id
+    let reply_resp = reply_via_agent_sock(&hub.agent_sock, &msg_id, "hello bob from alice").await;
+    assert_eq!(reply_resp["status"], "ok");
+
+    // 4. Client's background reply poller polls hub and delivers reply to Bob
+    let mut got_reply = false;
+    for _ in 0..100 {
+        let lines = rx_bob.lock().unwrap().clone();
+        if let Some(line) = lines
+            .iter()
+            .find(|l| l.contains(&format!("reply to message_id={msg_id}")))
+        {
+            assert!(line.contains("hello bob from alice"));
+            got_reply = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        got_reply,
+        "Bob on undialable client should receive polled reply from Alice"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Oracle 3: svc too
+// svc registered on C receives send from H and replies over register.sock
+// Mutant in src/fed.rs deliver_to_resolved_target: comment out Svc delivery => RED
+// -----------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_3_svc_over_outbound_link() {
+    let (cert_hub, key_hub, pin_hub) = generate_self_signed_ed25519_pem("hub").unwrap();
+    let (cert_client, key_client, pin_client) = generate_self_signed_ed25519_pem("client").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let svc_exe_arg = format!("guard={}", current_exe.display());
+
+    let hub_port = get_free_port();
+    let hub = spawn_hub_node("hub", hub_port, &cert_hub, &key_hub, "client", &pin_client).await;
+    let client = spawn_client_node(
+        "client",
+        &cert_client,
+        &key_client,
+        "hub",
+        hub_port,
+        &pin_hub,
+        Some(svc_exe_arg),
+    )
+    .await;
+
+    let (_sock_alice, rx_alice) =
+        create_claude_session_fixture(&hub.sessions_dir, "sess-alice", "alice");
+
+    // 1. Connect svc daemon to client's register.sock and register svc:guard
+    let (mut reader, mut writer) = connect_svc(&client.register_sock).await;
+    let reg_frame = serde_json::json!({
+        "harness": "svc",
+        "name": "guard",
+    });
+    writer
+        .write_all(format!("{reg_frame}\n").as_bytes())
+        .await
+        .unwrap();
+    let reg_resp = read_json_line(&mut reader).await;
+    assert_eq!(reg_resp["status"], "ok");
+    assert_eq!(reg_resp["sessionId"], "svc:guard");
+
+    // 2. Alice on hub sends to svc:guard@client
+    let send_resp = send_via_agent_sock(
+        &hub.agent_sock,
+        "svc:guard@client",
+        "audit request from hub",
+    )
+    .await;
+    assert_eq!(send_resp["status"], "ok");
+    assert_eq!(send_resp["delivery"]["outcome"], "queued");
+    let msg_id = send_resp["delivery"]["messageId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 3. Service guard on client polls and receives message
+    let poll_frame = serde_json::json!({
+        "action": "poll",
+        "waitSecs": 5,
+    });
+    writer
+        .write_all(format!("{poll_frame}\n").as_bytes())
+        .await
+        .unwrap();
+    let poll_resp = read_json_line(&mut reader).await;
+    assert_eq!(poll_resp["action"], "deliver");
+    assert_eq!(poll_resp["messageId"], msg_id);
+    assert_eq!(poll_resp["text"], "audit request from hub");
+
+    // 4. Service acks and replies over register.sock
+    let ack_frame = serde_json::json!({
+        "action": "ack",
+        "messageId": msg_id,
+    });
+    writer
+        .write_all(format!("{ack_frame}\n").as_bytes())
+        .await
+        .unwrap();
+    let ack_resp = read_json_line(&mut reader).await;
+    assert_eq!(ack_resp["status"], "ok");
+
+    let reply_frame = serde_json::json!({
+        "action": "reply",
+        "messageId": msg_id,
+        "text": "approved by guard service",
+    });
+    writer
+        .write_all(format!("{reply_frame}\n").as_bytes())
+        .await
+        .unwrap();
+    let reply_resp = read_json_line(&mut reader).await;
+    assert_eq!(reply_resp["status"], "ok");
+
+    // 5. Alice on hub receives svc reply
+    let mut got_reply = false;
+    for _ in 0..100 {
+        let lines = rx_alice.lock().unwrap().clone();
+        if let Some(line) = lines
+            .iter()
+            .find(|l| l.contains(&format!("reply to message_id={msg_id}")))
+        {
+            assert!(line.contains("approved by guard service"));
+            got_reply = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        got_reply,
+        "Alice on hub should receive reply from svc:guard"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Oracle 4: Off by default
+// Node without outbound peer starts no pull loop; assert absence of "starting outbound link pull loop" log
+// Mutant in src/main.rs: start loop unconditionally => RED
+// -----------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_4_off_by_default_no_pull_loop() {
+    let tmp = tempdir().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let cert_file = tmp.path().join("cert.pem");
+    let key_file = tmp.path().join("key.pem");
+    let peers_file = tmp.path().join("peers.json");
+    let db_path = tmp.path().join("node.db");
+
+    let (cert_pem, key_pem, pin) = generate_self_signed_ed25519_pem("plain-node").unwrap();
+    fs::write(&cert_file, cert_pem).unwrap();
+    fs::write(&key_file, key_pem).unwrap();
+    let peers_content = serde_json::json!({
+        "peer-regular": {
+            "address": "127.0.0.1:49999",
+            "pin": normalize_pin(&pin)
+        }
+    });
+    fs::write(&peers_file, peers_content.to_string()).unwrap();
+
+    let run_dir = tmp.path().join("run");
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let sessions_dir = tmp.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let agent_sock = run_dir.join("agent.sock");
+    let register_sock = run_dir.join("register.sock");
+    let http_sock = run_dir.join("http.sock");
+
+    let bin = env!("CARGO_BIN_EXE_xmsg");
+    let child = tokio::process::Command::new(bin)
+        .env("XDG_RUNTIME_DIR", &run_dir)
+        .env("RUST_LOG", "info")
+        .args([
+            "serve",
+            "--host-label",
+            "plain-node",
+            "--listen",
+            "127.0.0.1:0",
+            "--peers-file",
+            peers_file.to_str().unwrap(),
+            "--fed-cert",
+            cert_file.to_str().unwrap(),
+            "--fed-key",
+            key_file.to_str().unwrap(),
+            "--db-path",
+            db_path.to_str().unwrap(),
+            "--sessions-dir",
+            sessions_dir.to_str().unwrap(),
+            "--register-sock",
+            register_sock.to_str().unwrap(),
+            "--agent-sock",
+            agent_sock.to_str().unwrap(),
+            "--http-sock",
+            http_sock.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn plain node");
+
+    let mut guard = ChildGuard::new(child);
+
+    // Wait until ready
+    let mut ready = false;
+    for _ in 0..100 {
+        if let Ok(Some(status)) = guard.child_mut().try_wait() {
+            panic!("plain node exited prematurely: {:?}", status);
+        }
+        if agent_sock.exists() && register_sock.exists() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "plain node failed to become ready");
+
+    // Let node run briefly
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Kill node and inspect stderr
+    let mut child = guard.take().unwrap();
+    let _ = child.start_kill();
+    let output = child.wait_with_output().await.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let all_logs = format!("{stderr}\n{stdout}");
+
+    assert!(
+        !all_logs.contains("starting outbound link pull loop"),
+        "Oracle 4 violation: node without outbound peer must NOT log 'starting outbound link pull loop'"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Oracle 5: Unknown ref
+// H sends to nosuch@C; H receives not_found error reply and mailbox is acked.
+// Mutant in src/fed.rs: unresolvable branch doesn't send error reply => RED
+// -----------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_5_unknown_ref_acked_and_error_reply() {
+    let (cert_hub, key_hub, pin_hub) = generate_self_signed_ed25519_pem("hub").unwrap();
+    let (cert_client, key_client, pin_client) = generate_self_signed_ed25519_pem("client").unwrap();
+
+    let hub_port = get_free_port();
+    let hub = spawn_hub_node("hub", hub_port, &cert_hub, &key_hub, "client", &pin_client).await;
+    let _client = spawn_client_node(
+        "client",
+        &cert_client,
+        &key_client,
+        "hub",
+        hub_port,
+        &pin_hub,
+        None,
+    )
+    .await;
+
+    let (_sock_alice, rx_alice) =
+        create_claude_session_fixture(&hub.sessions_dir, "sess-alice", "alice");
+
+    // 1. Alice on hub sends to unresolvable ref nosuch@client
+    let send_resp = send_via_agent_sock(&hub.agent_sock, "nosuch@client", "hello nobody").await;
+    assert_eq!(send_resp["status"], "ok");
+    assert_eq!(send_resp["delivery"]["outcome"], "queued");
+    let msg_id = send_resp["delivery"]["messageId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Client pull loop fetches message, fails resolution, posts not_found error reply to hub, and acks
+    let mut got_error_reply = false;
+    for _ in 0..100 {
+        let lines = rx_alice.lock().unwrap().clone();
+        if let Some(line) = lines
+            .iter()
+            .find(|l| l.contains(&format!("reply to message_id={msg_id}")))
+        {
+            assert!(
+                line.contains("not_found"),
+                "Reply should contain error code 'not_found', got: {line}"
+            );
+            assert!(
+                line.contains("no live session matches 'nosuch'"),
+                "Reply should contain direct send error format, got: {line}"
+            );
+            got_error_reply = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        got_error_reply,
+        "Alice on hub should receive not_found error reply for unresolvable ref"
+    );
+
+    // 3. Verify message is acked and deleted from hub's mailbox
+    // Query hub's sqlite db to verify peer_mailbox table has 0 rows for client
+    let mut mailbox_empty = false;
+    for _ in 0..50 {
+        if let Ok(conn) = rusqlite::Connection::open(&hub.db_path) {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM peer_mailbox WHERE peer = 'client'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(1);
+            if count == 0 {
+                mailbox_empty = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        mailbox_empty,
+        "Hub mailbox for client should be acked and empty"
+    );
+}

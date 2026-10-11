@@ -723,6 +723,18 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 tracing::error!("register server error: {e}");
             }
         });
+
+        if let Some(ref fs) = fed_state {
+            for (peer_name, peer_cfg) in fs.peers.iter() {
+                if peer_cfg.is_outbound() {
+                    let fs_clone = fs.clone();
+                    let peer_clone = peer_name.clone();
+                    tokio::spawn(async move {
+                        xmsg::fed::run_outbound_peer_pull_loop(fs_clone, peer_clone).await;
+                    });
+                }
+            }
+        }
     }
 
     let app = build_router(state);

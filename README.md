@@ -605,3 +605,40 @@ For workloads running inside containers or Kubernetes pods (e.g. `genie-guard` o
   - `POST /fed/v1/inbox/{id}/ack`: Removes the message from the peer's mailbox upon explicit acknowledgment. Returns HTTP `404 Not Found` if the ID does not exist in that peer's mailbox. Unacknowledged messages remain queued and are returned on the next poll. Mailboxes are strictly isolated per peer.
 - **Strict Acknowledgment Ordering:** A leaf background task long-polls the hub inbox, enqueues inbound messages into the local `svc` inbox, and forwards `POST /fed/v1/inbox/{id}/ack` to the hub **only after** the local service daemon explicitly acknowledges the delivery over `register.sock`. If the daemon terminates before acknowledging, the unacknowledged message is redelivered when the daemon reconnects.
 - **Reply Routing & Attribution:** Svc replies sent over `register.sock` (`action: "reply"`) route back to the originating hub over `/fed/v1/replies`, attributed to the leaf principal.
+
+### 7.6 Outbound links (for a node that can't be dialled)
+
+Where Section 7.5 defines a restricted, single-principal `--leaf` node for isolated container/pod workers, full nodes running arbitrary harness sessions (`claude`, `agy`, `pi`, `svc`) may also be located behind NAT, firewalls, or dynamic edge connections where inbound TCP connections cannot be accepted.
+
+An **outbound link** allows a full `xmsg` node to connect to a dialable hub node without exposing a public listener port or requiring global leaf mode.
+
+- **Peer Configuration (`"dial": "outbound"`):**
+  On the undialable node, any peer in `peers.json` can specify `"dial": "outbound"`. This instructs the node to dial out to the peer's configured `address` instead of expecting inbound connections:
+  ```json
+  {
+    "hub": {
+      "address": "hub.example.com:43599",
+      "pin": "sha256:...",
+      "dial": "outbound",
+      "allow": ["send", "reply", "inbox"]
+    }
+  }
+  ```
+  Specifying both `"leaf": true` and `"dial": "outbound"` on the same peer is rejected at load time.
+- **Topology & Symmetry:**
+  The remote hub node marks the undialable peer as `"leaf": true` in its own `peers.json`, designating that messages sent to `<target>@<undialable-peer>` must be held in the hub's durable peer mailbox.
+- **Pull Loop on Full Node:**
+  For each peer configured with `"dial": "outbound"`, the full node automatically spawns a dedicated background pull loop at startup:
+  - Logs `starting outbound link pull loop` for the peer.
+  - Long-polls `/fed/v1/inbox` from the hub.
+  - Resolves target references across all supported harness kinds (`claude`, `agy`, `pi`, `svc`).
+  - Delivers resolved messages locally and executes `POST /fed/v1/inbox/{id}/ack` at the hub.
+  - Pull delivery is idempotent by message ID; duplicate messages already present in the database are acknowledged at the hub and discarded.
+- **Unresolvable Targets:**
+  Unlike leaf nodes (which reject non-principal targets), an outbound-linked full node serves all target kinds. If a target is unresolvable (`not_found`, `gone`, `ambiguous`), the message is acknowledged at the hub and an error reply with status `not_found` and detail `no live session matches '<target>'` is posted back to the hub over `/fed/v1/replies`, matching direct send error responses.
+- **Outbound Link Reply Routing:**
+  - **Inbound message replies:** When local sessions or services on the undialable node reply to an inbound message from an outbound-linked peer, they post the reply back to the dialable hub via `POST /fed/v1/replies`.
+  - **Outbound send replies:** When local sessions on the undialable node send a message to a dialable hub, the remote hub cannot dial back to push replies. Senders automatically spawn a background reply poller using `poll_federated_replies` (`GET /fed/v1/messages/{id}/replies?after=<seq>&wait=<s>`), pulling owed replies and delivering them locally to the caller's session.
+- **Default State:**
+  Outbound link pull loops are strictly opt-in and off unless configured. If no peer specifies `"dial": "outbound"`, no pull loop is spawned.
+

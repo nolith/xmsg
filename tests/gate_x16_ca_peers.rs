@@ -260,6 +260,7 @@ async fn test_oracle_1_ca_peer_accepted_and_delivered() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors.clone(),
         )
@@ -283,6 +284,7 @@ async fn test_oracle_1_ca_peer_accepted_and_delivered() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors,
         )
@@ -336,6 +338,7 @@ async fn test_oracle_2_different_ca_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors1.clone(),
         )
@@ -359,6 +362,7 @@ async fn test_oracle_2_different_ca_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors1,
         )
@@ -428,6 +432,7 @@ async fn test_oracle_3_uri_not_in_identities_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors.clone(),
         )
@@ -451,6 +456,7 @@ async fn test_oracle_3_uri_not_in_identities_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors,
         )
@@ -535,6 +541,7 @@ async fn test_oracle_4_expired_and_not_yet_valid_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors.clone(),
         )
@@ -558,6 +565,7 @@ async fn test_oracle_4_expired_and_not_yet_valid_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors,
         )
@@ -683,6 +691,7 @@ async fn test_oracle_5_zero_and_two_uri_sans_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors.clone(),
         )
@@ -706,6 +715,7 @@ async fn test_oracle_5_zero_and_two_uri_sans_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors,
         )
@@ -863,6 +873,7 @@ async fn test_oracle_6_prefix_wildcard_matching() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors.clone(),
         )
@@ -886,6 +897,7 @@ async fn test_oracle_6_prefix_wildcard_matching() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors,
         )
@@ -1004,6 +1016,7 @@ async fn test_oracle_7_overlapping_ca_peers_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors.clone(),
         )
@@ -1022,6 +1035,7 @@ async fn test_oracle_7_overlapping_ca_peers_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors.clone(),
         )
@@ -1045,6 +1059,7 @@ async fn test_oracle_7_overlapping_ca_peers_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors,
         )
@@ -1113,6 +1128,7 @@ async fn test_oracle_8_outbound_wrong_uri_fails() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors.clone(),
         )
@@ -1137,6 +1153,7 @@ async fn test_oracle_8_outbound_wrong_uri_fails() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors,
         )
@@ -1199,6 +1216,7 @@ async fn test_oracle_8b_outbound_different_ca_fails() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors1.clone(),
         )
@@ -1223,6 +1241,7 @@ async fn test_oracle_8b_outbound_different_ca_fails() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors1,
         )
@@ -1286,6 +1305,7 @@ async fn test_oracle_9_ca_peer_policy_targets_enforced() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: Some(vec!["claude:allowed-target".to_string()]),
+                dial: None,
             },
             anchors.clone(),
         )
@@ -1311,6 +1331,7 @@ async fn test_oracle_9_ca_peer_policy_targets_enforced() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors,
         )
@@ -1574,6 +1595,7 @@ fn test_oracle_11_duplicate_peer_name_refused() {
         leaf: false,
         principals: Vec::new(),
         targets: None,
+        dial: None,
     };
     let p2 = PeerConfig {
         name: "peer-prog".to_string(),
@@ -1586,6 +1608,7 @@ fn test_oracle_11_duplicate_peer_name_refused() {
         leaf: false,
         principals: Vec::new(),
         targets: None,
+        dial: None,
     };
     assert!(map.insert(p1).is_ok());
     let res_insert = map.insert(p2.clone());
@@ -1637,6 +1660,7 @@ async fn test_oracle_12_outbound_only_pin_and_ca_double_match_refused() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         })
         .unwrap();
 
@@ -1654,6 +1678,7 @@ async fn test_oracle_12_outbound_only_pin_and_ca_double_match_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors.clone(),
         )
@@ -1677,6 +1702,7 @@ async fn test_oracle_12_outbound_only_pin_and_ca_double_match_refused() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             anchors,
         )

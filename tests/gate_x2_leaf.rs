@@ -187,6 +187,7 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
             leaf: true,
             principals: vec!["svc:matrix".to_string()],
             targets: None,
+            dial: None,
         },
     );
 
@@ -280,6 +281,7 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         },
     );
 
@@ -429,6 +431,7 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
             leaf: true,
             principals: vec!["svc:matrix".to_string()],
             targets: None,
+            dial: None,
         },
     );
 
@@ -553,6 +556,7 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         },
     );
 

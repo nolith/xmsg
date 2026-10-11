@@ -338,6 +338,7 @@ async fn test_oracle_1_full_node_svc_federated_reply() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         None,
         Some((cert_a, key_a, pin_a.clone())),

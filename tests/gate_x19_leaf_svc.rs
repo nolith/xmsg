@@ -432,6 +432,7 @@ async fn test_oracle_1_end_to_end_leaf_svc() {
             leaf: true,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         creds_hub.clone(),
     )
@@ -450,6 +451,7 @@ async fn test_oracle_1_end_to_end_leaf_svc() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         creds_leaf.clone(),
         "svc:guard",
@@ -573,6 +575,7 @@ async fn test_oracle_2_redelivery_unacked_message() {
             leaf: true,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         creds_hub.clone(),
     )
@@ -591,6 +594,7 @@ async fn test_oracle_2_redelivery_unacked_message() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         creds_leaf.clone(),
         "svc:guard",
@@ -793,6 +797,7 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
                 leaf: true,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             PeerConfig {
                 name: "leaf2".to_string(),
@@ -805,6 +810,7 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
                 leaf: true,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
             PeerConfig {
                 name: "nonleaf".to_string(),
@@ -817,6 +823,7 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
                 leaf: false,
                 principals: Vec::new(),
                 targets: None,
+                dial: None,
             },
         ],
         creds_hub.clone(),
@@ -884,6 +891,7 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         })
         .unwrap();
 
@@ -954,6 +962,7 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         })
         .unwrap();
 
@@ -1009,6 +1018,7 @@ async fn test_oracle_5_targets_filter_on_queue_path() {
             leaf: true,
             principals: Vec::new(),
             targets: Some(vec!["svc:guard".to_string()]),
+            dial: None,
         }],
         creds_hub.clone(),
     )
@@ -1105,6 +1115,7 @@ async fn test_oracle_6_delivered_frame_carries_principal_badge() {
             leaf: true,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         creds_hub.clone(),
     )
@@ -1123,6 +1134,7 @@ async fn test_oracle_6_delivered_frame_carries_principal_badge() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         creds_leaf.clone(),
         "svc:guard",
@@ -1247,6 +1259,7 @@ async fn test_oracle_8_misaddressed_message_does_not_stall_inbox() {
             leaf: true,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         creds_hub.clone(),
     )
@@ -1265,6 +1278,7 @@ async fn test_oracle_8_misaddressed_message_does_not_stall_inbox() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         creds_leaf.clone(),
         "svc:guard",
@@ -1360,6 +1374,7 @@ async fn test_oracle_9_storage_error_does_not_ack_and_recovers() {
             leaf: true,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         creds_hub.clone(),
     )
@@ -1378,6 +1393,7 @@ async fn test_oracle_9_storage_error_does_not_ack_and_recovers() {
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         creds_leaf.clone(),
         "svc:guard",

@@ -763,6 +763,7 @@ async fn test_oracle_4_federated_send_queues_unregistered_and_checks_starttime()
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         creds_a.clone(),
         None,
@@ -783,6 +784,7 @@ async fn test_oracle_4_federated_send_queues_unregistered_and_checks_starttime()
             leaf: false,
             principals: Vec::new(),
             targets: None,
+            dial: None,
         }],
         creds_b.clone(),
         Some(Box::new(

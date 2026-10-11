@@ -1075,6 +1075,15 @@ pub async fn run_agent_server(
                                 Ok(delivery_resp) => {
                                     let outcome =
                                         delivery_resp.outcome.as_deref().unwrap_or("delivered");
+                                    if let Some(peer_cfg) = fed_state.peers.get(target_host) {
+                                        if peer_cfg.is_outbound() && envelope.push_replies {
+                                            crate::fed::spawn_outbound_reply_poller(
+                                                fed_state.clone(),
+                                                target_host.to_string(),
+                                                message_id.clone(),
+                                            );
+                                        }
+                                    }
                                     if let Ok(db) = state_clone.db.lock() {
                                         let _ = storage::insert_outbound(
                                             &db,
@@ -1131,6 +1140,7 @@ pub async fn run_agent_server(
                                 }
                                 Err(e) => {
                                     let (err_code, detail) = match e {
+                                        AppError::NotFound(d) => ("not_found", d),
                                         AppError::NoForward(d) => ("no_forward", d),
                                         AppError::OpDenied(d) => ("op_denied", d),
                                         AppError::PeerRejected(d) => ("peer_rejected", d),

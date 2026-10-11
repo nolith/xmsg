@@ -413,6 +413,15 @@ async fn send_message_handler(
             crate::fed::send_federated_message(&fed_state, target_host, &envelope).await?;
 
         let outcome = delivery_resp.outcome.as_deref().unwrap_or("delivered");
+        if let Some(peer_cfg) = fed_state.peers.get(target_host) {
+            if peer_cfg.is_outbound() && envelope.push_replies {
+                crate::fed::spawn_outbound_reply_poller(
+                    fed_state.clone(),
+                    target_host.to_string(),
+                    message_id.clone(),
+                );
+            }
+        }
         {
             let db = state
                 .db
