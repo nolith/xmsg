@@ -803,54 +803,63 @@ async fn get_replies_handler(
         None
     };
 
-    // 2. If outbound federated message, poll remote peer
+    // 2. If outbound federated message, poll remote peer (skip if peer is leaf)
     if let Some(outbound) = outbound {
-        if let Some(ref fed_state) = state.fed_state {
-            let local_existing = {
-                let db = state
-                    .db
-                    .lock()
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
-                storage::get_replies_after(&db, &id, after_seq)
-                    .map_err(|e| AppError::Internal(e.to_string()))?
-            };
-            if !local_existing.is_empty() {
-                return Ok((StatusCode::OK, Json(local_existing)).into_response());
-            }
+        let is_leaf = state
+            .fed_state
+            .as_ref()
+            .and_then(|fs| fs.peers.get(&outbound.peer))
+            .map(|p| p.leaf)
+            .unwrap_or(false);
 
-            let remote_replies = crate::fed::poll_federated_replies(
-                fed_state,
-                &outbound.peer,
-                &id,
-                after_seq,
-                wait_secs,
-            )
-            .await?;
-
-            {
-                let db = state
-                    .db
-                    .lock()
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
-                for r in &remote_replies {
-                    let existing_all = storage::get_replies_after(&db, &id, 0)
+        if !is_leaf {
+            if let Some(ref fed_state) = state.fed_state {
+                let local_existing = {
+                    let db = state
+                        .db
+                        .lock()
                         .map_err(|e| AppError::Internal(e.to_string()))?;
-                    if !existing_all.iter().any(|ex| {
-                        ex.text == r.text && ex.replier_session_id == r.replier_session_id
-                    }) {
-                        let _ = storage::insert_reply(
-                            &db,
-                            &id,
-                            &r.replier_session_id,
-                            &r.text,
-                            r.push_outcome.as_deref(),
-                            r.pushed_message_id.as_deref(),
-                        );
+                    storage::get_replies_after(&db, &id, after_seq)
+                        .map_err(|e| AppError::Internal(e.to_string()))?
+                };
+                if !local_existing.is_empty() {
+                    return Ok((StatusCode::OK, Json(local_existing)).into_response());
+                }
+
+                let remote_replies = crate::fed::poll_federated_replies(
+                    fed_state,
+                    &outbound.peer,
+                    &id,
+                    after_seq,
+                    wait_secs,
+                )
+                .await?;
+
+                {
+                    let db = state
+                        .db
+                        .lock()
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    for r in &remote_replies {
+                        let existing_all = storage::get_replies_after(&db, &id, 0)
+                            .map_err(|e| AppError::Internal(e.to_string()))?;
+                        if !existing_all.iter().any(|ex| {
+                            ex.text == r.text && ex.replier_session_id == r.replier_session_id
+                        }) {
+                            let _ = storage::insert_reply(
+                                &db,
+                                &id,
+                                &r.replier_session_id,
+                                &r.text,
+                                r.push_outcome.as_deref(),
+                                r.pushed_message_id.as_deref(),
+                            );
+                        }
                     }
                 }
-            }
 
-            return Ok((StatusCode::OK, Json(remote_replies)).into_response());
+                return Ok((StatusCode::OK, Json(remote_replies)).into_response());
+            }
         }
     }
 

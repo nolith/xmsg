@@ -2294,46 +2294,80 @@ async fn fed_reply_handler(
             .map_err(|e| AppError::Internal(e.to_string()))?
     };
 
-    let orig_msg = match orig_msg {
-        Some(m)
-            if m.return_harness.is_some() && m.return_session_id.is_some() && m.push_replies =>
-        {
-            m
-        }
-        _ => {
-            return Err(AppError::NotRecipient(format!(
-                "in_reply_to '{}' has no push-capable local recipient",
-                reply.in_reply_to
-            )));
-        }
+    let is_push_capable = match &orig_msg {
+        Some(m) => m.return_harness.is_some() && m.return_session_id.is_some() && m.push_replies,
+        None => false,
     };
 
-    let ret_harness = orig_msg.return_harness.unwrap();
-    let ret_session_id = orig_msg.return_session_id.unwrap();
+    if is_push_capable {
+        let orig_msg = orig_msg.unwrap();
+        let ret_harness = orig_msg.return_harness.unwrap();
+        let ret_session_id = orig_msg.return_session_id.unwrap();
 
-    let replier_badge =
-        inbox::sanitize_attested_from(&peer.name, &reply.replier.harness, &reply.replier.name);
+        let replier_badge =
+            inbox::sanitize_attested_from(&peer.name, &reply.replier.harness, &reply.replier.name);
 
-    let push_res = deliver_federated_reply_locally(
-        &fed_state,
-        &peer.name,
-        &reply.in_reply_to,
-        &reply.id,
-        &replier_badge,
-        &reply.text,
-        &ret_harness,
-        &ret_session_id,
-    )
-    .await?;
+        let push_res = deliver_federated_reply_locally(
+            &fed_state,
+            &peer.name,
+            &reply.in_reply_to,
+            &reply.id,
+            &replier_badge,
+            &reply.text,
+            &ret_harness,
+            &ret_session_id,
+        )
+        .await?;
 
-    Ok((
-        StatusCode::OK,
-        Json(json!({
-            "push_outcome": push_res,
-            "message_id": reply.id,
-        })),
-    )
-        .into_response())
+        Ok((
+            StatusCode::OK,
+            Json(json!({
+                "push_outcome": push_res,
+                "message_id": reply.id,
+            })),
+        )
+            .into_response())
+    } else if peer_cfg.leaf {
+        let replier_session_id = if !reply.replier.session_id.is_empty() {
+            reply.replier.session_id.clone()
+        } else if !reply.replier.name.is_empty() {
+            reply.replier.name.clone()
+        } else {
+            peer.name.clone()
+        };
+
+        let push_outcome = "disabled";
+        {
+            let db = fed_state
+                .db
+                .lock()
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            storage::insert_reply(
+                &db,
+                &reply.in_reply_to,
+                &replier_session_id,
+                &reply.text,
+                Some(push_outcome),
+                Some(&reply.id),
+            )
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        }
+        let _ = fed_state.notify_tx.send(reply.in_reply_to.clone());
+
+        Ok((
+            StatusCode::OK,
+            Json(json!({
+                "push_outcome": push_outcome,
+                "message_id": reply.id,
+            })),
+        )
+            .into_response())
+    } else {
+        return Err(AppError::NotRecipient(format!(
+            "in_reply_to '{}' has no push-capable local recipient",
+            reply.in_reply_to
+        )));
+    }
 }
 
 async fn fed_get_replies_handler(
