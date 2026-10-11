@@ -549,6 +549,11 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let reply_ttl = Duration::from_secs(args.reply_ttl);
     let idempotency_ttl = Duration::from_secs(args.idempotency_ttl);
 
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     if (args.peers_file.is_some() || args.fed_listen.is_some())
         && (args.fed_cert.is_none() || args.fed_key.is_none())
     {
@@ -647,14 +652,14 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("failed to initialize federation TLS acceptor: {e}"))?,
             };
             let fs_clone = fs.clone();
-            tokio::spawn(async move {
+            bg_tasks.push(tokio::spawn(async move {
                 info!(listen = %listen_addr, "starting federation mTLS listener");
                 if let Err(e) =
                     xmsg::fed::run_fed_listener_with_acceptor(listener, fs_clone, acceptor).await
                 {
                     tracing::error!("federation listener error: {e}");
                 }
-            });
+            }));
         }
 
         Some(fs)
@@ -687,11 +692,11 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !args.leaf {
         let agent_sock = agent_sock_path.clone();
         let agent_state = state.clone();
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             if let Err(e) = xmsg::agent::run_agent_server(agent_sock, agent_state, my_uid).await {
                 tracing::error!("agent server error: {e}");
             }
-        });
+        }));
 
         let reg_sock = register_sock_path.clone();
         let reg_config = agy_config.clone();
@@ -703,7 +708,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let reg_trusted_svc_exes = trusted_svc_exes.clone();
         let reg_svc_notify_tx = svc_notify_tx.clone();
         let reg_fed_state = fed_state.clone();
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             if let Err(e) = xmsg::agy::run_register_server(
                 reg_sock,
                 reg_config,
@@ -722,16 +727,16 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             {
                 tracing::error!("register server error: {e}");
             }
-        });
+        }));
 
         if let Some(ref fs) = fed_state {
             for (peer_name, peer_cfg) in fs.peers.iter() {
                 if peer_cfg.is_outbound() {
                     let fs_clone = fs.clone();
                     let peer_clone = peer_name.clone();
-                    tokio::spawn(async move {
+                    bg_tasks.push(tokio::spawn(async move {
                         xmsg::fed::run_outbound_peer_pull_loop(fs_clone, peer_clone).await;
-                    });
+                    }));
                 }
             }
         }
@@ -753,7 +758,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let leaf_svc_notify_tx = svc_notify_tx.clone();
         let leaf_fed_state = fed_state.clone();
 
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             if let Err(e) = xmsg::svc::run_leaf_register_server(
                 leaf_reg_sock,
                 leaf_proc_root,
@@ -769,7 +774,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             {
                 tracing::error!("leaf register server error: {e}");
             }
-        });
+        }));
 
         if let Some(ref fs) = fed_state {
             for peer_name in fs.peers.keys() {
@@ -778,7 +783,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let leaf_p_clone = args.leaf_principal.clone().unwrap();
                 let db_clone = db.clone();
                 let svc_notify_tx_clone = svc_notify_tx.clone();
-                tokio::spawn(async move {
+                bg_tasks.push(tokio::spawn(async move {
                     xmsg::svc::run_leaf_inbox_task(
                         fs_clone,
                         peer_clone,
@@ -787,28 +792,122 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                         svc_notify_tx_clone,
                     )
                     .await;
-                });
+                }));
             }
         }
 
         let tcp_addr = args.listen.as_ref().unwrap();
         let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await?;
         info!(listen = %tcp_addr, "starting leaf tcp http server");
-        axum::serve(tcp_listener, app).await?;
+        let mut shutdown_rx_leaf = shutdown_rx.clone();
+        let leaf_task = tokio::spawn(async move {
+            let server = axum::serve(tcp_listener, app);
+            let shutdown_fut = async move {
+                let _ = shutdown_rx_leaf.wait_for(|&v| v).await;
+            };
+            if let Err(e) = server.with_graceful_shutdown(shutdown_fut).await {
+                tracing::error!("leaf tcp http server error: {e}");
+            }
+        });
+
+        run_shutdown_drain(sigterm, sigint, shutdown_tx, bg_tasks, vec![leaf_task], db).await?;
         return Ok(());
     }
+
+    let mut server_tasks = Vec::new();
 
     if let Some(ref tcp_addr) = args.listen {
         let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await?;
         let tcp_app = app.clone();
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(tcp_listener, tcp_app).await {
+        let mut shutdown_rx_tcp = shutdown_rx.clone();
+        server_tasks.push(tokio::spawn(async move {
+            let server = axum::serve(tcp_listener, tcp_app);
+            let shutdown_fut = async move {
+                let _ = shutdown_rx_tcp.wait_for(|&v| v).await;
+            };
+            if let Err(e) = server.with_graceful_shutdown(shutdown_fut).await {
                 tracing::error!("tcp http server error: {e}");
             }
-        });
+        }));
     }
 
     let ucred_listener = xmsg::http::bind_ucred_unix_listener(&http_sock_path, my_uid, None)?;
-    axum::serve(ucred_listener, app).await?;
+    let mut shutdown_rx_unix = shutdown_rx.clone();
+    server_tasks.push(tokio::spawn(async move {
+        let server = axum::serve(ucred_listener, app);
+        let shutdown_fut = async move {
+            let _ = shutdown_rx_unix.wait_for(|&v| v).await;
+        };
+        if let Err(e) = server.with_graceful_shutdown(shutdown_fut).await {
+            tracing::error!("unix http server error: {e}");
+        }
+    }));
+
+    run_shutdown_drain(sigterm, sigint, shutdown_tx, bg_tasks, server_tasks, db).await?;
+    Ok(())
+}
+
+async fn run_shutdown_drain(
+    mut sigterm: tokio::signal::unix::Signal,
+    mut sigint: tokio::signal::unix::Signal,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    bg_tasks: Vec<tokio::task::JoinHandle<()>>,
+    server_tasks: Vec<tokio::task::JoinHandle<()>>,
+    db: Arc<Mutex<rusqlite::Connection>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Wait for first signal
+    let sig_name = tokio::select! {
+        _ = sigterm.recv() => "SIGTERM",
+        _ = sigint.recv() => "SIGINT",
+    };
+    info!("shutdown signal received ({sig_name}), starting graceful drain");
+
+    // Spawn listener for second signal to exit immediately non-zero
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tracing::warn!("second SIGTERM received during shutdown, exiting immediately");
+                std::process::exit(128 + 15);
+            }
+            _ = sigint.recv() => {
+                tracing::warn!("second SIGINT received during shutdown, exiting immediately");
+                std::process::exit(128 + 2);
+            }
+        }
+    });
+
+    // 1. Notify axum servers to stop accepting connections and drain
+    let _ = shutdown_tx.send(true);
+
+    // 2. Stop pull loops and background listeners immediately
+    for handle in bg_tasks {
+        handle.abort();
+    }
+
+    // 3. Drain in-flight HTTP requests bounded by 5s
+    // Rationale: local HTTP/IPC requests in xmsg take <10ms; 5s provides ample headroom
+    // for in-flight requests and TLS handshakes while staying well under container stop
+    // grace periods (e.g. 30s) to prevent SIGKILL.
+    let drain_bound = Duration::from_secs(5);
+    let servers_fut = async {
+        for t in server_tasks {
+            let _ = t.await;
+        }
+    };
+
+    if tokio::time::timeout(drain_bound, servers_fut)
+        .await
+        .is_err()
+    {
+        tracing::warn!("drain timeout (5s) reached, completing shutdown");
+    }
+
+    // 4. Close database cleanly: checkpoint WAL to main db file
+    if let Ok(conn) = db.lock() {
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+
+    // 5. Log completion line and exit 0
+    info!("shutdown complete, exiting cleanly");
     Ok(())
 }
