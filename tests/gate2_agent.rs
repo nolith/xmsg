@@ -171,6 +171,7 @@ async fn setup(max_body: usize) -> Env {
                 xmsg::svc::new_svc_store(),
                 std::collections::HashMap::new(),
                 tokio::sync::broadcast::channel(16).0,
+                None,
             )
             .await;
         });

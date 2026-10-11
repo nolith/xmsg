@@ -113,6 +113,7 @@ async fn oracle_1_hook_credential_less_and_credentialed_and_malformed() {
             xmsg::svc::new_svc_store(),
             std::collections::HashMap::new(),
             tokio::sync::broadcast::channel(16).0,
+            None,
         )
         .await;
     });

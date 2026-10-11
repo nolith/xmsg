@@ -87,6 +87,7 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
             xmsg::svc::new_svc_store(),
             std::collections::HashMap::new(),
             tokio::sync::broadcast::channel(16).0,
+            None,
         )
         .await;
     });

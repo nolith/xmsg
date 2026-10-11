@@ -1025,6 +1025,7 @@ pub async fn run_register_server(
     svc_store: crate::svc::SvcStore,
     trusted_svc_exes: HashMap<String, PathBuf>,
     svc_notify_tx: tokio::sync::broadcast::Sender<String>,
+    fed_state: Option<Arc<crate::fed::FedState>>,
 ) -> io::Result<()> {
     if let Some(parent) = sock_path.parent() {
         if let Err(e) = crate::agent::ensure_secure_socket_dir(parent, my_uid) {
@@ -1087,6 +1088,7 @@ pub async fn run_register_server(
         let svc_store_clone = svc_store.clone();
         let trusted_svc_exes_clone = trusted_svc_exes.clone();
         let svc_notify_tx_clone = svc_notify_tx.clone();
+        let fed_state_clone = fed_state.clone();
 
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1223,7 +1225,7 @@ pub async fn run_register_server(
                                     reply_ttl,
                                     false,
                                     None,
-                                    None,
+                                    fed_state_clone,
                                 )
                                 .await
                                 {

@@ -546,39 +546,8 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("cannot determine agent socket path: {e}"))?,
     };
 
-    let reg_config = agy_config.clone();
-    let reg_store = agy_store.clone();
-    let reg_pi_store = pi_store.clone();
-    let reg_sock = register_sock_path.clone();
-    let reg_db = db.clone();
-    let reg_pi_notify_tx = pi_notify_tx.clone();
-    let reg_svc_store = svc_store.clone();
-    let reg_trusted_svc_exes = trusted_svc_exes.clone();
-    let reg_svc_notify_tx = svc_notify_tx.clone();
     let reply_ttl = Duration::from_secs(args.reply_ttl);
     let idempotency_ttl = Duration::from_secs(args.idempotency_ttl);
-
-    if !args.leaf {
-        tokio::spawn(async move {
-            if let Err(e) = xmsg::agy::run_register_server(
-                reg_sock,
-                reg_config,
-                reg_store,
-                reg_pi_store,
-                reg_db,
-                reg_pi_notify_tx,
-                reply_ttl,
-                my_uid,
-                reg_svc_store,
-                reg_trusted_svc_exes,
-                reg_svc_notify_tx,
-            )
-            .await
-            {
-                tracing::error!("register server error: {e}");
-            }
-        });
-    }
 
     if (args.peers_file.is_some() || args.fed_listen.is_some())
         && (args.fed_cert.is_none() || args.fed_key.is_none())
@@ -699,9 +668,9 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         sessions_dirs,
         agy_config: agy_config.clone(),
-        agy_store,
-        pi_store,
-        pi_notify_tx,
+        agy_store: agy_store.clone(),
+        pi_store: pi_store.clone(),
+        pi_notify_tx: pi_notify_tx.clone(),
         svc_store: svc_store.clone(),
         svc_notify_tx: svc_notify_tx.clone(),
         host_label,
@@ -721,6 +690,37 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             if let Err(e) = xmsg::agent::run_agent_server(agent_sock, agent_state, my_uid).await {
                 tracing::error!("agent server error: {e}");
+            }
+        });
+
+        let reg_sock = register_sock_path.clone();
+        let reg_config = agy_config.clone();
+        let reg_store = agy_store.clone();
+        let reg_pi_store = pi_store.clone();
+        let reg_db = db.clone();
+        let reg_pi_notify_tx = pi_notify_tx.clone();
+        let reg_svc_store = svc_store.clone();
+        let reg_trusted_svc_exes = trusted_svc_exes.clone();
+        let reg_svc_notify_tx = svc_notify_tx.clone();
+        let reg_fed_state = fed_state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = xmsg::agy::run_register_server(
+                reg_sock,
+                reg_config,
+                reg_store,
+                reg_pi_store,
+                reg_db,
+                reg_pi_notify_tx,
+                reply_ttl,
+                my_uid,
+                reg_svc_store,
+                reg_trusted_svc_exes,
+                reg_svc_notify_tx,
+                reg_fed_state,
+            )
+            .await
+            {
+                tracing::error!("register server error: {e}");
             }
         });
     }

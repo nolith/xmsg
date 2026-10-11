@@ -121,6 +121,7 @@ async fn setup_harness(service_name: &str) -> SvcTestHarness {
             reg_svc_store,
             reg_trusted_svc,
             reg_svc_notify,
+            None,
         )
         .await;
     });

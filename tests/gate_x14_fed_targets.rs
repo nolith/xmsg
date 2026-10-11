@@ -209,6 +209,7 @@ async fn create_fed_test_node(
             reg_svc_store,
             reg_trusted_svc,
             reg_svc_notify,
+            None,
         )
         .await;
     });

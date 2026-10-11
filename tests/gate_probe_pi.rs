@@ -173,6 +173,7 @@ async fn setup_gate_harness() -> GateHarness {
             xmsg::svc::new_svc_store(),
             std::collections::HashMap::new(),
             tokio::sync::broadcast::channel(16).0,
+            None,
         )
         .await;
     });

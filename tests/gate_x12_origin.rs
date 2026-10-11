@@ -145,6 +145,7 @@ async fn test_oracle_1_local_attested_session_origin() {
             reg_svc_store,
             reg_trusted_svc,
             reg_svc_notify,
+            None,
         )
         .await;
     });
@@ -413,6 +414,7 @@ async fn create_fed_test_node(
             reg_svc_store,
             reg_trusted_svc,
             reg_svc_notify,
+            None,
         )
         .await;
     });
@@ -878,6 +880,7 @@ async fn test_oracle_4_pre_migration_row_delivered_with_default_anonymous_origin
             r_sst,
             trusted_svc_exes,
             r_svc_not,
+            None,
         )
         .await;
     });
