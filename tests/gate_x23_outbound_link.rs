@@ -151,104 +151,136 @@ struct NodeFixture {
 
 async fn spawn_hub_node(
     name: &str,
-    fed_port: u16,
     cert_pem: &str,
     key_pem: &str,
     client_name: &str,
     client_pin: &str,
-) -> NodeFixture {
-    let tmp = tempdir().unwrap();
-    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+) -> (NodeFixture, u16) {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let fed_port = get_free_port();
 
-    let cert_file = tmp.path().join("cert.pem");
-    let key_file = tmp.path().join("key.pem");
-    let peers_file = tmp.path().join("peers.json");
-    let db_path = tmp.path().join("hub.db");
+        let tmp = tempdir().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
 
-    fs::write(&cert_file, cert_pem.as_bytes()).unwrap();
-    fs::write(&key_file, key_pem.as_bytes()).unwrap();
+        let cert_file = tmp.path().join("cert.pem");
+        let key_file = tmp.path().join("key.pem");
+        let peers_file = tmp.path().join("peers.json");
+        let db_path = tmp.path().join("hub.db");
 
-    let peers_json = serde_json::json!({
-        client_name: {
-            "address": "127.0.0.1:0",
-            "pin": normalize_pin(client_pin),
-            "leaf": true,
-            "allow": ["send", "reply", "inbox"]
+        fs::write(&cert_file, cert_pem.as_bytes()).unwrap();
+        fs::write(&key_file, key_pem.as_bytes()).unwrap();
+
+        let peers_json = serde_json::json!({
+            client_name: {
+                "address": "127.0.0.1:0",
+                "pin": normalize_pin(client_pin),
+                "leaf": true,
+                "allow": ["send", "reply", "inbox"]
+            }
+        });
+        fs::write(&peers_file, peers_json.to_string()).unwrap();
+
+        let run_dir = tmp.path().join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let sessions_dir = tmp.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let agent_sock = run_dir.join("agent.sock");
+        let register_sock = run_dir.join("register.sock");
+        let http_sock = run_dir.join("http.sock");
+
+        let bin = env!("CARGO_BIN_EXE_xmsg");
+        let child = tokio::process::Command::new(bin)
+            .env("XDG_RUNTIME_DIR", &run_dir)
+            .args([
+                "serve",
+                "--host-label",
+                name,
+                "--listen",
+                "127.0.0.1:0",
+                "--fed-listen",
+                &format!("127.0.0.1:{fed_port}"),
+                "--peers-file",
+                peers_file.to_str().unwrap(),
+                "--fed-cert",
+                cert_file.to_str().unwrap(),
+                "--fed-key",
+                key_file.to_str().unwrap(),
+                "--db-path",
+                db_path.to_str().unwrap(),
+                "--sessions-dir",
+                sessions_dir.to_str().unwrap(),
+                "--register-sock",
+                register_sock.to_str().unwrap(),
+                "--agent-sock",
+                agent_sock.to_str().unwrap(),
+                "--http-sock",
+                http_sock.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn hub node");
+
+        let mut guard = ChildGuard::new(child);
+
+        let mut ready = false;
+        let mut exited = None;
+        for _ in 0..100 {
+            if let Ok(Some(status)) = guard.child_mut().try_wait() {
+                exited = Some(status);
+                break;
+            }
+            if agent_sock.exists()
+                && tokio::net::TcpStream::connect(("127.0.0.1", fed_port))
+                    .await
+                    .is_ok()
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    });
-    fs::write(&peers_file, peers_json.to_string()).unwrap();
 
-    let run_dir = tmp.path().join("run");
-    fs::create_dir_all(&run_dir).unwrap();
-    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
-
-    let sessions_dir = tmp.path().join("sessions");
-    fs::create_dir_all(&sessions_dir).unwrap();
-    fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o700)).unwrap();
-
-    let agent_sock = run_dir.join("agent.sock");
-    let register_sock = run_dir.join("register.sock");
-    let http_sock = run_dir.join("http.sock");
-
-    let bin = env!("CARGO_BIN_EXE_xmsg");
-    let child = tokio::process::Command::new(bin)
-        .env("XDG_RUNTIME_DIR", &run_dir)
-        .args([
-            "serve",
-            "--host-label",
-            name,
-            "--listen",
-            "127.0.0.1:0",
-            "--fed-listen",
-            &format!("127.0.0.1:{fed_port}"),
-            "--peers-file",
-            peers_file.to_str().unwrap(),
-            "--fed-cert",
-            cert_file.to_str().unwrap(),
-            "--fed-key",
-            key_file.to_str().unwrap(),
-            "--db-path",
-            db_path.to_str().unwrap(),
-            "--sessions-dir",
-            sessions_dir.to_str().unwrap(),
-            "--register-sock",
-            register_sock.to_str().unwrap(),
-            "--agent-sock",
-            agent_sock.to_str().unwrap(),
-            "--http-sock",
-            http_sock.to_str().unwrap(),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn hub node");
-
-    let mut guard = ChildGuard::new(child);
-
-    let mut ready = false;
-    for _ in 0..100 {
-        if let Ok(Some(status)) = guard.child_mut().try_wait() {
-            panic!("hub node exited prematurely: {:?}", status);
+        if ready {
+            return (
+                NodeFixture {
+                    _tmp: tmp,
+                    agent_sock,
+                    register_sock,
+                    sessions_dir,
+                    db_path,
+                    child: guard,
+                },
+                fed_port,
+            );
         }
-        if agent_sock.exists()
-            && tokio::net::TcpStream::connect(("127.0.0.1", fed_port))
-                .await
-                .is_ok()
+
+        let mut stderr = String::new();
+        if let Some(mut err) = guard.child_mut().stderr.take() {
+            let _ = tokio::io::AsyncReadExt::read_to_string(&mut err, &mut stderr).await;
+        }
+        if exited.is_some()
+            && (stderr.contains("AddrInUse")
+                || stderr.contains("address already in use")
+                || stderr.contains("Address already in use")
+                || stderr.contains("failed to bind federation listener"))
+            && attempt < 5
         {
-            ready = true;
-            break;
+            eprintln!(
+                "hub node lost port {fed_port} before binding, retrying (attempt {attempt}): {stderr}"
+            );
+            continue;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(ready, "hub node failed to become ready");
-
-    NodeFixture {
-        _tmp: tmp,
-        agent_sock,
-        register_sock,
-        sessions_dir,
-        db_path,
-        child: guard,
+        panic!(
+            "hub node exited prematurely: {:?}, stderr:\n{}",
+            exited, stderr
+        );
     }
 }
 
@@ -334,7 +366,14 @@ async fn spawn_client_node(
     let mut ready = false;
     for _ in 0..100 {
         if let Ok(Some(status)) = guard.child_mut().try_wait() {
-            panic!("client node exited prematurely: {:?}", status);
+            let mut stderr = String::new();
+            if let Some(mut err) = guard.child_mut().stderr.take() {
+                let _ = tokio::io::AsyncReadExt::read_to_string(&mut err, &mut stderr).await;
+            }
+            panic!(
+                "client node exited prematurely: {:?}, stderr:\n{}",
+                status, stderr
+            );
         }
         if agent_sock.exists() && register_sock.exists() {
             ready = true;
@@ -364,8 +403,7 @@ async fn test_oracle_1_inbound_over_outbound_link() {
     let (cert_hub, key_hub, pin_hub) = generate_self_signed_ed25519_pem("hub").unwrap();
     let (cert_client, key_client, pin_client) = generate_self_signed_ed25519_pem("client").unwrap();
 
-    let hub_port = get_free_port();
-    let hub = spawn_hub_node("hub", hub_port, &cert_hub, &key_hub, "client", &pin_client).await;
+    let (hub, hub_port) = spawn_hub_node("hub", &cert_hub, &key_hub, "client", &pin_client).await;
     let client = spawn_client_node(
         "client",
         &cert_client,
@@ -444,8 +482,7 @@ async fn test_oracle_2_outbound_send_from_undialable_node() {
     let (cert_hub, key_hub, pin_hub) = generate_self_signed_ed25519_pem("hub").unwrap();
     let (cert_client, key_client, pin_client) = generate_self_signed_ed25519_pem("client").unwrap();
 
-    let hub_port = get_free_port();
-    let hub = spawn_hub_node("hub", hub_port, &cert_hub, &key_hub, "client", &pin_client).await;
+    let (hub, hub_port) = spawn_hub_node("hub", &cert_hub, &key_hub, "client", &pin_client).await;
     let client = spawn_client_node(
         "client",
         &cert_client,
@@ -525,8 +562,7 @@ async fn test_oracle_3_svc_over_outbound_link() {
     let current_exe = std::env::current_exe().unwrap();
     let svc_exe_arg = format!("guard={}", current_exe.display());
 
-    let hub_port = get_free_port();
-    let hub = spawn_hub_node("hub", hub_port, &cert_hub, &key_hub, "client", &pin_client).await;
+    let (hub, hub_port) = spawn_hub_node("hub", &cert_hub, &key_hub, "client", &pin_client).await;
     let client = spawn_client_node(
         "client",
         &cert_client,
@@ -703,7 +739,14 @@ async fn test_oracle_4_off_by_default_no_pull_loop() {
     let mut ready = false;
     for _ in 0..100 {
         if let Ok(Some(status)) = guard.child_mut().try_wait() {
-            panic!("plain node exited prematurely: {:?}", status);
+            let mut stderr = String::new();
+            if let Some(mut err) = guard.child_mut().stderr.take() {
+                let _ = tokio::io::AsyncReadExt::read_to_string(&mut err, &mut stderr).await;
+            }
+            panic!(
+                "plain node exited prematurely: {:?}, stderr:\n{}",
+                status, stderr
+            );
         }
         if agent_sock.exists() && register_sock.exists() {
             ready = true;
@@ -740,8 +783,7 @@ async fn test_oracle_5_unknown_ref_acked_and_error_reply() {
     let (cert_hub, key_hub, pin_hub) = generate_self_signed_ed25519_pem("hub").unwrap();
     let (cert_client, key_client, pin_client) = generate_self_signed_ed25519_pem("client").unwrap();
 
-    let hub_port = get_free_port();
-    let hub = spawn_hub_node("hub", hub_port, &cert_hub, &key_hub, "client", &pin_client).await;
+    let (hub, hub_port) = spawn_hub_node("hub", &cert_hub, &key_hub, "client", &pin_client).await;
     let _client = spawn_client_node(
         "client",
         &cert_client,
