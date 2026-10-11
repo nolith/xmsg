@@ -3804,6 +3804,13 @@ async fn test_n7_f6_unspecified_address_binds() {
     std::fs::write(&key_file, key_pem).unwrap();
     std::fs::write(&peers_file, "{}").unwrap();
 
+    // ponytail: the port is free when picked but could be taken before the child binds it; nothing
+    // else in this file binds a fixed port, so a collision is unlikely.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let bin = env!("CARGO_BIN_EXE_xmsg");
     let mut child = std::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", tmp.path())
@@ -3812,7 +3819,7 @@ async fn test_n7_f6_unspecified_address_binds() {
             "--listen",
             "127.0.0.1:0",
             "--fed-listen",
-            "0.0.0.0:0",
+            &format!("0.0.0.0:{port}"),
             "--peers-file",
             peers_file.to_str().unwrap(),
             "--fed-cert",
@@ -3824,39 +3831,37 @@ async fn test_n7_f6_unspecified_address_binds() {
             "--sessions-dir",
             tmp.path().join("sessions").to_str().unwrap(),
         ])
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
 
-    // The bind is logged before the server starts serving; wait for it, or for the child to exit.
-    let (tx, rx) = std::sync::mpsc::channel();
-    for out in [
-        Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
-        Box::new(child.stderr.take().unwrap()),
-    ] {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            for line in std::io::BufRead::lines(std::io::BufReader::new(out)).map_while(Result::ok)
-            {
-                let _ = tx.send(line);
-            }
-        });
-    }
-    drop(tx);
-    let mut seen = Vec::new();
-    let bound = loop {
-        match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(line) if line.contains("bound federation mTLS listener") => break true,
-            Ok(line) => seen.push(line),
-            Err(_) => break false,
+    // A listener on 0.0.0.0 accepts on loopback too.
+    let mut bound = false;
+    let mut exited = None;
+    for _ in 0..100 {
+        if let Some(status) = child.try_wait().unwrap() {
+            exited = Some(status);
+            break;
         }
-    };
-    let _ = child.kill();
-    let _ = child.wait();
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            bound = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if exited.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let mut stderr = String::new();
+    let _ = std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr);
     assert!(
         bound,
-        "0.0.0.0 must bind for --fed-listen; output: {seen:#?}"
+        "0.0.0.0 must bind for --fed-listen (exit: {exited:?}): {stderr}"
     );
 }
 
