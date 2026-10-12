@@ -1174,8 +1174,7 @@ async fn test_oracle_9_service_name_validation_refusals() {
 
     for bad_name in bad_names {
         let (client_read, server_write) = tokio::io::duplex(1024);
-        let (server_read, _client_write) = tokio::io::duplex(1024);
-        let reader = tokio::io::BufReader::new(server_read);
+        let reader = tokio::io::BufReader::new(tokio::io::empty());
 
         let req = xmsg::svc::SvcRegisterRequest {
             name: bad_name.to_string(),
