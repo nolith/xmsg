@@ -12,14 +12,6 @@ use xmsg::http::{build_router, AppState};
 use xmsg::inbox::InboxLine;
 use xmsg::mcp::{run_mcp_loop, McpConfig};
 
-fn get_self_proc_start() -> String {
-    xmsg::process::starttime(
-        std::path::Path::new(xmsg::process::LIVE_PROC_ROOT),
-        std::process::id(),
-    )
-    .expect("live starttime")
-}
-
 fn write_proc_stat(proc_dir: &Path, pid: u32, ppid: u32, proc_start: &str) {
     let pid_dir = proc_dir.join(pid.to_string());
     fs::create_dir_all(&pid_dir).expect("create pid dir");
@@ -129,16 +121,15 @@ async fn start_mcp_harness() -> McpHarness {
         }
     });
 
-    let my_pid = std::process::id();
-    let my_proc_start = get_self_proc_start();
-
-    // Create target session (PID my_pid so HTTP server can verify liveness against real /proc)
+    let target_pid = 5000;
+    let target_proc_start = "start_5000";
+    write_proc_stat(proc_dir.path(), target_pid, 1, target_proc_start);
     write_session_file(
         sess_dir.path(),
-        my_pid,
+        target_pid,
         "sess-target-5000",
         "target-agent",
-        &my_proc_start,
+        target_proc_start,
         &sock_path,
     );
 
@@ -439,7 +430,7 @@ async fn test_mcp_send_and_reply_with_derived_caller() {
 
     // 2. reply to the message via MCP
     // Reconfigure ancestor for target-agent (session_id = sess-target-5000)
-    let _ = fs::remove_file(harness.sessions_dir.join(format!("{my_pid}.json")));
+    let _ = fs::remove_file(harness.sessions_dir.join("5000.json"));
     let target_sock = harness.proc_root.join("target.sock");
     write_session_file(
         &harness.sessions_dir,
