@@ -410,9 +410,9 @@ pub async fn run_agent_server(
                                             conv_id,
                                             reg.pid,
                                             reg.starttime,
-                                            None,
-                                        )
-                                    });
+                                        None,
+                                    )
+                                });
                             }
                             let _ = crate::claim::sync_claims(
                                 &state_clone.db,

@@ -467,22 +467,30 @@ async fn test_oracle_3_duplicate_session_across_dirs_assigned_suffixes_and_route
     {
         let lines_plain = listener.received_lines.lock().await;
         assert!(
-            lines_plain.iter().any(|l| l.contains("Message to plain duplicate")),
+            lines_plain
+                .iter()
+                .any(|l| l.contains("Message to plain duplicate")),
             "plain listener must receive message to plain duplicate"
         );
         assert!(
-            !lines_plain.iter().any(|l| l.contains("Message to fork duplicate")),
+            !lines_plain
+                .iter()
+                .any(|l| l.contains("Message to fork duplicate")),
             "plain listener must NOT receive message to fork duplicate"
         );
     }
     {
         let lines_fork = listener_b.received_lines.lock().await;
         assert!(
-            lines_fork.iter().any(|l| l.contains("Message to fork duplicate")),
+            lines_fork
+                .iter()
+                .any(|l| l.contains("Message to fork duplicate")),
             "fork listener must receive message to fork duplicate"
         );
         assert!(
-            !lines_fork.iter().any(|l| l.contains("Message to plain duplicate")),
+            !lines_fork
+                .iter()
+                .any(|l| l.contains("Message to plain duplicate")),
             "fork listener must NOT receive message to plain duplicate"
         );
     }

@@ -9,9 +9,7 @@ use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Mutex;
 
 use xmsg::agy::{new_agy_store, AgyConfig, AgySessionInfo};
-use xmsg::claim::{
-    get_all_claims_for_id, is_uuid_shaped, sync_claims_db, validate_service_name,
-};
+use xmsg::claim::{get_all_claims_for_id, is_uuid_shaped, sync_claims_db, validate_service_name};
 use xmsg::http::{build_router, AppState};
 use xmsg::pi::new_pi_store;
 use xmsg::storage::init_db;
@@ -623,11 +621,8 @@ async fn test_oracle_5_fork_identity_attribution_and_routing() {
     );
 
     // 3. From-attribution: message sent by P2 is attributed to X~2, NOT X
-    let badge = xmsg::inbox::sanitize_attested_from(
-        "test-node",
-        &caller_p2.harness,
-        &caller_p2.session_id,
-    );
+    let badge =
+        xmsg::inbox::sanitize_attested_from("test-node", &caller_p2.harness, &caller_p2.session_id);
     assert_eq!(
         badge,
         format!("xmsg@test-node · claude:{conv_id}~2"),
@@ -720,7 +715,13 @@ async fn test_oracle_6_fork_notice_exact_text_and_single_delivery() {
     }
 
     // First process starts: no fork notice
-    let (_, notices) = sync_claims_db(&conn.lock().unwrap(), &proc_root, &sessions_dir, "test-node").unwrap();
+    let (_, notices) = sync_claims_db(
+        &conn.lock().unwrap(),
+        &proc_root,
+        &sessions_dir,
+        "test-node",
+    )
+    .unwrap();
     xmsg::claim::deliver_fork_notices(&conn, notices).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(listener_p1.received_lines.lock().await.len(), 0);
@@ -736,7 +737,13 @@ async fn test_oracle_6_fork_notice_exact_text_and_single_delivery() {
         &listener_p2.sock_path,
     );
 
-    let (_, notices) = sync_claims_db(&conn.lock().unwrap(), &proc_root, &sessions_dir, "test-node").unwrap();
+    let (_, notices) = sync_claims_db(
+        &conn.lock().unwrap(),
+        &proc_root,
+        &sessions_dir,
+        "test-node",
+    )
+    .unwrap();
     xmsg::claim::deliver_fork_notices(&conn, notices).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -769,7 +776,13 @@ async fn test_oracle_6_fork_notice_exact_text_and_single_delivery() {
     );
 
     // Subsequent sync: NO duplicate notice delivered
-    let (_, notices) = sync_claims_db(&conn.lock().unwrap(), &proc_root, &sessions_dir, "test-node").unwrap();
+    let (_, notices) = sync_claims_db(
+        &conn.lock().unwrap(),
+        &proc_root,
+        &sessions_dir,
+        "test-node",
+    )
+    .unwrap();
     xmsg::claim::deliver_fork_notices(&conn, notices).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
@@ -850,10 +863,13 @@ async fn test_oracle_7_agy_conversation_uuid_across_restart() {
     .expect("attest 7777");
 
     assert_eq!(reg1.1, conv_uuid);
-    let session_key = reg1.1.clone();
-    assert_eq!(session_key, conv_uuid, "Session key MUST be conversation UUID");
+    assert_eq!(
+        reg1.0.session_key, conv_uuid,
+        "Session key MUST be conversation UUID"
+    );
+    let session_key = reg1.0.session_key.clone();
 
-    let session_info = AgySessionInfo::new(conv_uuid.to_string(), 7777, "100".to_string(), None);
+    let session_info = AgySessionInfo::new(session_key.clone(), 7777, "100".to_string(), None);
     assert_eq!(session_info.session_key, conv_uuid);
     assert_eq!(session_info.conversation_id, conv_uuid);
     assert!(is_uuid_shaped(&session_info.session_key));
@@ -920,18 +936,29 @@ async fn test_oracle_7_agy_conversation_uuid_across_restart() {
     .expect("attest 8888");
 
     assert_eq!(reg2.1, conv_uuid);
+    assert_eq!(
+        reg2.0.session_key, conv_uuid,
+        "Restarted session key MUST be conversation UUID"
+    );
 
     // Emulate mcp_start store update:
     {
         let mut store_lock = agy_store.write().unwrap();
         store_lock
-            .entry(reg2.1.clone())
+            .entry(reg2.0.session_key.clone())
             .and_modify(|current| {
                 if current.pid != 8888 || current.starttime != "300" {
-                    *current = AgySessionInfo::new(reg2.1.clone(), 8888, "300".to_string(), None);
+                    *current = AgySessionInfo::new(
+                        reg2.0.session_key.clone(),
+                        8888,
+                        "300".to_string(),
+                        None,
+                    );
                 }
             })
-            .or_insert_with(|| AgySessionInfo::new(reg2.1.clone(), 8888, "300".to_string(), None));
+            .or_insert_with(|| {
+                AgySessionInfo::new(reg2.0.session_key.clone(), 8888, "300".to_string(), None)
+            });
     }
 
     // 3. Restarted agy resolves as caller under conversation UUID
@@ -1128,6 +1155,9 @@ async fn test_oracle_9_service_name_validation_refusals() {
     let (svc_notify_tx, _) = tokio::sync::broadcast::channel(16);
     let my_uid = xmsg::agent::current_uid();
     setup_mock_proc(&proc_root, 9991, "100");
+    let exe_path = proc_root.join("mock_exe");
+    fs::write(&exe_path, "exe").unwrap();
+    let _ = std::os::unix::fs::symlink(&exe_path, proc_root.join("9991").join("exe"));
 
     let bad_names = [
         "xmsg",
@@ -1136,6 +1166,11 @@ async fn test_oracle_9_service_name_validation_refusals() {
         "worker.dot",
         "worker~tilde",
     ];
+
+    let mut trusted = std::collections::HashMap::new();
+    for bad_name in bad_names {
+        trusted.insert(bad_name.to_string(), exe_path.clone());
+    }
 
     for bad_name in bad_names {
         let (client_read, server_write) = tokio::io::duplex(1024);
@@ -1147,7 +1182,6 @@ async fn test_oracle_9_service_name_validation_refusals() {
             cwd: None,
         };
 
-        let trusted = std::collections::HashMap::new();
         let res = xmsg::svc::handle_svc_connection(
             reader,
             server_write,
