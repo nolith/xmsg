@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod agent;
 pub mod agy;
+pub mod claim;
 pub mod error;
 pub mod fed;
 pub mod http;

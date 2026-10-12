@@ -106,7 +106,7 @@ fn cell_1_accept_trusted_exe_and_lock_open() {
 
     assert_eq!(reg.pid, 2000);
     assert_eq!(reg.starttime, "1000");
-    assert_eq!(reg.session_key, "agy:2000:1000");
+    assert_eq!(reg.session_key, "conv-1");
 }
 
 /// Cell 2: Refuse - ancestor has file open but untrusted exe (argv claims agy, exe differs).

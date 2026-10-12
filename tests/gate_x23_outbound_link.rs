@@ -589,7 +589,7 @@ async fn test_oracle_3_svc_over_outbound_link() {
         .unwrap();
     let reg_resp = read_json_line(&mut reader).await;
     assert_eq!(reg_resp["status"], "ok");
-    assert_eq!(reg_resp["sessionId"], "svc:guard");
+    assert_eq!(reg_resp["sessionId"], "guard");
 
     // 2. Alice on hub sends to svc:guard@client
     let send_resp = send_via_agent_sock(

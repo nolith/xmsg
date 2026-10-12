@@ -9,7 +9,7 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use xmsg::http::{build_router, AppState};
 use xmsg::inbox::InboxLine;
-use xmsg::registry::{list_sessions, resolve_session, resolve_sessions_dirs, SessionsQuery};
+use xmsg::registry::{list_sessions, resolve_sessions_dirs, SessionsQuery};
 
 fn get_self_proc_start() -> String {
     xmsg::process::starttime(Path::new(xmsg::process::LIVE_PROC_ROOT), std::process::id())
@@ -327,7 +327,16 @@ async fn test_oracle_3_duplicate_session_across_dirs_excluded_fail_closed() {
     let my_pid = std::process::id();
     let my_proc_start = get_self_proc_start();
 
-    // Session with same ID in BOTH dir_a and dir_b
+    // Session with same ID in BOTH dir_a and dir_b but distinct processes
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn child process");
+    let child_pid = child.id();
+    let child_proc_start =
+        xmsg::process::starttime(Path::new(xmsg::process::LIVE_PROC_ROOT), child_pid).unwrap();
+    let listener_b = start_socket_listener("inbox_test_b").await;
+
     let duplicate_id = "sess-colliding-dup-999";
     write_claude_session(
         dir_a.path(),
@@ -339,11 +348,11 @@ async fn test_oracle_3_duplicate_session_across_dirs_excluded_fail_closed() {
     );
     write_claude_session(
         dir_b.path(),
-        my_pid,
+        child_pid,
         duplicate_id,
         "worker-dup-in-b",
-        &my_proc_start,
-        &listener.sock_path,
+        &child_proc_start,
+        &listener_b.sock_path,
     );
 
     // Unique session in dir_b
@@ -359,31 +368,7 @@ async fn test_oracle_3_duplicate_session_across_dirs_excluded_fail_closed() {
 
     let configured_dirs = vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()];
 
-    // 1. Registry list check: duplicate session must NOT be listed
-    let sessions = list_sessions(&configured_dirs, &SessionsQuery::default());
-    let listed_ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
-    assert!(
-        !listed_ids.contains(&duplicate_id),
-        "Duplicate session ID across dirs must NOT be listed (fail closed)"
-    );
-    assert!(
-        listed_ids.contains(&unique_id),
-        "Unique session must be listed normally"
-    );
-
-    // 2. Registry resolve check: duplicate session must fail to resolve
-    let resolve_dup = resolve_session(&configured_dirs, duplicate_id);
-    assert!(
-        resolve_dup.is_err(),
-        "Resolving duplicate session ID must fail closed"
-    );
-    let resolve_unique = resolve_session(&configured_dirs, unique_id);
-    assert!(
-        resolve_unique.is_ok(),
-        "Resolving unique session ID must succeed"
-    );
-
-    // 3. HTTP Server behavior
+    // 1. HTTP Server behavior: claim table assigns X and X~2
     let server = start_test_server(configured_dirs).await;
     let client = reqwest::Client::new();
 
@@ -397,35 +382,60 @@ async fn test_oracle_3_duplicate_session_across_dirs_excluded_fail_closed() {
         .iter()
         .filter_map(|s| s["sessionId"].as_str())
         .collect();
+
+    let fork_id = format!("{duplicate_id}~2");
     assert!(
-        !returned_ids.contains(&duplicate_id),
-        "HTTP /v1/sessions must NOT return duplicate session ID"
+        returned_ids.contains(&duplicate_id),
+        "HTTP /v1/sessions must return plain session ID for first process"
+    );
+    assert!(
+        returned_ids.contains(&fork_id.as_str()),
+        "HTTP /v1/sessions must return fork session ID (~2) for second process"
     );
     assert!(
         returned_ids.contains(&unique_id),
         "HTTP /v1/sessions must return unique session ID"
     );
 
-    // 4. Delivery to duplicate session must fail 404 (fail closed)
-    let post_dup = client
+    // 2. Delivery to plain duplicate session reaches first process (202)
+    let post_plain = client
         .post(format!(
             "{}/v1/sessions/{duplicate_id}/messages",
             server.base_url
         ))
         .json(&serde_json::json!({
             "from": "claude",
-            "text": "Message to duplicate"
+            "text": "Message to plain duplicate"
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(
-        post_dup.status(),
-        404,
-        "Delivery to duplicate session must return 404 Not Found"
+        post_plain.status(),
+        202,
+        "Delivery to plain duplicate session must return 202 Accepted"
     );
 
-    // 5. Delivery to unique session must succeed 202
+    // 3. Delivery to fork duplicate session reaches second process (202)
+    let post_fork = client
+        .post(format!(
+            "{}/v1/sessions/{fork_id}/messages",
+            server.base_url
+        ))
+        .json(&serde_json::json!({
+            "from": "claude",
+            "text": "Message to fork duplicate"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        post_fork.status(),
+        202,
+        "Delivery to fork duplicate session must return 202 Accepted"
+    );
+
+    // 4. Delivery to unique session must succeed 202
     let post_unique = client
         .post(format!(
             "{}/v1/sessions/{unique_id}/messages",
@@ -443,4 +453,6 @@ async fn test_oracle_3_duplicate_session_across_dirs_excluded_fail_closed() {
         202,
         "Delivery to unique session must return 202 Accepted"
     );
+
+    let _ = child.kill();
 }

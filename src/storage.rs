@@ -236,6 +236,28 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_forwarded_messages_created_at ON forwarded_messages(created_at);
+
+        CREATE TABLE IF NOT EXISTS instance_claims (
+            id TEXT NOT NULL,
+            pid INTEGER NOT NULL,
+            proc_start TEXT NOT NULL,
+            suffix INTEGER NOT NULL,
+            released INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (id, pid, proc_start)
+        );
+        CREATE INDEX IF NOT EXISTS idx_instance_claims_id ON instance_claims(id);
+        CREATE INDEX IF NOT EXISTS idx_instance_claims_proc ON instance_claims(pid, proc_start);
+
+        CREATE TABLE IF NOT EXISTS fork_notices (
+            id TEXT NOT NULL,
+            pid1 INTEGER NOT NULL,
+            proc_start1 TEXT NOT NULL,
+            pid2 INTEGER NOT NULL,
+            proc_start2 TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (id, pid1, proc_start1, pid2, proc_start2)
+        );
         "#,
     )?;
 
@@ -752,10 +774,15 @@ pub fn get_next_pending_svc_message(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Option<SvcPendingMessage>> {
+    let alt_session_id = if let Some(stripped) = session_id.strip_prefix("svc:") {
+        stripped.to_string()
+    } else {
+        format!("svc:{session_id}")
+    };
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, created_at, from_name, bytes, text, envelope, delivered_at, origin FROM svc_pending_messages WHERE session_id = ?1 AND delivered_at IS NULL ORDER BY created_at ASC, rowid ASC LIMIT 1",
+        "SELECT id, session_id, created_at, from_name, bytes, text, envelope, delivered_at, origin FROM svc_pending_messages WHERE (session_id = ?1 OR session_id = ?2) AND delivered_at IS NULL ORDER BY created_at ASC, rowid ASC LIMIT 1",
     )?;
-    let mut rows = stmt.query(params![session_id])?;
+    let mut rows = stmt.query(params![session_id, alt_session_id])?;
 
     if let Some(row) = rows.next()? {
         let bytes_i64: i64 = row.get(4)?;
@@ -778,10 +805,15 @@ pub fn get_next_pending_svc_message(
 }
 
 pub fn ack_svc_message(conn: &Connection, session_id: &str, message_id: &str) -> Result<bool> {
+    let alt_session_id = if let Some(stripped) = session_id.strip_prefix("svc:") {
+        stripped.to_string()
+    } else {
+        format!("svc:{session_id}")
+    };
     let now = now_epoch_secs();
     let count = conn.execute(
-        "UPDATE svc_pending_messages SET delivered_at = ?1 WHERE id = ?2 AND session_id = ?3 AND delivered_at IS NULL",
-        params![now, message_id, session_id],
+        "UPDATE svc_pending_messages SET delivered_at = ?1 WHERE id = ?2 AND (session_id = ?3 OR session_id = ?4) AND delivered_at IS NULL",
+        params![now, message_id, session_id, alt_session_id],
     )?;
     Ok(count > 0)
 }

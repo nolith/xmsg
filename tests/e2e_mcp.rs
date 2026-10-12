@@ -439,6 +439,7 @@ async fn test_mcp_send_and_reply_with_derived_caller() {
 
     // 2. reply to the message via MCP
     // Reconfigure ancestor for target-agent (session_id = sess-target-5000)
+    let _ = fs::remove_file(harness.sessions_dir.join(format!("{my_pid}.json")));
     let target_sock = harness.proc_root.join("target.sock");
     write_session_file(
         &harness.sessions_dir,

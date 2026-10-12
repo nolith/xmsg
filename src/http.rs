@@ -138,6 +138,8 @@ pub(crate) fn resolve_target(
     agy_store: &crate::agy::AgyStore,
     pi_store: &crate::pi::PiStore,
     svc_store: &crate::svc::SvcStore,
+    conn: Option<&rusqlite::Connection>,
+    host_label: &str,
     ref_str: &str,
 ) -> Result<ResolvedTarget, AppError> {
     let claude_ref = ref_str
@@ -145,7 +147,18 @@ pub(crate) fn resolve_target(
         .or_else(|| ref_str.strip_prefix("session:"))
         .unwrap_or(ref_str);
 
-    match registry::resolve_session(sessions_dirs, claude_ref) {
+    let claude_res = match conn {
+        Some(c) => crate::claim::resolve_claude_session(
+            c,
+            &agy_config.proc_root,
+            sessions_dirs,
+            host_label,
+            claude_ref,
+        ),
+        None => registry::resolve_session(sessions_dirs, claude_ref),
+    };
+
+    match claude_res {
         Ok((session, socket_path)) => Ok(ResolvedTarget::Claude(session, socket_path)),
         Err(AppError::Gone { session_id, pid }) => {
             if crate::process::starttime(&agy_config.proc_root, pid).is_ok() {
@@ -201,12 +214,18 @@ pub(crate) fn resolve_target_session(
     state: &AppState,
     ref_str: &str,
 ) -> Result<ResolvedTarget, AppError> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     resolve_target(
         &state.sessions_dirs,
         &state.agy_config,
         &state.agy_store,
         &state.pi_store,
         &state.svc_store,
+        Some(&db),
+        &state.host_label,
         ref_str,
     )
 }
@@ -224,7 +243,34 @@ async fn list_sessions_handler(
         return Ok((StatusCode::OK, Json(entries)).into_response());
     }
 
-    let mut sessions = registry::list_sessions(&state.sessions_dirs, &query);
+    let claude_sessions = {
+        let active_pairs = crate::claim::sync_claims(
+            &state.db,
+            &state.agy_config.proc_root,
+            &state.sessions_dirs,
+            &state.host_label,
+        )
+        .await?;
+        let mut list = Vec::new();
+        for (claim, entry) in active_pairs {
+            if let Some(ref q_cwd) = query.cwd {
+                if &entry.cwd != q_cwd && !entry.cwd.starts_with(q_cwd) {
+                    continue;
+                }
+            }
+            if let Some(ref q_status) = query.status {
+                if &entry.status != q_status {
+                    continue;
+                }
+            }
+            let mut session: registry::Session = entry.into();
+            session.session_id = claim.address();
+            list.push(session);
+        }
+        list
+    };
+
+    let mut sessions = claude_sessions;
     let mut agy_sessions =
         crate::agy::list_agy_sessions(&state.agy_config, &state.agy_store, &query);
     sessions.append(&mut agy_sessions);

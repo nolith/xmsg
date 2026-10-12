@@ -149,7 +149,7 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
     let reg_resp: Value = serde_json::from_str(&resp_line).unwrap();
     assert_eq!(reg_resp["status"], "ok");
     let derived_session_id = reg_resp["sessionId"].as_str().unwrap().to_string();
-    assert!(derived_session_id.starts_with("pi:"));
+    assert!(xmsg::claim::is_uuid_shaped(&derived_session_id));
 
     // 4. Verify session appears in GET /v1/sessions
     let client = reqwest::Client::new();

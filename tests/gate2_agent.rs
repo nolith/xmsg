@@ -266,8 +266,8 @@ async fn gate2_identity() {
     let pi_resp: serde_json::Value = serde_json::from_str(&o).unwrap();
     assert_eq!(pi_resp["status"], "ok");
     let pi_id: String = pi_resp["sessionId"].as_str().unwrap().into();
-    // Server-derived ID must be pi:<pid>:<starttime>, ignoring caller sessionId
-    assert_eq!(pi_id, format!("pi:{me}:555"));
+    // Server-derived ID must be UUID v4, ignoring caller sessionId
+    assert!(xmsg::claim::is_uuid_shaped(&pi_id));
 
     // Probe: reply to victim-claude MSG1 as registered pi -> must be rejected (not_recipient)
     let o = agent_call(

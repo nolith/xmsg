@@ -490,7 +490,7 @@ async fn test_oracle_1_end_to_end_leaf_svc() {
 
     let reg_resp = read_json_line(&mut reader).await;
     assert_eq!(reg_resp["status"], "ok");
-    assert_eq!(reg_resp["sessionId"], "svc:guard");
+    assert_eq!(reg_resp["sessionId"], "guard");
 
     // Poll message from leaf
     let poll_frame = serde_json::json!({
@@ -769,7 +769,7 @@ async fn test_oracle_3_leaf_admission_refuses_non_leaf_principal() {
         resp2["status"], "ok",
         "Registering matching leaf principal must succeed"
     );
-    assert_eq!(resp2["sessionId"], "svc:guard");
+    assert_eq!(resp2["sessionId"], "guard");
 }
 
 // =============================================================================
@@ -1447,7 +1447,8 @@ async fn test_oracle_9_storage_error_does_not_ack_and_recovers() {
         .write_all(format!("{reg_frame}\n").as_bytes())
         .await
         .unwrap();
-    let _ = read_json_line(&mut reader).await;
+    let reg_resp = read_json_line(&mut reader).await;
+    assert_eq!(reg_resp["status"], "ok");
 
     // 6. Daemon polls: leaf background task recovers, stores repolled message, delivers to svc
     let poll_res = tokio::time::timeout(Duration::from_secs(4), async {

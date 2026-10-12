@@ -252,8 +252,8 @@ async fn test_gate_probe_b2_pi_registration_and_cross_harness_reply_isolation() 
         "Server must not accept caller-asserted sessionId"
     );
     assert!(
-        derived_id.starts_with("pi:"),
-        "Server must derive session ID prefixed with pi:"
+        xmsg::claim::is_uuid_shaped(derived_id),
+        "Server must derive UUID session ID"
     );
 
     // 2. Insert message addressed to victim-claude with recipient_harness: claude

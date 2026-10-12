@@ -445,7 +445,7 @@ async fn test_oracle_1_http_caller_leaf_reply_stored_and_polled() {
         .unwrap();
     let reg_resp = read_json_line(&mut reader).await;
     assert_eq!(reg_resp["status"], "ok");
-    assert_eq!(reg_resp["sessionId"], "svc:guard");
+    assert_eq!(reg_resp["sessionId"], "guard");
 
     // 2. HTTP caller on hub sends to svc:guard@leaf
     let client = reqwest::Client::new();

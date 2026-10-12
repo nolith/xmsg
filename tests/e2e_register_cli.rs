@@ -159,8 +159,8 @@ async fn test_shipped_binary_register_cli_with_server() {
         "Credentials should be registered in store"
     );
     assert!(
-        store.read().unwrap().get(conv_id).is_none(),
-        "conversation_id must not be a direct store key"
+        store.read().unwrap().get(conv_id).is_some(),
+        "conversation_id must be a direct store key"
     );
     let info = creds_opt.unwrap();
     let creds = info.credentials.as_ref().unwrap();

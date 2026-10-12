@@ -175,7 +175,7 @@ pub async fn handle_pi_connection<
         }
     };
 
-    let session_id = format!("pi:{peer_pid}:{starttime}");
+    let session_id = crate::claim::mint_uuid_v4();
     let conflict = {
         let store_lock = store.read().unwrap();
         if let Some(existing) = store_lock.get(&session_id) {

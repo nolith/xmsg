@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::error::AppError;
 use crate::process;
@@ -209,10 +208,8 @@ pub fn is_pid_live_in(proc_root: &Path, pid: u32, expected_proc_start: &str) -> 
 pub fn read_session_entries(sessions_dirs: &(impl SessionDirs + ?Sized)) -> Vec<SessionFileEntry> {
     let dirs = sessions_dirs.to_dirs();
     let mut entries: Vec<SessionFileEntry> = Vec::new();
-    let mut seen_dir: HashMap<String, usize> = HashMap::new();
-    let mut cross_dir_duplicates: HashSet<String> = HashSet::new();
 
-    for (dir_idx, dir) in dirs.iter().enumerate() {
+    for dir in &dirs {
         let read_dir = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(err) => {
@@ -242,17 +239,6 @@ pub fn read_session_entries(sessions_dirs: &(impl SessionDirs + ?Sized)) -> Vec<
 
             match serde_json::from_str::<SessionFileEntry>(&content) {
                 Ok(session_entry) => {
-                    let sid = &session_entry.session_id;
-                    if let Some(&first_dir_idx) = seen_dir.get(sid) {
-                        if first_dir_idx != dir_idx && cross_dir_duplicates.insert(sid.clone()) {
-                            error!(
-                                "duplicate sessionId '{}' found across session directories; excluding session (fail closed)",
-                                sid
-                            );
-                        }
-                    } else {
-                        seen_dir.insert(sid.clone(), dir_idx);
-                    }
                     entries.push(session_entry);
                 }
                 Err(e) => {
@@ -262,9 +248,6 @@ pub fn read_session_entries(sessions_dirs: &(impl SessionDirs + ?Sized)) -> Vec<
         }
     }
 
-    if !cross_dir_duplicates.is_empty() {
-        entries.retain(|e| !cross_dir_duplicates.contains(&e.session_id));
-    }
     entries
 }
 

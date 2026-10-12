@@ -730,7 +730,7 @@ fn oracle_4_non_agy_ancestor_gets_no_identity_at_mcp_start() {
         Ok((reg, conv_id)) => {
             assert_eq!(reg.pid, 6000);
             assert_eq!(reg.starttime, "100");
-            assert_eq!(reg.session_key, "agy:6000:100");
+            assert_eq!(reg.session_key, "conv-oracle4");
             assert_eq!(conv_id, "conv-oracle4");
         }
         other => panic!("expected Ok for valid agy ancestor, got {other:?}"),

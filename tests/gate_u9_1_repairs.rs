@@ -159,6 +159,7 @@ fn cell_g2_agent_sock_refuses_unregistered_lock_holder() {
         &agy_store,
         &pi_store,
         &svc_store,
+        None,
         4000,
     );
 

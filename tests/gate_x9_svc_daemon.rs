@@ -228,13 +228,13 @@ async fn test_oracle_1_trusted_exe_registered_and_addressable() {
     );
     assert_eq!(
         reg_resp.get("sessionId").and_then(|s| s.as_str()),
-        Some("svc:dispatcher")
+        Some("dispatcher")
     );
 
     let client = reqwest::Client::new();
     let base_url = format!("http://127.0.0.1:{}", harness.http_port);
 
-    // 2. Query /v1/sessions: must list svc:dispatcher
+    // 2. Query /v1/sessions: must list dispatcher
     let sessions_resp: Value = client
         .get(format!("{base_url}/v1/sessions"))
         .send()
@@ -247,8 +247,8 @@ async fn test_oracle_1_trusted_exe_registered_and_addressable() {
     let sessions = sessions_resp.as_array().expect("sessions list");
     let svc_session = sessions
         .iter()
-        .find(|s| s.get("sessionId").and_then(|v| v.as_str()) == Some("svc:dispatcher"))
-        .expect("svc:dispatcher session must be present in /v1/sessions");
+        .find(|s| s.get("sessionId").and_then(|v| v.as_str()) == Some("dispatcher"))
+        .expect("dispatcher session must be present in /v1/sessions");
 
     assert_eq!(
         svc_session.get("harness").and_then(|v| v.as_str()),
@@ -277,7 +277,7 @@ async fn test_oracle_1_trusted_exe_registered_and_addressable() {
     let session_val: Value = get_prefixed.json().await.unwrap();
     assert_eq!(
         session_val.get("sessionId").and_then(|v| v.as_str()),
-        Some("svc:dispatcher")
+        Some("dispatcher")
     );
 
     // 4. Addressable as plain name (dispatcher) on /v1/sessions/:ref
@@ -307,7 +307,7 @@ async fn test_oracle_1_trusted_exe_registered_and_addressable() {
     );
     assert_eq!(
         send_val.get("sessionId").and_then(|v| v.as_str()),
-        Some("svc:dispatcher")
+        Some("dispatcher")
     );
 }
 
@@ -583,9 +583,9 @@ async fn test_oracle_5_second_live_registration_refused() {
     {
         let mut store_lock = harness.svc_store.write().unwrap();
         store_lock.insert(
-            "svc:singleton-svc".to_string(),
+            "singleton-svc".to_string(),
             xmsg::svc::SvcSessionInfo {
-                session_id: "svc:singleton-svc".to_string(),
+                session_id: "singleton-svc".to_string(),
                 name: "singleton-svc".to_string(),
                 pid: child_pid,
                 starttime: child_start.to_string(),
@@ -629,7 +629,7 @@ async fn test_oracle_5_second_live_registration_refused() {
     // Verify original registration is intact and not overwritten
     {
         let store_lock = harness.svc_store.read().unwrap();
-        let current_info = store_lock.get("svc:singleton-svc").unwrap();
+        let current_info = store_lock.get("singleton-svc").unwrap();
         assert_eq!(
             current_info.pid, child_pid,
             "Original active daemon PID must NOT be overwritten by second registration attempt"
@@ -659,6 +659,6 @@ async fn test_oracle_5_second_live_registration_refused() {
     );
     assert_eq!(
         reg_resp2.get("sessionId").and_then(|s| s.as_str()),
-        Some("svc:singleton-svc")
+        Some("singleton-svc")
     );
 }

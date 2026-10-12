@@ -44,7 +44,7 @@ impl AgySessionInfo {
         starttime: String,
         credentials: Option<AgyCredentials>,
     ) -> Self {
-        let session_key = format!("agy:{pid}:{starttime}");
+        let session_key = conversation_id.clone();
         Self {
             session_key,
             conversation_id,
@@ -618,7 +618,7 @@ pub fn verify_registration(
             "process starttime changed during verification for PID {chosen_pid}"
         )));
     }
-    let session_key = format!("agy:{chosen_pid}:{st2}");
+    let session_key = req.conversation_id.clone();
 
     Ok(AgyRegistration {
         pid: chosen_pid,
@@ -762,7 +762,7 @@ pub fn attest_mcp_caller(
             "process starttime changed during verification for PID {chosen_pid}"
         )));
     }
-    let session_key = format!("agy:{chosen_pid}:{st2}");
+    let session_key = conv_id.clone();
 
     Ok((
         AgyRegistration {

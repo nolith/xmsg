@@ -2760,7 +2760,23 @@ async fn fed_list_sessions_handler(
     }
 
     let query = crate::registry::SessionsQuery::default();
-    let mut sessions = crate::registry::list_sessions(&fed_state.sessions_dir, &query);
+    let claude_sessions = {
+        let active_pairs = crate::claim::sync_claims(
+            &fed_state.db,
+            &fed_state.agy_config.proc_root,
+            std::slice::from_ref(&fed_state.sessions_dir),
+            &fed_state.host_label,
+        )
+        .await?;
+        let mut list = Vec::new();
+        for (claim, entry) in active_pairs {
+            let mut session: crate::registry::Session = entry.into();
+            session.session_id = claim.address();
+            list.push(session);
+        }
+        list
+    };
+    let mut sessions = claude_sessions;
     let mut agy_sessions =
         crate::agy::list_agy_sessions(&fed_state.agy_config, &fed_state.agy_store, &query);
     sessions.append(&mut agy_sessions);
@@ -2992,12 +3008,18 @@ fn resolve_target_session_fed(
     fed_state: &FedState,
     ref_str: &str,
 ) -> Result<crate::http::ResolvedTarget, AppError> {
+    let db = fed_state
+        .db
+        .lock()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     crate::http::resolve_target(
         std::slice::from_ref(&fed_state.sessions_dir),
         &fed_state.agy_config,
         &fed_state.agy_store,
         &fed_state.pi_store,
         &fed_state.svc_store,
+        Some(&db),
+        &fed_state.host_label,
         ref_str,
     )
 }

@@ -214,6 +214,15 @@ pub async fn handle_svc_connection<
         return Err(AppError::BadRequest("service name must not be empty".to_string()).into());
     }
 
+    if let Err(e) = crate::claim::validate_service_name(&name) {
+        let err_resp = serde_json::json!({
+            "status": "error",
+            "detail": e.to_string(),
+        });
+        let _ = writer.write_all(format!("{err_resp}\n").as_bytes()).await;
+        return Err(e.into());
+    }
+
     let starttime = if leaf_mode {
         let expected_name = leaf_principal
             .as_deref()
@@ -266,12 +275,19 @@ pub async fn handle_svc_connection<
         }
     };
 
-    let session_id = format!("svc:{name}");
+    let session_id = name.clone();
 
     // Single live registration check (Gate r2 G5 / Oracle 5)
     let conflict = {
         let store_lock = store.read().unwrap();
-        if let Some(existing) = store_lock.get(&session_id) {
+        let existing = store_lock.get(&session_id).or_else(|| {
+            if let Some(stripped) = session_id.strip_prefix("svc:") {
+                store_lock.get(stripped)
+            } else {
+                store_lock.get(&format!("svc:{session_id}"))
+            }
+        });
+        if let Some(existing) = existing {
             (existing.pid != peer_pid || existing.starttime != starttime)
                 && is_svc_session_alive(&proc_root, existing)
         } else {
@@ -396,7 +412,15 @@ pub async fn handle_svc_connection<
                     let wait_fut = async {
                         loop {
                             match rx.recv().await {
-                                Ok(ref id) if id == &sess_clone => break,
+                                Ok(ref id)
+                                    if id == &sess_clone
+                                        || id.strip_prefix("svc:").unwrap_or(id)
+                                            == sess_clone
+                                                .strip_prefix("svc:")
+                                                .unwrap_or(&sess_clone) =>
+                                {
+                                    break
+                                }
                                 Err(broadcast::error::RecvError::Lagged(_)) => break,
                                 Err(_) => break,
                                 _ => {}

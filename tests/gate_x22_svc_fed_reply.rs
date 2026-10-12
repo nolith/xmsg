@@ -488,7 +488,7 @@ async fn test_oracle_1_full_node_svc_federated_reply() {
 
     let reg_resp = read_json_line(&mut reader_b).await;
     assert_eq!(reg_resp["status"], "ok");
-    assert_eq!(reg_resp["sessionId"], "svc:guard");
+    assert_eq!(reg_resp["sessionId"], "guard");
 
     // 2. Node A sends to svc:guard@node_b
     let send_resp = send_via_agent_sock(
@@ -577,7 +577,7 @@ async fn test_oracle_2_local_svc_reply_records_pushed() {
 
     let reg_resp = read_json_line(&mut reader).await;
     assert_eq!(reg_resp["status"], "ok");
-    assert_eq!(reg_resp["sessionId"], "svc:guard");
+    assert_eq!(reg_resp["sessionId"], "guard");
 
     // 2. Send local message to svc:guard (non-federated, no @host)
     let send_resp = send_via_agent_sock(
@@ -627,6 +627,6 @@ async fn test_oracle_2_local_svc_reply_records_pushed() {
     let replies = xmsg::storage::get_all_replies(&conn, &msg_id).unwrap();
     assert_eq!(replies.len(), 1);
     assert_eq!(replies[0].push_outcome.as_deref(), Some("pushed"));
-    assert_eq!(replies[0].replier_session_id, "svc:guard");
+    assert_eq!(replies[0].replier_session_id, "guard");
     assert_eq!(replies[0].text, "Local task completed by guard");
 }

@@ -190,6 +190,7 @@ fn test_resolve_caller_session_ancestor_walk() {
         &agy_store,
         &pi_store,
         &svc_store,
+        None,
         3000,
     )
     .unwrap();
@@ -212,6 +213,7 @@ fn test_resolve_caller_session_ancestor_walk() {
         &agy_store,
         &pi_store,
         &svc_store,
+        None,
         9999,
     ) {
         Err(AppError::NotRecipient(msg)) => {

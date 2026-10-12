@@ -219,7 +219,7 @@ async fn oracle_1_restart_preserves_agy_addressability_and_queues() {
     setup_mock_process(&proc_root, child_pid, parent_pid, None, None, "200");
 
     let client = reqwest::Client::new();
-    let expected_session_key = format!("agy:{parent_pid}:100");
+    let expected_session_key = conv_id;
 
     // 3. Verify stage-1 registration on Server 1
     let mut registered_s1 = false;
@@ -382,7 +382,7 @@ async fn oracle_2_restarted_server_does_not_list_exited_agy_child() {
     setup_mock_process(&proc_root, child_pid, parent_pid, None, None, "300");
 
     let client = reqwest::Client::new();
-    let expected_session_key = format!("agy:{parent_pid}:200");
+    let expected_session_key = conv_id;
 
     // Verify stage-1 registration on Server 1
     let mut registered_s1 = false;
@@ -395,7 +395,7 @@ async fn oracle_2_restarted_server_does_not_list_exited_agy_child() {
         let sessions: Vec<Value> = resp.json().await.unwrap();
         if sessions
             .iter()
-            .any(|s| s["sessionId"] == expected_session_key)
+            .any(|s| s["sessionId"] == expected_session_key && s["status"] != "unregistered")
         {
             registered_s1 = true;
             break;
@@ -432,7 +432,7 @@ async fn oracle_2_restarted_server_does_not_list_exited_agy_child() {
     // 5. Wait past the reconnect bound
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // 6. Assert Server 2 does NOT list the session (no ghost session)
+    // 6. Assert Server 2 does NOT list the session as stage-1 registered (no ghost session)
     let resp = client
         .get(format!("{}/v1/sessions", server2.base_url))
         .send()
@@ -440,8 +440,8 @@ async fn oracle_2_restarted_server_does_not_list_exited_agy_child() {
         .unwrap();
     let sessions: Vec<Value> = resp.json().await.unwrap();
     assert!(
-        !sessions.iter().any(|s| s["sessionId"] == expected_session_key),
-        "restarted server must NOT list an agy session whose xmsg mcp child has exited (found: {sessions:?})"
+        !sessions.iter().any(|s| s["sessionId"] == expected_session_key && s["status"] != "unregistered"),
+        "restarted server must NOT list a stage-1 registered agy session whose xmsg mcp child has exited (found: {sessions:?})"
     );
 
     let get_resp = client
@@ -452,7 +452,10 @@ async fn oracle_2_restarted_server_does_not_list_exited_agy_child() {
         .send()
         .await
         .unwrap();
-    assert_eq!(get_resp.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+    let get_val: Value = get_resp.json().await.unwrap();
+    assert_eq!(get_val["status"], "unregistered");
+    assert_eq!(get_val["registered"], false);
 
     server2.stop().await;
 }

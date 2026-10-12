@@ -11,6 +11,7 @@ use crate::error::AppError;
 use crate::http::{resolve_target_session, AppState, ResolvedTarget};
 use crate::inbox;
 use crate::pi::PiStore;
+use crate::process;
 use crate::registry::{self, Session};
 use crate::storage;
 
@@ -106,6 +107,7 @@ pub fn default_agent_sock_path() -> Result<PathBuf, AppError> {
     default_socket_dir().map(|d| d.join("agent.sock"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_caller_session(
     proc_root: &Path,
     sessions_dirs: &(impl crate::registry::SessionDirs + ?Sized),
@@ -113,6 +115,7 @@ pub fn resolve_caller_session(
     agy_store: &crate::agy::AgyStore,
     pi_store: &PiStore,
     svc_store: &crate::svc::SvcStore,
+    conn: Option<&rusqlite::Connection>,
     peer_pid: u32,
 ) -> Result<Session, AppError> {
     let mut curr_pid = peer_pid;
@@ -124,7 +127,15 @@ pub fn resolve_caller_session(
             if entry.pid == curr_pid
                 && registry::is_pid_live_in(proc_root, curr_pid, &entry.proc_start)
             {
-                return Ok(entry.into());
+                let mut session: Session = entry.clone().into();
+                if let Some(c) = conn {
+                    if let Ok(Some(claim)) =
+                        crate::claim::get_active_claim_for_proc(c, entry.pid, &entry.proc_start)
+                    {
+                        session.session_id = claim.address();
+                    }
+                }
+                return Ok(session);
             }
         }
 
@@ -137,11 +148,7 @@ pub fn resolve_caller_session(
                     && agy::is_agy_session_alive(proc_root, info)
                 {
                     return Ok(Session {
-                        session_id: if !info.session_key.is_empty() {
-                            info.session_key.clone()
-                        } else {
-                            info.conversation_id.clone()
-                        },
+                        session_id: info.conversation_id.clone(),
                         name: if !info.conversation_id.is_empty() {
                             Some(info.conversation_id.clone())
                         } else {
@@ -384,7 +391,7 @@ pub async fn run_agent_server(
                         peer_pid,
                     ) {
                         Ok((reg, conv_id)) => {
-                            let session_key = reg.session_key.clone();
+                            let session_key = conv_id.clone();
                             {
                                 let mut store_lock = state_clone.agy_store.write().unwrap();
                                 store_lock.entry(session_key.clone()).or_insert_with(|| {
@@ -399,40 +406,102 @@ pub async fn run_agent_server(
                             let resp = serde_json::json!({
                                 "status": "ok",
                                 "sessionId": session_key,
+                                "address": session_key,
                             });
                             let _ = writer.write_all(format!("{resp}\n").as_bytes()).await;
                         }
-                        Err(e) => {
-                            let err_resp = serde_json::json!({
-                                "status": "error",
-                                "error": "unattested",
-                                "detail": e.to_string()
-                            });
-                            let _ = writer.write_all(format!("{err_resp}\n").as_bytes()).await;
+                        Err(_) => {
+                            // Check Claude Code sessions via claim table
+                            let claude_res = {
+                                if let Ok(db) = state_clone.db.lock() {
+                                    crate::claim::sync_claims_db(
+                                        &db,
+                                        &state_clone.agy_config.proc_root,
+                                        &state_clone.sessions_dirs,
+                                        &state_clone.host_label,
+                                    )
+                                    .ok()
+                                    .and_then(|(active_pairs, _)| {
+                                        let mut curr = peer_pid;
+                                        for _ in 0..32 {
+                                            if let Some((claim, _)) =
+                                                active_pairs.iter().find(|(c, _)| c.pid == curr)
+                                            {
+                                                return Some(claim.address());
+                                            }
+                                            if let Some(ppid) = process::parent_pid(
+                                                &state_clone.agy_config.proc_root,
+                                                curr,
+                                            ) {
+                                                if ppid <= 1 {
+                                                    break;
+                                                }
+                                                curr = ppid;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        None
+                                    })
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(address) = claude_res {
+                                let resp = serde_json::json!({
+                                    "status": "ok",
+                                    "sessionId": address,
+                                    "address": address,
+                                });
+                                let _ = writer.write_all(format!("{resp}\n").as_bytes()).await;
+                            } else {
+                                let err_resp = serde_json::json!({
+                                    "status": "error",
+                                    "error": "unattested",
+                                    "detail": "caller is not an attested agent session",
+                                });
+                                let _ = writer.write_all(format!("{err_resp}\n").as_bytes()).await;
+                            }
                         }
                     }
                     continue;
                 }
 
                 // Resolve caller session via ancestor walk
-                let caller = match resolve_caller_session(
-                    &state_clone.agy_config.proc_root,
-                    &state_clone.sessions_dirs,
-                    &state_clone.agy_config,
-                    &state_clone.agy_store,
-                    &state_clone.pi_store,
-                    &state_clone.svc_store,
-                    peer_pid,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let err_resp = serde_json::json!({
-                            "status": "error",
-                            "error": "not_recipient",
-                            "detail": e.to_string()
-                        });
-                        let _ = writer.write_all(format!("{err_resp}\n").as_bytes()).await;
-                        continue;
+                let caller = {
+                    let res = {
+                        let db_guard = state_clone.db.lock().ok();
+                        if let Some(ref db) = db_guard {
+                            let _ = crate::claim::sync_claims_db(
+                                db,
+                                &state_clone.agy_config.proc_root,
+                                &state_clone.sessions_dirs,
+                                &state_clone.host_label,
+                            );
+                        }
+                        resolve_caller_session(
+                            &state_clone.agy_config.proc_root,
+                            &state_clone.sessions_dirs,
+                            &state_clone.agy_config,
+                            &state_clone.agy_store,
+                            &state_clone.pi_store,
+                            &state_clone.svc_store,
+                            db_guard.as_deref(),
+                            peer_pid,
+                        )
+                    };
+                    match res {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let err_resp = serde_json::json!({
+                                "status": "error",
+                                "error": "not_recipient",
+                                "detail": e.to_string(),
+                            });
+                            let _ = writer.write_all(format!("{err_resp}\n").as_bytes()).await;
+                            continue;
+                        }
                     }
                 };
 
