@@ -118,6 +118,16 @@ async fn setup_gate_harness() -> GateHarness {
         .expect("live starttime")
     };
 
+    let victim_pid_dir = proc_root.join(victim_pid.to_string());
+    fs::create_dir_all(&victim_pid_dir).unwrap();
+    fs::write(
+        victim_pid_dir.join("stat"),
+        format!(
+            "{victim_pid} (sleep) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {victim_proc_start} 0 0\n"
+        ),
+    )
+    .unwrap();
+
     let target_session_json = serde_json::json!({
         "pid": victim_pid,
         "sessionId": "victim-claude",
