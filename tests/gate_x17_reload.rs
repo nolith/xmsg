@@ -91,8 +91,7 @@ async fn create_reloader_node(
     fs::create_dir_all(&sessions_dir).unwrap();
     let presence_dir = temp.path().join("presence");
     fs::create_dir_all(&presence_dir).unwrap();
-    let proc_root = temp.path().join("proc");
-    fs::create_dir_all(&proc_root).unwrap();
+    let proc_root = PathBuf::from(xmsg::process::LIVE_PROC_ROOT);
     let proc_locks = temp.path().join("locks");
     fs::create_dir_all(&proc_locks).unwrap();
 
