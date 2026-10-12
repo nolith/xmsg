@@ -230,10 +230,11 @@ async fn oracle_1_restart_preserves_agy_addressability_and_queues() {
             .await
             .unwrap();
         let sessions: Vec<Value> = resp.json().await.unwrap();
-        if sessions
-            .iter()
-            .any(|s| s["sessionId"] == expected_session_key && s["registered"] == false)
-        {
+        if sessions.iter().any(|s| {
+            s["sessionId"] == expected_session_key
+                && s["registered"] == false
+                && s["status"] != "unregistered"
+        }) {
             registered_s1 = true;
             break;
         }
@@ -271,10 +272,11 @@ async fn oracle_1_restart_preserves_agy_addressability_and_queues() {
             .await
             .unwrap();
         let sessions: Vec<Value> = resp.json().await.unwrap();
-        if sessions
-            .iter()
-            .any(|s| s["sessionId"] == expected_session_key && s["registered"] == false)
-        {
+        if sessions.iter().any(|s| {
+            s["sessionId"] == expected_session_key
+                && s["registered"] == false
+                && s["status"] != "unregistered"
+        }) {
             registered_s2 = true;
             break;
         }

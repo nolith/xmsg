@@ -339,14 +339,6 @@ pub fn resolve_session(
         return Err(AppError::Gone { session_id, pid });
     }
 
-    if live_candidates.len() > 1 {
-        let ids: Vec<String> = live_candidates
-            .iter()
-            .map(|c| c.session_id.clone())
-            .collect();
-        return Err(AppError::Ambiguous(ids.join(", ")));
-    }
-
     let resolved = live_candidates.into_iter().next().unwrap();
     let socket_path = PathBuf::from(&resolved.messaging_socket_path);
     Ok((resolved.into(), socket_path))

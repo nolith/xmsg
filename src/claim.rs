@@ -158,6 +158,11 @@ pub fn get_all_claims_for_id(conn: &Connection, id: &str) -> Result<Vec<Instance
 
 #[derive(Debug, Clone)]
 pub struct ForkNoticeToSend {
+    pub id: String,
+    pub pid1: u32,
+    pub proc_start1: String,
+    pub pid2: u32,
+    pub proc_start2: String,
     pub target_session_id: String,
     pub socket_path: PathBuf,
     pub from_name: String,
@@ -166,12 +171,6 @@ pub struct ForkNoticeToSend {
 
 pub fn is_claude_proc_live(proc_root: &Path, pid: u32, expected: &str) -> bool {
     process::claude_proc_start_matches(proc_root, pid, expected)
-        || (proc_root != Path::new(process::LIVE_PROC_ROOT)
-            && process::claude_proc_start_matches(
-                Path::new(process::LIVE_PROC_ROOT),
-                pid,
-                expected,
-            ))
 }
 
 #[allow(clippy::type_complexity)]
@@ -348,12 +347,6 @@ pub fn sync_claims_db(
                         .map_err(|e| AppError::Internal(e.to_string()))?;
 
                     if noticed_count == 0 {
-                        conn.execute(
-                            "INSERT INTO fork_notices (id, pid1, proc_start1, pid2, proc_start2, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            params![id, c1.pid, c1.proc_start, c2.pid, c2.proc_start, now],
-                        )
-                        .map_err(|e| AppError::Internal(e.to_string()))?;
-
                         if let Some(e1) = live_entries.iter().find(|e| {
                             e.pid == c1.pid
                                 && e.proc_start == c1.proc_start
@@ -364,6 +357,11 @@ pub fn sync_claims_db(
                                 id, host_label, c1.address(), c2.address(), id, plain_addr
                             );
                             notices_to_send.push(ForkNoticeToSend {
+                                id: id.clone(),
+                                pid1: c1.pid,
+                                proc_start1: c1.proc_start.clone(),
+                                pid2: c2.pid,
+                                proc_start2: c2.proc_start.clone(),
                                 target_session_id: c1.address(),
                                 socket_path: PathBuf::from(&e1.messaging_socket_path),
                                 from_name: format!("xmsg@{host_label}"),
@@ -381,6 +379,11 @@ pub fn sync_claims_db(
                                 id, host_label, c2.address(), c1.address(), id, plain_addr
                             );
                             notices_to_send.push(ForkNoticeToSend {
+                                id: id.clone(),
+                                pid1: c1.pid,
+                                proc_start1: c1.proc_start.clone(),
+                                pid2: c2.pid,
+                                proc_start2: c2.proc_start.clone(),
                                 target_session_id: c2.address(),
                                 socket_path: PathBuf::from(&e2.messaging_socket_path),
                                 from_name: format!("xmsg@{host_label}"),
@@ -396,6 +399,67 @@ pub fn sync_claims_db(
     Ok((active_pairs, notices_to_send))
 }
 
+pub async fn deliver_fork_notices(
+    db: &std::sync::Mutex<Connection>,
+    notices: Vec<ForkNoticeToSend>,
+) {
+    if notices.is_empty() {
+        return;
+    }
+
+    let mut delivered_records = Vec::new();
+    for notice in notices {
+        let msg_id = ulid::Ulid::new().to_string();
+        let body_len = notice.text.len();
+        match inbox::encode_transport_line(&notice.from_name, &notice.text) {
+            Ok(line) => {
+                match inbox::deliver_to_socket(&notice.socket_path, &line).await {
+                    Ok(()) => {
+                        let record = MessageRecord {
+                            id: msg_id.clone(),
+                            created_at: now_epoch_secs(),
+                            session_id: notice.target_session_id.clone(),
+                            from_name: notice.from_name.clone(),
+                            bytes: body_len,
+                            outcome: "delivered".to_string(),
+                            recipient_harness: "claude".to_string(),
+                            return_harness: None,
+                            return_session_id: None,
+                            push_replies: false,
+                            thread_id: msg_id,
+                            return_host: None,
+                        };
+                        delivered_records.push((notice, record));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed delivering fork notice to {}: {}",
+                            notice.socket_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed encoding transport line for fork notice: {}", e);
+            }
+        }
+    }
+
+    if !delivered_records.is_empty() {
+        if let Ok(conn) = db.lock() {
+            let now = now_epoch_secs();
+            for (notice, record) in delivered_records {
+                let _ = storage::insert_message(&conn, &record);
+                let _ = conn.execute(
+                    "INSERT INTO fork_notices (id, pid1, proc_start1, pid2, proc_start2, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![notice.id, notice.pid1, notice.proc_start1, notice.pid2, notice.proc_start2, now],
+                );
+            }
+        }
+    }
+}
+
 pub async fn sync_claims(
     db: &std::sync::Mutex<Connection>,
     proc_root: &Path,
@@ -407,68 +471,26 @@ pub async fn sync_claims(
         sync_claims_db(&conn, proc_root, sessions_dirs, host_label)?
     };
 
-    let mut delivered_records = Vec::new();
-    for notice in notices_to_send {
-        let msg_id = ulid::Ulid::new().to_string();
-        let body_len = notice.text.len();
-        match inbox::encode_transport_line(&notice.from_name, &notice.text) {
-            Ok(line) => {
-                if let Err(e) = inbox::deliver_to_socket(&notice.socket_path, &line).await {
-                    warn!(
-                        "Failed delivering fork notice to {}: {}",
-                        notice.socket_path.display(),
-                        e
-                    );
-                }
-            }
-            Err(e) => {
-                warn!("Failed encoding transport line for fork notice: {}", e);
-            }
-        }
-
-        let record = MessageRecord {
-            id: msg_id.clone(),
-            created_at: now_epoch_secs(),
-            session_id: notice.target_session_id,
-            from_name: notice.from_name,
-            bytes: body_len,
-            outcome: "delivered".to_string(),
-            recipient_harness: "claude".to_string(),
-            return_harness: None,
-            return_session_id: None,
-            push_replies: false,
-            thread_id: msg_id,
-            return_host: None,
-        };
-        delivered_records.push(record);
-    }
-
-    if !delivered_records.is_empty() {
-        let conn = db.lock().map_err(|e| AppError::Internal(e.to_string()))?;
-        for record in delivered_records {
-            let _ = storage::insert_message(&conn, &record);
-        }
-    }
-
+    deliver_fork_notices(db, notices_to_send).await;
     Ok(active_pairs)
 }
 
-pub fn resolve_claude_session(
+pub fn resolve_claude_session_with_notices(
     conn: &Connection,
     proc_root: &Path,
     sessions_dirs: &(impl SessionDirs + ?Sized),
     host_label: &str,
     ref_str: &str,
-) -> Result<(Session, PathBuf), AppError> {
+) -> Result<((Session, PathBuf), Vec<ForkNoticeToSend>), AppError> {
     // 1. Check if ref_str specifies a fork suffix e.g. "X~2"
     if let Some((base_id, suffix_str)) = ref_str.split_once('~') {
         if let Ok(suffix) = suffix_str.parse::<u32>() {
-            let (active_pairs, _) = sync_claims_db(conn, proc_root, sessions_dirs, host_label)?;
+            let (active_pairs, notices) = sync_claims_db(conn, proc_root, sessions_dirs, host_label)?;
             for (claim, entry) in active_pairs {
                 if claim.id == base_id && claim.suffix == suffix {
                     let mut session: Session = entry.clone().into();
                     session.session_id = claim.address();
-                    return Ok((session, PathBuf::from(entry.messaging_socket_path)));
+                    return Ok(((session, PathBuf::from(entry.messaging_socket_path)), notices));
                 }
             }
 
@@ -491,7 +513,7 @@ pub fn resolve_claude_session(
         }
     }
 
-    let (active_pairs, _) = sync_claims_db(conn, proc_root, sessions_dirs, host_label)?;
+    let (active_pairs, notices) = sync_claims_db(conn, proc_root, sessions_dirs, host_label)?;
 
     // 2. Check for bare ID match
     let mut id_matches: Vec<(InstanceClaim, SessionFileEntry)> = Vec::new();
@@ -505,7 +527,7 @@ pub fn resolve_claude_session(
         if let Some((plain_claim, plain_entry)) = id_matches.iter().find(|(c, _)| c.suffix == 1) {
             let mut session: Session = plain_entry.clone().into();
             session.session_id = plain_claim.address();
-            return Ok((session, PathBuf::from(&plain_entry.messaging_socket_path)));
+            return Ok(((session, PathBuf::from(&plain_entry.messaging_socket_path)), notices));
         } else {
             // Suffix 1 is free/dead, but active forks exist: ambiguous!
             let candidates: Vec<String> = id_matches.iter().map(|(c, _)| c.address()).collect();
@@ -519,7 +541,7 @@ pub fn resolve_claude_session(
             if entry.pid == pid {
                 let mut session: Session = entry.clone().into();
                 session.session_id = claim.address();
-                return Ok((session, PathBuf::from(&entry.messaging_socket_path)));
+                return Ok(((session, PathBuf::from(&entry.messaging_socket_path)), notices));
             }
         }
     }
@@ -538,7 +560,7 @@ pub fn resolve_claude_session(
         let (claim, entry) = name_matches.into_iter().next().unwrap();
         let mut session: Session = entry.clone().into();
         session.session_id = claim.address();
-        return Ok((session, PathBuf::from(entry.messaging_socket_path)));
+        return Ok(((session, PathBuf::from(entry.messaging_socket_path)), notices));
     } else if name_matches.len() > 1 {
         let candidates: Vec<String> = name_matches.iter().map(|(c, _)| c.address()).collect();
         return Err(AppError::Ambiguous(candidates.join(", ")));
@@ -575,4 +597,30 @@ pub fn resolve_claude_session(
     }
 
     Err(AppError::NotFound(ref_str.to_string()))
+}
+
+pub fn resolve_claude_session(
+    conn: &Connection,
+    proc_root: &Path,
+    sessions_dirs: &(impl SessionDirs + ?Sized),
+    host_label: &str,
+    ref_str: &str,
+) -> Result<(Session, PathBuf), AppError> {
+    let (res, _) = resolve_claude_session_with_notices(conn, proc_root, sessions_dirs, host_label, ref_str)?;
+    Ok(res)
+}
+
+pub async fn resolve_claude_session_and_deliver(
+    db: &std::sync::Mutex<Connection>,
+    proc_root: &Path,
+    sessions_dirs: &(impl SessionDirs + ?Sized),
+    host_label: &str,
+    ref_str: &str,
+) -> Result<(Session, PathBuf), AppError> {
+    let (res, notices) = {
+        let conn = db.lock().map_err(|e| AppError::Internal(e.to_string()))?;
+        resolve_claude_session_with_notices(&conn, proc_root, sessions_dirs, host_label, ref_str)?
+    };
+    deliver_fork_notices(db, notices).await;
+    Ok(res)
 }

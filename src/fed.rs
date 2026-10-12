@@ -2253,7 +2253,15 @@ pub async fn deliver_federated_reply_locally(
 
     let push_res = match ret_harness {
         "claude" => {
-            match crate::registry::resolve_session(&fed_state.sessions_dir, ret_session_id) {
+            match crate::claim::resolve_claude_session_and_deliver(
+                &fed_state.db,
+                std::path::Path::new(crate::process::LIVE_PROC_ROOT),
+                &fed_state.sessions_dir,
+                &fed_state.host_label,
+                ret_session_id,
+            )
+            .await
+            {
                 Ok((_session, socket_path)) => {
                     if !socket_path.exists() {
                         "sender_gone"

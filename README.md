@@ -246,7 +246,9 @@ In multi-tenant setups where multiple Claude configurations exist on the same ho
   xmsg serve
   ```
 - **Default:** `~/.claude/sessions`.
-- **Instance Claims & Multi-Instance Resolution:** Discovery, liveness verification, listing, and delivery inspect all configured directories. When the same conversation ID appears across multiple directories or in multiple concurrent processes, `xmsg` assigns instance claims deterministically via the persistent `instance_claims` table. The earliest live process retains plain `X`, and subsequent instances receive monotonic fork addresses `X~2`, `X~3`, etc., accompanied by fork notices.
+- **Instance Claims & Multi-Instance Resolution:** Discovery, liveness verification, listing, and delivery inspect all configured directories. When the same conversation ID appears across multiple directories or in multiple concurrent processes, `xmsg` assigns instance claims deterministically via the persistent `instance_claims` table. The first observed live process retains plain `X`, and subsequent instances receive monotonic fork addresses `X~2`, `X~3`, etc., accompanied by fork notices.
+  - **Address Lifespan:** An Antigravity session address lasts across restarts that resume with `--conversation=<id>` (the conversation UUID is preserved). A Claude session address lasts across a resumed session when the harness keeps it (a resumed session may retain its sessionId across process restarts, but a new session ID will mint a new claim).
+  - **Cost (P-4):** across session directories (tenants sharing one xmsg, §1.3), the plain ID goes to whichever directory's process registers X next (first observed), where previously the duplicate ID was excluded entirely.
 
 ### 3.5 Daemon Harness Integration: Long-Poll & Attestation
 
@@ -287,11 +289,11 @@ The server responds with the registered canonical session ID:
 ```json
 {
   "status": "ok",
-  "sessionId": "svc:genie-expert"
+  "sessionId": "genie-expert"
 }
 ```
 
-Registered services appear in `list` / `/v1/sessions` as `svc:<name>` (with kind `"daemon"` and status `"idle"`) and are addressable as either `svc:<name>` or simply `<name>`.
+Registered services appear in `list` / `/v1/sessions` as bare `<name>` (with kind `"daemon"` and status `"idle"`) and are addressable as `<name>` (or legacy `svc:<name>`).
 
 #### Long-Poll & Explicit Acknowledgment Semantics
 

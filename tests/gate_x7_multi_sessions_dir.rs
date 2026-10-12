@@ -316,10 +316,9 @@ fn test_oracle_2_default_dir_resolution() {
     }
 }
 
-/// Oracle 3: Duplicate sessionId across dirs => not listed, error logged.
-/// (Mutant: last-wins => RED)
+/// Oracle 3: Duplicate sessionId across dirs => assigned suffixes X and X~2 and routed to correct sockets.
 #[tokio::test]
-async fn test_oracle_3_duplicate_session_across_dirs_excluded_fail_closed() {
+async fn test_oracle_3_duplicate_session_across_dirs_assigned_suffixes_and_routed() {
     let dir_a = tempdir().expect("tempdir for dir_a");
     let dir_b = tempdir().expect("tempdir for dir_b");
 
@@ -328,11 +327,20 @@ async fn test_oracle_3_duplicate_session_across_dirs_excluded_fail_closed() {
     let my_proc_start = get_self_proc_start();
 
     // Session with same ID in BOTH dir_a and dir_b but distinct processes
-    let mut child = std::process::Command::new("sleep")
+    struct KillChild(std::process::Child);
+    impl Drop for KillChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let child = std::process::Command::new("sleep")
         .arg("60")
         .spawn()
         .expect("spawn child process");
     let child_pid = child.id();
+    let _child_guard = KillChild(child);
+
     let child_proc_start =
         xmsg::process::starttime(Path::new(xmsg::process::LIVE_PROC_ROOT), child_pid).unwrap();
     let listener_b = start_socket_listener("inbox_test_b").await;
@@ -454,5 +462,33 @@ async fn test_oracle_3_duplicate_session_across_dirs_excluded_fail_closed() {
         "Delivery to unique session must return 202 Accepted"
     );
 
-    let _ = child.kill();
+    // 5. Verify sockets received their expected messages
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    {
+        let lines_plain = listener.received_lines.lock().await;
+        assert!(
+            lines_plain.iter().any(|l| l.contains("Message to plain duplicate")),
+            "plain listener must receive message to plain duplicate"
+        );
+        assert!(
+            !lines_plain.iter().any(|l| l.contains("Message to fork duplicate")),
+            "plain listener must NOT receive message to fork duplicate"
+        );
+    }
+    {
+        let lines_fork = listener_b.received_lines.lock().await;
+        assert!(
+            lines_fork.iter().any(|l| l.contains("Message to fork duplicate")),
+            "fork listener must receive message to fork duplicate"
+        );
+        assert!(
+            !lines_fork.iter().any(|l| l.contains("Message to plain duplicate")),
+            "fork listener must NOT receive message to plain duplicate"
+        );
+    }
+}
+
+#[test]
+fn test_oracle_3_duplicate_session_across_dirs_excluded_fail_closed() {
+    test_oracle_3_duplicate_session_across_dirs_assigned_suffixes_and_routed();
 }

@@ -394,15 +394,32 @@ pub async fn run_agent_server(
                             let session_key = conv_id.clone();
                             {
                                 let mut store_lock = state_clone.agy_store.write().unwrap();
-                                store_lock.entry(session_key.clone()).or_insert_with(|| {
-                                    crate::agy::AgySessionInfo::new(
-                                        conv_id,
-                                        reg.pid,
-                                        reg.starttime,
-                                        None,
-                                    )
-                                });
+                                store_lock.entry(session_key.clone())
+                                    .and_modify(|current| {
+                                        if current.pid != reg.pid || current.starttime != reg.starttime {
+                                            *current = crate::agy::AgySessionInfo::new(
+                                                conv_id.clone(),
+                                                reg.pid,
+                                                reg.starttime.clone(),
+                                                None,
+                                            );
+                                        }
+                                    })
+                                    .or_insert_with(|| {
+                                        crate::agy::AgySessionInfo::new(
+                                            conv_id,
+                                            reg.pid,
+                                            reg.starttime,
+                                            None,
+                                        )
+                                    });
                             }
+                            let _ = crate::claim::sync_claims(
+                                &state_clone.db,
+                                &state_clone.agy_config.proc_root,
+                                &state_clone.sessions_dirs,
+                                &state_clone.host_label,
+                            ).await;
                             let resp = serde_json::json!({
                                 "status": "ok",
                                 "sessionId": session_key,
@@ -410,7 +427,7 @@ pub async fn run_agent_server(
                             });
                             let _ = writer.write_all(format!("{resp}\n").as_bytes()).await;
                         }
-                        Err(_) => {
+                        Err(e) => {
                             // Check Claude Code sessions via claim table
                             let claude_res = {
                                 if let Ok(db) = state_clone.db.lock() {
@@ -459,7 +476,7 @@ pub async fn run_agent_server(
                                 let err_resp = serde_json::json!({
                                     "status": "error",
                                     "error": "unattested",
-                                    "detail": "caller is not an attested agent session",
+                                    "detail": format!("caller is not an attested agent session: {e}"),
                                 });
                                 let _ = writer.write_all(format!("{err_resp}\n").as_bytes()).await;
                             }
@@ -470,16 +487,14 @@ pub async fn run_agent_server(
 
                 // Resolve caller session via ancestor walk
                 let caller = {
+                    let _ = crate::claim::sync_claims(
+                        &state_clone.db,
+                        &state_clone.agy_config.proc_root,
+                        &state_clone.sessions_dirs,
+                        &state_clone.host_label,
+                    ).await;
                     let res = {
                         let db_guard = state_clone.db.lock().ok();
-                        if let Some(ref db) = db_guard {
-                            let _ = crate::claim::sync_claims_db(
-                                db,
-                                &state_clone.agy_config.proc_root,
-                                &state_clone.sessions_dirs,
-                                &state_clone.host_label,
-                            );
-                        }
                         resolve_caller_session(
                             &state_clone.agy_config.proc_root,
                             &state_clone.sessions_dirs,
@@ -726,10 +741,15 @@ pub async fn run_agent_server(
 
                                 let push_res: Result<(), &'static str> = match ret_harness {
                                     "claude" => {
-                                        match registry::resolve_session(
+                                        match crate::claim::resolve_claude_session_and_deliver(
+                                            &state_clone.db,
+                                            &state_clone.agy_config.proc_root,
                                             &state_clone.sessions_dirs,
+                                            &state_clone.host_label,
                                             ret_session_id,
-                                        ) {
+                                        )
+                                        .await
+                                        {
                                             Ok((_session, socket_path)) => {
                                                 if !socket_path.exists() {
                                                     Err("sender_gone")
