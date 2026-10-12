@@ -1880,9 +1880,6 @@ async fn fed_send_message_handler(
             }),
         };
 
-        let delivery_resp = send_federated_message(&fed_state, dest, &forwarded_envelope).await?;
-        let outcome = delivery_resp.outcome.as_deref().unwrap_or("delivered");
-
         {
             let db = fed_state
                 .db
@@ -1890,14 +1887,37 @@ async fn fed_send_message_handler(
                 .map_err(|e| AppError::Internal(e.to_string()))?;
             storage::insert_forwarded_message(&db, &envelope.id, &peer.name, envelope.created_at)
                 .map_err(|e| AppError::Internal(e.to_string()))?;
-            let _ = storage::insert_outbound(
+            storage::insert_outbound(
                 &db,
                 &envelope.id,
                 dest,
                 target_ref,
-                outcome,
+                "pending",
                 envelope.created_at,
-            );
+            )
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        }
+
+        let delivery_resp =
+            match send_federated_message(&fed_state, dest, &forwarded_envelope).await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    if let Ok(db) = fed_state.db.lock() {
+                        let _ = storage::delete_outbound(&db, &envelope.id);
+                        let _ = storage::delete_forwarded_message(&db, &envelope.id);
+                    }
+                    return Err(err);
+                }
+            };
+
+        let outcome = delivery_resp.outcome.as_deref().unwrap_or("delivered");
+
+        {
+            let db = fed_state
+                .db
+                .lock()
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let _ = storage::update_outbound_outcome(&db, &envelope.id, outcome);
             let fwd_msg_record = MessageRecord {
                 id: envelope.id.clone(),
                 created_at: envelope.created_at,
@@ -2142,6 +2162,10 @@ async fn fed_send_message_handler(
             .lock()
             .map_err(|e| AppError::Internal(e.to_string()))?;
         storage::insert_message(&db, &pre_record).map_err(|e| AppError::Internal(e.to_string()))?;
+        if envelope.forwarded.is_some() {
+            storage::insert_forwarded_message(&db, &envelope.id, &peer.name, envelope.created_at)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+        }
     }
 
     // 8. Deliver to local target session

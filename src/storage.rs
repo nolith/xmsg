@@ -438,6 +438,19 @@ pub fn get_outbound(conn: &Connection, id: &str) -> Result<Option<OutboundRecord
     }
 }
 
+pub fn update_outbound_outcome(conn: &Connection, id: &str, outcome: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE outbound SET outcome = ?1 WHERE id = ?2",
+        params![outcome, id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_outbound(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM outbound WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
 pub fn insert_reply(
     conn: &Connection,
     message_id: &str,
@@ -989,4 +1002,9 @@ pub fn purge_forwarded_messages(conn: &Connection, ttl_secs: u64) -> Result<usiz
         "DELETE FROM forwarded_messages WHERE created_at < ?1",
         params![cutoff],
     )
+}
+
+pub fn delete_forwarded_message(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM forwarded_messages WHERE id = ?1", params![id])?;
+    Ok(())
 }

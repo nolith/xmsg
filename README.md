@@ -373,12 +373,13 @@ curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/xmsg/http.sock" http:
 
 ### Messaging
 
-- `POST /v1/sessions/{ref}/messages`: Inject a message into a session inbox.
+- `POST /v1/sessions/{ref}/messages`: Inject a message into a session inbox. Accepts optional `"push_replies": bool` (defaults to `true`; set `false` to opt out of asynchronous reply pushes, allowing replies to be read by long-poll instead).
   ```json
   {
     "from": "alice-orchestrator",
     "text": "Hello, please review unit tests.",
-    "idempotency_key": "optional-key-1-to-128-chars"
+    "idempotency_key": "optional-key-1-to-128-chars",
+    "push_replies": true
   }
   ```
   Returns `202 Accepted` with ULID `messageId`:

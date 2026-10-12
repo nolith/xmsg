@@ -1047,3 +1047,94 @@ async fn test_oracle_6_off_by_default() {
     })
     .await;
 }
+
+// =============================================================================
+// Oracle 6b: Direct federated send with push_replies: false records disabled
+// A direct fed send A->B with push_replies: false: B's session replies, and
+// B's reply record has push_outcome "disabled" with NO push attempted.
+// Mutant: unconditional push to return_host without is_forwarded check => RED (push_failed)
+// Line: test_oracle_6b_direct_send_push_replies_false_disabled
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_6b_direct_send_push_replies_false_disabled() {
+    run_test_with_port_retry(
+        "test_oracle_6b_direct_send_push_replies_false_disabled",
+        || async move {
+            let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
+            let (cert_b, key_b, pin_b) = generate_self_signed_ed25519_pem("node-b").unwrap();
+
+            let port_a = get_free_port();
+            let http_a = get_free_port();
+            let port_b = get_free_port();
+            let http_b = get_free_port();
+
+            // Direct peering A <-> B (no hub involved)
+            let peers_a = serde_json::json!({
+                "node-b": {
+                    "address": format!("127.0.0.1:{port_b}"),
+                    "pin": normalize_pin(&pin_b),
+                    "allow": ["send", "reply"]
+                }
+            });
+
+            let peers_b = serde_json::json!({
+                "node-a": {
+                    "address": format!("127.0.0.1:{port_a}"),
+                    "pin": normalize_pin(&pin_a),
+                    "allow": ["send", "reply"]
+                }
+            });
+
+            let node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
+            let node_a = spawn_test_node("node-a", port_a, http_a, &cert_a, &key_a, peers_a).await;
+
+            let (_sock_a, rx_a) =
+                create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
+            let (_sock_b, rx_b) = create_claude_session_fixture(&node_b.sessions_dir, "bob", "Bob");
+
+            // Alice sends direct to bob@node-b with push_replies: false
+            let send_res = send_via_agent_sock(
+                &node_a.agent_sock,
+                "bob@node-b",
+                "Direct send without push replies",
+                false,
+            )
+            .await;
+
+            assert_eq!(send_res["status"], "ok");
+
+            // Bob receives the direct message
+            let b_msg = wait_for_inbox_message(&rx_b, Duration::from_secs(5))
+                .await
+                .expect("Bob should receive direct message on B");
+            let msg_id = extract_message_id(&b_msg).expect("message_id in Bob footer");
+
+            // Bob replies
+            let reply_res = reply_via_agent_sock(
+                &node_b.agent_sock,
+                &msg_id,
+                "Bob direct reply to non-push sender",
+            )
+            .await;
+
+            assert_eq!(reply_res["status"], "ok");
+            // H0 invariant: direct non-push send records pushOutcome == "disabled"
+            assert_eq!(
+                reply_res["reply"]["pushOutcome"], "disabled",
+                "Direct send reply must record pushOutcome = disabled: {:?}",
+                reply_res
+            );
+
+            // Verify no push was attempted to Alice's inbox
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            {
+                let guard = rx_a.lock().unwrap();
+                assert!(
+                    guard.is_empty(),
+                    "Alice inbox should receive zero pushed replies"
+                );
+            }
+        },
+    )
+    .await;
+}
