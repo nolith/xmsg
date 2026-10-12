@@ -99,6 +99,13 @@ async fn setup(max_body: usize) -> Env {
 
     // Target Claude session "target" at target_pid() with inbox
     let inbox = t.path().join("inbox.sock");
+    write_stat(
+        &proc_root,
+        target_pid(),
+        "target",
+        1,
+        &real_start(target_pid()),
+    );
     fs::write(
         sessions.join("target.json"),
         serde_json::json!({
