@@ -641,3 +641,50 @@ An **outbound link** allows a full `xmsg` node to connect to a dialable hub node
   - **Outbound send replies:** When local sessions on the undialable node send a message to a dialable hub, the remote hub cannot dial back to push replies. Senders automatically spawn a background reply poller using `poll_federated_replies` (`GET /fed/v1/messages/{id}/replies?after=<seq>&wait=<s>`), pulling owed replies and delivering them locally to the caller's session.
 - **Default State:**
   Outbound link pull loops are strictly opt-in and off unless configured. If no peer specifies `"dial": "outbound"`, no pull loop is spawned.
+
+### 7.7 Forwarding through a hub (advanced)
+
+In a star or multi-node mesh topology, nodes that cannot directly dial one another (e.g. edge nodes behind NAT or in separate networks) can route messages through an intermediate forwarding node (hub). Forwarding is strictly opt-in and off by default.
+
+- **Explicit Addressing (`ref@dest@hub`):**
+  Clients explicitly route a message through a hub by suffixing the target with the destination peer and the hub peer:
+  ```
+  ref@dest@hub
+  ```
+  The sending node dials `hub` with target `ref@dest`. The hub splits this target, recognizes `dest` as another known peer, and relays the message to `dest` with target `ref`.
+- **Peer Configuration Fields:**
+  Forwarding requires explicit permissions configured on both the hub and the final recipient:
+  - **On the Forwarder (`allow = ["forward"]`):** The sending peer's entry in the hub's `peers.json` must include `"forward"` in its `allow` list:
+    ```json
+    {
+      "peer-a": {
+        "address": "10.0.1.5:43599",
+        "pin": "sha256:...",
+        "allow": ["send", "forward"]
+      }
+    }
+    ```
+    Without `"forward"`, the hub refuses any send addressed to `ref@dest` with HTTP `403 Forbidden` (`no_forward`).
+  - **On the Recipient (`allow = ["relayed"]`):** The recipient node accepts a forwarded message only if its entry for the forwarding node includes `"relayed"` (or `"relay"`) in its `allow` list:
+    ```json
+    {
+      "hub": {
+        "address": "hub.example.com:43599",
+        "pin": "sha256:...",
+        "allow": ["send", "reply", "relayed"]
+      }
+    }
+    ```
+    If the forwarding node lacks the `"relayed"` capability, the recipient refuses the send with HTTP `403 Forbidden` (`op_denied`).
+- **One-Hop Limit:**
+  Forwarded messages are marked with `forwarded: { origin_peer, origin_principal }`. A node refuses to forward any message that already carries the forward mark (`no_forward`). Multi-hop daisy-chaining is prohibited.
+- **Origin & Attestation (Trust Model):**
+  When a recipient receives a forwarded message, the sender origin displayed to local sessions and services (`xmsg@<origin_peer> · <principal>`) is the forwarding node's assertion, **not proven end-to-end**. The recipient trusts the hub to attest accurately to who sent the message. (For end-to-end origin signatures, see Section B of `xmsg-hub-design.md`).
+- **Destination Target Filters:**
+  The forwarding node checks the destination peer's configured `targets` list against the unpacked `ref`. If the destination peer restricts targets and `ref` is not allowed, the hub rejects the send before relaying.
+- **Reply Routing:**
+  - The forwarding hub records each forwarded message in SQLite (`forwarded_messages`).
+  - When the recipient replies, its reply is addressed to the forwarding node (`return_host = hub`).
+  - The hub authorizes the reply against the outbound record created during forwarding, looks up the origin peer, and relays the reply back to the origin peer using `send_federated_reply` (if dialable) or stores it in SQLite for long-polling if the origin is a leaf or outbound-linked node.
+- **Default State (Off by Default):**
+  Without `"forward"` configured on the sender's peer entry, a node behaves identically to older releases: cross-host target references containing `@` are rejected with `no_forward`.

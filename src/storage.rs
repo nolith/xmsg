@@ -229,6 +229,13 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             origin TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_peer_mailbox_peer_created ON peer_mailbox(peer, created_at);
+
+        CREATE TABLE IF NOT EXISTS forwarded_messages (
+            id TEXT PRIMARY KEY,
+            origin_peer TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_forwarded_messages_created_at ON forwarded_messages(created_at);
         "#,
     )?;
 
@@ -935,4 +942,51 @@ pub fn is_svc_message_acked(conn: &Connection, id: &str) -> Result<bool> {
     } else {
         Ok(false)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ForwardedMessageRecord {
+    pub id: String,
+    pub origin_peer: String,
+    pub created_at: i64,
+}
+
+pub fn insert_forwarded_message(
+    conn: &Connection,
+    id: &str,
+    origin_peer: &str,
+    created_at: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO forwarded_messages (id, origin_peer, created_at) VALUES (?1, ?2, ?3)",
+        params![id, origin_peer, created_at],
+    )?;
+    Ok(())
+}
+
+pub fn get_forwarded_message(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<ForwardedMessageRecord>> {
+    let mut stmt =
+        conn.prepare("SELECT id, origin_peer, created_at FROM forwarded_messages WHERE id = ?1")?;
+    let mut rows = stmt.query(params![id])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(ForwardedMessageRecord {
+            id: row.get(0)?,
+            origin_peer: row.get(1)?,
+            created_at: row.get(2)?,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn purge_forwarded_messages(conn: &Connection, ttl_secs: u64) -> Result<usize> {
+    let now = now_epoch_secs();
+    let cutoff = now.saturating_sub(ttl_secs as i64);
+    conn.execute(
+        "DELETE FROM forwarded_messages WHERE created_at < ?1",
+        params![cutoff],
+    )
 }

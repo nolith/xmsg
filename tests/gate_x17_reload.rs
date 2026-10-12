@@ -249,6 +249,7 @@ fn make_envelope(target: &str, body: &str) -> FedEnvelope {
         push_replies: false,
         thread_id: format!("thr-{}", ulid::Ulid::new()),
         created_at: 1000,
+        forwarded: None,
     }
 }
 

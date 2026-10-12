@@ -1333,6 +1333,13 @@ impl RateLimiter {
 // Wire Protocol Envelopes
 // -----------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FedForwarded {
+    pub origin_peer: String,
+    pub origin_principal: FedPrincipal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FedEnvelope {
@@ -1344,9 +1351,11 @@ pub struct FedEnvelope {
     pub push_replies: bool,
     pub thread_id: String,
     pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded: Option<FedForwarded>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum FedPrincipal {
     #[serde(rename = "session")]
@@ -1755,13 +1764,171 @@ async fn fed_send_message_handler(
         }
     }
 
-    // 2. Validate to.ref: forwarding is forbidden
-    let target_ref = &envelope.to.r#ref;
+    // Relayed messages check: if envelope is forwarded, recipient's entry for the peer must allow "relayed"
+    if envelope.forwarded.is_some()
+        && !peer_cfg
+            .allow
+            .iter()
+            .any(|op| op == "relayed" || op == "relay")
+    {
+        return Err(AppError::OpDenied(
+            "relayed messages not allowed for peer".to_string(),
+        ));
+    }
+
+    // 2. Validate to.ref and handle forwarding
+    let raw_target_ref = &envelope.to.r#ref;
+    let (target_ref, dest_host) = match split_peer_ref(raw_target_ref) {
+        Some((r, h)) if h != fed_state.host_label => (r, Some(h)),
+        Some((r, _)) => (r, None),
+        None => (raw_target_ref.as_str(), None),
+    };
+
+    if let Some(dest) = dest_host {
+        // One-hop rule: cannot forward an already forwarded message
+        if envelope.forwarded.is_some() {
+            return Err(AppError::NoForward(
+                "message has already been forwarded (one hop maximum)".to_string(),
+            ));
+        }
+
+        // Sender peer must have "forward" in allow
+        if !peer_cfg.allow.iter().any(|op| op == "forward") {
+            return Err(AppError::NoForward(
+                "Forwarding cross-host is not permitted".to_string(),
+            ));
+        }
+
+        // Dest must be a known peer other than the sender
+        if dest == peer.name || !fed_state.peers.contains_name(dest) {
+            return Err(AppError::UnknownPeer(dest.to_string()));
+        }
+        let dest_cfg = fed_state.peers.get(dest).unwrap();
+
+        // Dest's targets must allow target_ref
+        if let Some(ref allowed_targets) = dest_cfg.targets {
+            if !target_ref_could_match(target_ref, allowed_targets) {
+                return Err(AppError::OpDenied(
+                    "target not allowed for peer".to_string(),
+                ));
+            }
+        }
+
+        // Rate limit sender
+        let principal_key = match &envelope.principal {
+            FedPrincipal::Session {
+                harness,
+                session_id,
+                ..
+            } => Some(format!("{harness}:{session_id}")),
+            FedPrincipal::Service { name } => Some(format!("svc:{name}")),
+            FedPrincipal::Anonymous { from } => Some(format!("anon:{from}")),
+        };
+        if !fed_state
+            .rate_limiter
+            .check_and_consume(&peer.name, principal_key.as_deref())
+        {
+            return Err(AppError::RateLimited("Rate limit exceeded".to_string()));
+        }
+
+        // Check if message already delivered / forwarded (idempotency)
+        {
+            let db = fed_state
+                .db
+                .lock()
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            if let Some(existing) = storage::get_message(&db, &envelope.id)
+                .map_err(|e| AppError::Internal(e.to_string()))?
+            {
+                return match existing.outcome.as_str() {
+                    "delivered" | "queued" | "accepted" => Ok((
+                        StatusCode::ACCEPTED,
+                        Json(DeliveryResponse {
+                            session_id: existing.session_id,
+                            from_name: existing.from_name,
+                            bytes: existing.bytes,
+                            message_id: existing.id,
+                            outcome: Some(existing.outcome),
+                        }),
+                    )
+                        .into_response()),
+                    "not_found" => Err(AppError::NotFound(existing.session_id)),
+                    "ambiguous" => Err(AppError::Ambiguous(existing.session_id)),
+                    "gone" => Err(AppError::Gone {
+                        session_id: existing.session_id,
+                        pid: 0,
+                    }),
+                    other => Err(AppError::BadRequest(format!("outcome: {other}"))),
+                };
+            }
+        }
+
+        let forwarded_envelope = FedEnvelope {
+            v: envelope.v,
+            id: envelope.id.clone(),
+            principal: envelope.principal.clone(),
+            to: FedTarget {
+                r#ref: target_ref.to_string(),
+            },
+            body: envelope.body.clone(),
+            push_replies: envelope.push_replies,
+            thread_id: envelope.thread_id.clone(),
+            created_at: envelope.created_at,
+            forwarded: Some(FedForwarded {
+                origin_peer: peer.name.clone(),
+                origin_principal: envelope.principal.clone(),
+            }),
+        };
+
+        let delivery_resp = send_federated_message(&fed_state, dest, &forwarded_envelope).await?;
+        let outcome = delivery_resp.outcome.as_deref().unwrap_or("delivered");
+
+        {
+            let db = fed_state
+                .db
+                .lock()
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            storage::insert_forwarded_message(&db, &envelope.id, &peer.name, envelope.created_at)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let _ = storage::insert_outbound(
+                &db,
+                &envelope.id,
+                dest,
+                target_ref,
+                outcome,
+                envelope.created_at,
+            );
+            let fwd_msg_record = MessageRecord {
+                id: envelope.id.clone(),
+                created_at: envelope.created_at,
+                session_id: target_ref.to_string(),
+                from_name: format!("xmsg@{} · {}", peer.name, envelope.principal.badge()),
+                bytes: envelope.body.len(),
+                outcome: outcome.to_string(),
+                recipient_harness: "fed".to_string(),
+                return_harness: None,
+                return_session_id: None,
+                return_host: Some(peer.name.clone()),
+                push_replies: envelope.push_replies,
+                thread_id: envelope.thread_id.clone(),
+            };
+            let _ = storage::insert_message(&db, &fwd_msg_record);
+        }
+
+        return Ok((StatusCode::ACCEPTED, Json(delivery_resp)).into_response());
+    }
+
     if target_ref.contains('@') {
         return Err(AppError::NoForward(
             "Forwarding cross-host is not permitted".to_string(),
         ));
     }
+
+    let (effective_origin_peer, effective_principal) = if let Some(ref fwd) = envelope.forwarded {
+        (&fwd.origin_peer, &fwd.origin_principal)
+    } else {
+        (&peer.name, &envelope.principal)
+    };
 
     let target = match resolve_target_session_fed(&fed_state, target_ref) {
         Ok(t) => {
@@ -1800,7 +1967,7 @@ async fn fed_send_message_handler(
                 return Err(AppError::RateLimited("Rate limit exceeded".to_string()));
             }
 
-            let (from_name, return_harness, return_session_id) = match &envelope.principal {
+            let (from_name, return_harness, return_session_id) = match effective_principal {
                 FedPrincipal::Session {
                     harness,
                     session_id,
@@ -1809,7 +1976,8 @@ async fn fed_send_message_handler(
                     if !matches!(harness.as_str(), "claude" | "agy" | "pi" | "svc") {
                         return Err(AppError::BadRequest(format!("invalid harness '{harness}'")));
                     }
-                    let sanitized = inbox::sanitize_attested_from(&peer.name, harness, name);
+                    let sanitized =
+                        inbox::sanitize_attested_from(effective_origin_peer, harness, name);
                     (sanitized, Some(harness.clone()), Some(session_id.clone()))
                 }
                 FedPrincipal::Service { name } => {
@@ -1819,11 +1987,11 @@ async fn fed_send_message_handler(
                             "invalid service name '{name}'"
                         )));
                     }
-                    let badge = format!("xmsg@{} · svc:{}", peer.name, name);
+                    let badge = format!("xmsg@{} · svc:{}", effective_origin_peer, name);
                     (badge, Some("svc".to_string()), Some(name.clone()))
                 }
                 FedPrincipal::Anonymous { from } => {
-                    let sanitized = inbox::sanitize_from(&peer.name, from)?;
+                    let sanitized = inbox::sanitize_from(effective_origin_peer, from)?;
                     (sanitized, None, None)
                 }
             };
@@ -1842,7 +2010,7 @@ async fn fed_send_message_handler(
             let pre_record = MessageRecord {
                 id: envelope.id.clone(),
                 created_at: envelope.created_at,
-                session_id: target_ref.clone(),
+                session_id: target_ref.to_string(),
                 from_name,
                 bytes: body_len,
                 outcome: outcome_str.to_string(),
@@ -1878,7 +2046,7 @@ async fn fed_send_message_handler(
     }
 
     // 5. Validate principal and sanitize badge
-    let (from_name, return_harness, return_session_id) = match &envelope.principal {
+    let (from_name, return_harness, return_session_id) = match effective_principal {
         FedPrincipal::Session {
             harness,
             session_id,
@@ -1887,7 +2055,7 @@ async fn fed_send_message_handler(
             if !matches!(harness.as_str(), "claude" | "agy" | "pi" | "svc") {
                 return Err(AppError::BadRequest(format!("invalid harness '{harness}'")));
             }
-            let sanitized = inbox::sanitize_attested_from(&peer.name, harness, name);
+            let sanitized = inbox::sanitize_attested_from(effective_origin_peer, harness, name);
             (sanitized, Some(harness.clone()), Some(session_id.clone()))
         }
         FedPrincipal::Service { name } => {
@@ -1897,11 +2065,11 @@ async fn fed_send_message_handler(
                     "invalid service name '{name}'"
                 )));
             }
-            let badge = format!("xmsg@{} · svc:{}", peer.name, name);
+            let badge = format!("xmsg@{} · svc:{}", effective_origin_peer, name);
             (badge, Some("svc".to_string()), Some(name.clone()))
         }
         FedPrincipal::Anonymous { from } => {
-            let sanitized = inbox::sanitize_from(&peer.name, from)?;
+            let sanitized = inbox::sanitize_from(effective_origin_peer, from)?;
             (sanitized, None, None)
         }
     };
@@ -1984,8 +2152,8 @@ async fn fed_send_message_handler(
         &envelope.id,
         &envelope.body,
         storage::SvcOrigin::Fed {
-            host: peer.name.clone(),
-            principal: Some(envelope.principal.badge()),
+            host: effective_origin_peer.clone(),
+            principal: Some(effective_principal.badge()),
         },
     )
     .await;
@@ -2274,7 +2442,7 @@ async fn fed_reply_handler(
             .map_err(|e| AppError::Internal(e.to_string()))?
     };
 
-    let _outbound = match outbound {
+    let outbound = match outbound {
         Some(o) if o.peer == peer.name => o,
         _ => {
             return Err(AppError::NotRecipient(format!(
@@ -2283,6 +2451,72 @@ async fn fed_reply_handler(
             )));
         }
     };
+
+    // 3. Check if this is a reply to a forwarded message (hub forwarding case)
+    let forwarded = {
+        let db = fed_state
+            .db
+            .lock()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        storage::get_forwarded_message(&db, &reply.in_reply_to)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+    };
+
+    if let Some(fwd) = forwarded {
+        let origin_peer_cfg = fed_state
+            .peers
+            .get(&fwd.origin_peer)
+            .ok_or_else(|| AppError::UnknownPeer(fwd.origin_peer.clone()))?;
+
+        if !origin_peer_cfg.leaf && !origin_peer_cfg.is_outbound() {
+            // Dialable origin: send federated reply to origin peer
+            let _ = send_federated_reply(&fed_state, &fwd.origin_peer, &reply).await?;
+            return Ok((
+                StatusCode::OK,
+                Json(json!({
+                    "push_outcome": "relayed",
+                    "message_id": reply.id,
+                })),
+            )
+                .into_response());
+        } else {
+            // Undialable origin (leaf / outbound link): store reply for polling
+            let replier_session_id = if !reply.replier.session_id.is_empty() {
+                reply.replier.session_id.clone()
+            } else if !reply.replier.name.is_empty() {
+                reply.replier.name.clone()
+            } else {
+                peer.name.clone()
+            };
+
+            let push_outcome = "disabled";
+            {
+                let db = fed_state
+                    .db
+                    .lock()
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                storage::insert_reply(
+                    &db,
+                    &reply.in_reply_to,
+                    &replier_session_id,
+                    &reply.text,
+                    Some(push_outcome),
+                    Some(&reply.id),
+                )
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            }
+            let _ = fed_state.notify_tx.send(reply.in_reply_to.clone());
+
+            return Ok((
+                StatusCode::OK,
+                Json(json!({
+                    "push_outcome": push_outcome,
+                    "message_id": reply.id,
+                })),
+            )
+                .into_response());
+        }
+    }
 
     // 4. Look up original message to get caller session
     let orig_msg = {
@@ -2327,7 +2561,15 @@ async fn fed_reply_handler(
             })),
         )
             .into_response())
-    } else if peer_cfg.leaf {
+    } else if peer_cfg.leaf
+        || (outbound.target_ref.contains('@')
+            && orig_msg
+                .as_ref()
+                .map(|m| {
+                    !m.push_replies && m.return_harness.is_some() && m.return_session_id.is_some()
+                })
+                .unwrap_or(false))
+    {
         let replier_session_id = if !reply.replier.session_id.is_empty() {
             reply.replier.session_id.clone()
         } else if !reply.replier.name.is_empty() {
@@ -2389,17 +2631,29 @@ async fn fed_get_replies_handler(
         return Err(AppError::RateLimited("Rate limit exceeded".to_string()));
     }
 
-    let msg = {
+    let (authorized, exists) = {
         let db = fed_state
             .db
             .lock()
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        storage::get_message(&db, &id)
+        if let Some(msg) =
+            storage::get_message(&db, &id).map_err(|e| AppError::Internal(e.to_string()))?
+        {
+            (msg.return_host.as_deref() == Some(&peer.name), true)
+        } else if let Some(fwd) = storage::get_forwarded_message(&db, &id)
             .map_err(|e| AppError::Internal(e.to_string()))?
-            .ok_or_else(|| AppError::NotFound(format!("message '{id}'")))?
+        {
+            (fwd.origin_peer == peer.name, true)
+        } else {
+            (false, false)
+        }
     };
 
-    if msg.return_host.as_deref() != Some(&peer.name) {
+    if !exists {
+        return Err(AppError::NotFound(format!("message '{id}'")));
+    }
+
+    if !authorized {
         return Err(AppError::OpDenied(format!(
             "peer '{}' is not authorized to pull replies for message '{}'",
             peer.name, id

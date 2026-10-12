@@ -23,12 +23,18 @@ pub struct InboxMessage {
     pub content: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendMessageRequest {
     #[serde(default)]
     pub from: String,
     pub text: String,
+    #[serde(default = "default_true", alias = "pushReplies")]
+    pub push_replies: bool,
     #[serde(
         default,
         alias = "idempotencyKey",

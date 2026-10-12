@@ -537,7 +537,52 @@ pub async fn run_agent_server(
                             false
                         };
 
-                        let (push_outcome, pushed_message_id) = if let (
+                        let (push_outcome, pushed_message_id) = if is_leaf_peer {
+                            (Some("disabled".to_string()), None)
+                        } else if let Some(ret_host) = msg
+                            .return_host
+                            .as_deref()
+                            .filter(|h| !h.is_empty() && *h != state_clone.host_label)
+                        {
+                            let new_message_id = ulid::Ulid::new().to_string();
+                            let replier_name =
+                                caller.name.as_deref().unwrap_or(&caller.session_id);
+                            let replier = crate::fed::FedReplier {
+                                harness: caller.harness.clone(),
+                                session_id: caller.session_id.clone(),
+                                name: replier_name.to_string(),
+                            };
+                            let reply_envelope = crate::fed::FedReplyEnvelope {
+                                v: 1,
+                                id: new_message_id.clone(),
+                                in_reply_to: message_id.to_string(),
+                                replier,
+                                text: text.to_string(),
+                                created_at: storage::now_epoch_secs(),
+                            };
+                            let push_res: Result<(), &'static str> =
+                                match &state_clone.fed_state {
+                                    Some(fed_state) => {
+                                        match crate::fed::send_federated_reply(
+                                            fed_state,
+                                            ret_host,
+                                            &reply_envelope,
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => Ok(()),
+                                            Err(AppError::Gone { .. }) => Err("sender_gone"),
+                                            Err(_) => Err("push_failed"),
+                                        }
+                                    }
+                                    None => Err("push_failed"),
+                                };
+                            let outcome_str = match push_res {
+                                Ok(()) => "pushed",
+                                Err(e) => e,
+                            };
+                            (Some(outcome_str.to_string()), Some(new_message_id))
+                        } else if let (
                             Some(ret_harness),
                             Some(ret_session_id),
                         ) = (
@@ -546,49 +591,6 @@ pub async fn run_agent_server(
                         ) {
                             if !msg.push_replies || is_leaf_peer {
                                 (Some("disabled".to_string()), None)
-                            } else if let Some(ret_host) = msg
-                                .return_host
-                                .as_deref()
-                                .filter(|h| !h.is_empty() && *h != state_clone.host_label)
-                            {
-                                let new_message_id = ulid::Ulid::new().to_string();
-                                let replier_name =
-                                    caller.name.as_deref().unwrap_or(&caller.session_id);
-                                let replier = crate::fed::FedReplier {
-                                    harness: caller.harness.clone(),
-                                    session_id: caller.session_id.clone(),
-                                    name: replier_name.to_string(),
-                                };
-                                let reply_envelope = crate::fed::FedReplyEnvelope {
-                                    v: 1,
-                                    id: new_message_id.clone(),
-                                    in_reply_to: message_id.to_string(),
-                                    replier,
-                                    text: text.to_string(),
-                                    created_at: storage::now_epoch_secs(),
-                                };
-                                let push_res: Result<(), &'static str> =
-                                    match &state_clone.fed_state {
-                                        Some(fed_state) => {
-                                            match crate::fed::send_federated_reply(
-                                                fed_state,
-                                                ret_host,
-                                                &reply_envelope,
-                                            )
-                                            .await
-                                            {
-                                                Ok(_) => Ok(()),
-                                                Err(AppError::Gone { .. }) => Err("sender_gone"),
-                                                Err(_) => Err("push_failed"),
-                                            }
-                                        }
-                                        None => Err("push_failed"),
-                                    };
-                                let outcome_str = match push_res {
-                                    Ok(()) => "pushed",
-                                    Err(e) => e,
-                                };
-                                (Some(outcome_str.to_string()), Some(new_message_id))
                             } else {
                                 let new_message_id = ulid::Ulid::new().to_string();
                                 let replier_name =
@@ -1063,6 +1065,7 @@ pub async fn run_agent_server(
                                 push_replies,
                                 thread_id: message_id.clone(),
                                 created_at: storage::now_epoch_secs(),
+                                forwarded: None,
                             };
 
                             match crate::fed::send_federated_message(

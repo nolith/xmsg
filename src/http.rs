@@ -404,9 +404,10 @@ async fn send_message_handler(
                 r#ref: ref_str.clone(),
             },
             body: req.text.clone(),
-            push_replies: true,
+            push_replies: req.push_replies,
             thread_id: message_id.clone(),
             created_at: storage::now_epoch_secs(),
+            forwarded: None,
         };
 
         let delivery_resp =
@@ -446,7 +447,7 @@ async fn send_message_handler(
                 return_harness: Some("svc".to_string()),
                 return_session_id: state.leaf_principal().map(|s| s.to_string()),
                 return_host: Some(state.host_label.clone()),
-                push_replies: true,
+                push_replies: req.push_replies,
                 thread_id: message_id.clone(),
             };
             let _ = storage::insert_message(&db, &msg_record);
@@ -698,6 +699,7 @@ async fn send_message_handler(
         let _ = storage::purge_agy_messages(&db, state.reply_ttl.as_secs());
         let _ = storage::purge_svc_messages(&db, state.reply_ttl.as_secs());
         let _ = storage::purge_peer_mailbox(&db, state.reply_ttl.as_secs());
+        let _ = storage::purge_forwarded_messages(&db, state.reply_ttl.as_secs());
     }
 
     // Invariant: Message bodies are NEVER logged under any circumstances

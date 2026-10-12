@@ -841,6 +841,7 @@ async fn test_oracle_4_refused_target_does_not_consume_rate_limit_or_create_stor
         push_replies: false,
         thread_id: refused_id.to_string(),
         created_at: storage::now_epoch_secs(),
+        forwarded: None,
     };
 
     let res_refused = send_federated_message(&node_a.fed_state, "host-b", &envelope_refused).await;
@@ -882,6 +883,7 @@ async fn test_oracle_4_refused_target_does_not_consume_rate_limit_or_create_stor
         push_replies: false,
         thread_id: allowed_id.to_string(),
         created_at: storage::now_epoch_secs(),
+        forwarded: None,
     };
 
     let res_allowed = send_federated_message(&node_a.fed_state, "host-b", &envelope_allowed).await;

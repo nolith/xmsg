@@ -511,6 +511,7 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
         push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
 
     let fed_state_a1 = Arc::new(FedState {
@@ -598,6 +599,7 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
         push_replies: false,
         thread_id: "t2".to_string(),
         created_at: 2000,
+        forwarded: None,
     };
 
     let fed_state_a2 = Arc::new(FedState {
@@ -698,6 +700,7 @@ async fn test_oracle_2_from_absent_pin_only_accepted() {
         push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
 
     let fed_state_a = Arc::new(FedState {
@@ -1042,6 +1045,7 @@ async fn test_oracle_6_anonymous_from_with_colon_gives_400() {
         push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
 
     let fed_state_a = Arc::new(FedState {
@@ -1179,6 +1183,7 @@ async fn test_oracle_7_root_harness_rejected_and_badge_spoof_sanitized() {
         push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
     let res_root = send_federated_message(&fed_state_a, "host-b", &env_root).await;
     assert!(matches!(
@@ -1202,6 +1207,7 @@ async fn test_oracle_7_root_harness_rejected_and_badge_spoof_sanitized() {
         push_replies: false,
         thread_id: "t2".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
     let res_spoof = send_federated_message(&fed_state_a, "host-b", &env_spoof).await;
     assert!(res_spoof.is_ok());
@@ -1296,6 +1302,7 @@ async fn test_n4_attested_name_ascii_only_u0387() {
         push_replies: false,
         thread_id: "t-u0387".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
     let res = send_federated_message(&fed_state_a, "host-b", &env_u0387).await;
     assert!(res.is_ok());
@@ -1387,6 +1394,7 @@ async fn test_oracle_8_no_forward_rejected() {
         push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
 
     let res = send_federated_message(&fed_state_a, "host-b", &env).await;
@@ -1619,6 +1627,7 @@ async fn test_oracle_10_duplicate_id_delivered_once() {
         push_replies: false,
         thread_id: dup_id.clone(),
         created_at: 1000,
+        forwarded: None,
     };
 
     // First send
@@ -1729,6 +1738,7 @@ async fn test_oracle_11_rate_limit_429() {
             push_replies: false,
             thread_id: "t".to_string(),
             created_at: 1000,
+            forwarded: None,
         };
         send_federated_message(&fed_state_a, "host-b", &env)
             .await
@@ -1751,6 +1761,7 @@ async fn test_oracle_11_rate_limit_429() {
         push_replies: false,
         thread_id: "t".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
     let res = send_federated_message(&fed_state_a, "host-b", &env_exceeded).await;
     match res {
@@ -1908,6 +1919,7 @@ async fn test_amendment_a_peer_without_send_gets_403_op_denied() {
         push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
 
     let res = send_federated_message(&fed_state_a, "host-b", &env).await;
@@ -2670,6 +2682,7 @@ async fn test_f4_one_way_link() {
         push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
 
     let res = send_federated_message(&node_a.fed_state, "host-b", &env).await;
@@ -2749,6 +2762,7 @@ async fn test_f7_outbound_timeout_on_silent_peer() {
         push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
 
     let start = std::time::Instant::now();
@@ -2819,6 +2833,7 @@ async fn test_f8_verbatim_remote_outcome_relay_and_dedup() {
         push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
 
     let r1 = send_federated_message(&fed_state_a, "host-b", &env).await;
@@ -2890,6 +2905,7 @@ async fn test_f9_kind_qualified_principal_filter() {
             push_replies: false,
             thread_id: "t1".into(),
             created_at: 1000,
+            forwarded: None,
         },
     )
     .await;
@@ -2912,6 +2928,7 @@ async fn test_f9_kind_qualified_principal_filter() {
             push_replies: false,
             thread_id: "t2".into(),
             created_at: 1000,
+            forwarded: None,
         },
     )
     .await;
@@ -2939,6 +2956,7 @@ async fn test_f9_kind_qualified_principal_filter() {
             push_replies: false,
             thread_id: "t3".into(),
             created_at: 1000,
+            forwarded: None,
         },
     )
     .await;
@@ -2961,6 +2979,7 @@ async fn test_f9_kind_qualified_principal_filter() {
             push_replies: false,
             thread_id: "t4".into(),
             created_at: 1000,
+            forwarded: None,
         },
     )
     .await;
@@ -3153,6 +3172,7 @@ async fn test_oracle_server_pin_verified() {
         push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
 
     let rg = send_federated_message(&good_state, "host-b", &e).await;
@@ -3588,6 +3608,7 @@ async fn test_n3_unauthenticated_socket_bound_leaves_slot_for_peer() {
         push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
 
     let send_res = send_federated_message(&a, "host-b", &env).await;
@@ -3725,6 +3746,7 @@ async fn test_n7_mf6_tcp_peer_address_source() {
         push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
+        forwarded: None,
     };
     let body_bytes = serde_json::to_vec(&env).unwrap();
     let req = hyper::Request::builder()
