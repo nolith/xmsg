@@ -357,13 +357,6 @@ def start_hermes():
     time.sleep(3)
 
 
-# A first launch only warms hermes's plugin toolset cache: on a fresh HERMES_HOME the CLI resolves
-# its toolsets while plugin discovery is still running, so a plugin's tools reach the model from
-# the second launch on (hermes_cli/plugins.py _nowait_plugin_set).
-start_hermes()
-os.kill(hermes_pid, signal.SIGKILL)
-os.waitpid(hermes_pid, 0)
-scr.clear()
 start_hermes()
 ok("hermes CLI is up")
 
