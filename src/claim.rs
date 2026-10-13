@@ -227,6 +227,8 @@ pub fn sync_claims_entries(
         .filter(|e| is_claude_proc_live(proc_root, e.pid, &e.proc_start))
         .collect();
 
+    let now = now_epoch_secs();
+
     // 1. Recheck all active claims (released = 0)
     let mut stmt = conn
         .prepare("SELECT id, pid, proc_start, suffix, released, created_at FROM instance_claims WHERE released = 0")
@@ -256,6 +258,10 @@ pub fn sync_claims_entries(
                 params![claim.id, claim.pid, claim.proc_start],
             )
             .map_err(|e| AppError::Internal(e.to_string()))?;
+            // Discovery is on demand, so the release is the latest moment X is known to
+            // have been live: its parked lifetime runs from here (A14, D-1).
+            storage::mark_live(conn, &claim.id, "claude", now)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
         }
     }
 
@@ -281,7 +287,6 @@ pub fn sync_claims_entries(
     }
 
     // 3. For each ID with new observations, sort by (procStart, pid) and assign suffixes
-    let now = now_epoch_secs();
     for (id, mut entries) in new_observations_by_id {
         entries.sort_by(|a, b| {
             cmp_proc_start(&a.proc_start, &b.proc_start).then_with(|| a.pid.cmp(&b.pid))
@@ -479,8 +484,70 @@ pub async fn deliver_fork_notices(
     }
 }
 
+/// A queued message taken for a live holder of its plain ID (A14).
+#[derive(Debug, Clone)]
+pub struct QueuedDelivery {
+    pub message: storage::QueuedMessage,
+    pub socket_path: PathBuf,
+}
+
+/// Takes what is queued for every live plain-ID holder in one scan's pairs. A queue drains
+/// when its conversation is next observed, and a taken message is marked delivered, so the
+/// observation after that delivers nothing again.
+pub fn take_queued_for(
+    conn: &Connection,
+    active_pairs: &[(InstanceClaim, SessionFileEntry)],
+) -> Result<Vec<QueuedDelivery>, AppError> {
+    let now = now_epoch_secs();
+    let mut out = Vec::new();
+    for (claim, entry) in active_pairs.iter().filter(|(c, _)| c.suffix == 1) {
+        for message in storage::take_queued(conn, &claim.id, now)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+        {
+            out.push(QueuedDelivery {
+                message,
+                socket_path: PathBuf::from(&entry.messaging_socket_path),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Delivers messages taken by `take_queued_for`, in order. A delivered message's outcome
+/// becomes `delivered`; a failed one is put back for the next observation.
+pub async fn deliver_queued(db: &std::sync::Mutex<Connection>, deliveries: Vec<QueuedDelivery>) {
+    let mut outcomes = Vec::new();
+    for d in deliveries {
+        let res = match inbox::encode_transport_line(&d.message.from_name, &d.message.body) {
+            Ok(line) => inbox::deliver_to_socket(&d.socket_path, &line).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = &res {
+            warn!(
+                "Failed delivering queued message {} to {}: {}",
+                d.message.id,
+                d.socket_path.display(),
+                e
+            );
+        }
+        outcomes.push((d.message.id, res.is_ok()));
+    }
+    let conn = db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (id, delivered) in outcomes {
+        let res = if delivered {
+            storage::update_message_outcome(&conn, &id, "delivered").map(|_| ())
+        } else {
+            storage::untake_queued(&conn, &id)
+        };
+        if let Err(e) = res {
+            warn!("Queued message bookkeeping failed for {}: {}", id, e);
+        }
+    }
+}
+
 /// Runs one claim scan, then `f` over its live (claim, session file) pairs,
-/// under the DB lock; then delivers the fork notices that scan claimed.
+/// under the DB lock; then delivers the fork notices that scan claimed and the
+/// queued messages it took (A14).
 /// Every surface that observes the claim table goes through here, so none can
 /// observe a fork and drop its notice.
 ///
@@ -494,14 +561,18 @@ pub async fn with_claims<T>(
     node_name: &str,
     f: impl FnOnce(&Connection, &[(InstanceClaim, SessionFileEntry)]) -> T,
 ) -> Result<T, AppError> {
-    let (out, notices) = {
+    let (out, notices, queued) = {
         let conn = db.lock().map_err(|e| AppError::Internal(e.to_string()))?;
         let (pairs, notices) = sync_claims_db(&conn, proc_root, sessions_dirs, node_name)?;
-        (f(&conn, &pairs), notices)
+        let queued = take_queued_for(&conn, &pairs)?;
+        (f(&conn, &pairs), notices, queued)
     };
-    if !notices.is_empty() {
+    if !notices.is_empty() || !queued.is_empty() {
         let db = Arc::clone(db);
-        let delivery = tokio::spawn(async move { deliver_fork_notices(&db, notices).await });
+        let delivery = tokio::spawn(async move {
+            deliver_fork_notices(&db, notices).await;
+            deliver_queued(&db, queued).await;
+        });
         if let Err(e) = delivery.await {
             warn!("Fork notice delivery task failed: {}", e);
         }

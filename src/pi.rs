@@ -214,6 +214,18 @@ pub async fn handle_pi_connection<
         };
         store.write().unwrap().insert(session_id.clone(), info);
     }
+    // The ever-observed record, so that once this process exits its ID answers `gone`
+    // (AM-9, AM-10); stamped again when the connection ends, however it ends.
+    struct MarkLive(Arc<Mutex<rusqlite::Connection>>, String);
+    impl Drop for MarkLive {
+        fn drop(&mut self) {
+            if let Ok(conn) = self.0.lock() {
+                let _ = storage::mark_live(&conn, &self.1, "pi", now_epoch_secs());
+            }
+        }
+    }
+    drop(MarkLive(db.clone(), session_id.clone()));
+    let _mark_on_end = MarkLive(db.clone(), session_id.clone());
 
     // Write initial registration ok with server-derived sessionId
     let ok_resp = serde_json::json!({

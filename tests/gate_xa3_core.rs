@@ -17,6 +17,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 
+mod http_child;
+
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
 }
@@ -776,8 +778,18 @@ async fn test_oracle_5_replies_reads_the_stored_reply_and_caps_wait() {
     let node = Node::start(tmp.path(), &["answerer"]);
     let mut answerer = Service::register(&node, "answerer").await;
 
-    let (status, body) = node.send("answerer", "anonymous question").await;
+    // This test process is now the service `answerer` (A15), so the anonymous sender is a
+    // process outside every tree.
+    let (status, body) = http_child::request_detached(
+        "http_child_entry",
+        &http_child::Via::Unix(node.http_sock.clone()),
+        "POST",
+        "/v1/messages",
+        Some(&serde_json::json!({ "to": "answerer", "from": "ci", "text": "anonymous question" })),
+    )
+    .await;
     assert_eq!(status, 202, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     let message_id = body["message_id"].as_str().unwrap().to_string();
     let delivered = answerer.poll(3).await.expect("delivered");
     let ack = answerer
@@ -1078,4 +1090,10 @@ async fn test_oracle_12_names_compare_exactly() {
             assert_eq!(sent["error"], "not_found", "send {name}: {sent}");
         }
     }
+}
+
+/// The body of every HTTP child this binary starts (`tests/http_child`).
+#[test]
+fn http_child_entry() {
+    http_child::serve_if_child();
 }

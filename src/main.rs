@@ -892,7 +892,11 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ucred_listener = xmsg::http::bind_ucred_unix_listener(&http_sock_path, my_uid, None)?;
     let mut shutdown_rx_unix = shutdown_rx.clone();
     server_tasks.push(tokio::spawn(async move {
-        let server = axum::serve(ucred_listener, app);
+        // A15: only http.sock carries the peer credentials a caller is traced by.
+        let server = axum::serve(
+            ucred_listener,
+            app.into_make_service_with_connect_info::<xmsg::http::HttpPeer>(),
+        );
         let shutdown_fut = async move {
             let _ = shutdown_rx_unix.wait_for(|&v| v).await;
         };

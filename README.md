@@ -14,6 +14,7 @@ All local IPC in `xmsg` relies on Unix domain sockets located in `$XDG_RUNTIME_D
 - Any process executing under the **same local UID** is within the trust boundary and may connect to the Unix sockets.
 - Sockets are protected against symlink attacks and race conditions on startup by verifying directory ownership and permissions prior to binding.
 - All HTTP API endpoints are exposed over `$XDG_RUNTIME_DIR/xmsg/http.sock` by default. Every connection undergoes a peer UID check (`peer_uid == server_uid`) before HTTP framing, dropping connections from other UIDs immediately.
+- **Caller identity is attribution, not a boundary (A15).** Within one UID, identifying a caller by its process ancestry (on `agent.sock` and `http.sock`) protects against mistakes and attributes senders; it does not stop a same-UID process that sets out to impersonate a session. The boundaries that hold are separate UIDs (each genie tier runs its own `xmsg`), certificates, and a peer's `allow`. Anyone who sees a message ID (in a log, in a forwarded label) can read its replies.
 
 ### 1.2 No-Authentication HTTP Posture & Unix-Socket Default
 
@@ -41,12 +42,12 @@ All local IPC in `xmsg` relies on Unix domain sockets located in `$XDG_RUNTIME_D
   anonymous:  from · anon@node     (an unattested HTTP sender)
   ```
   `id@node` is attested by `xmsg`: `id` is the sender's instance address, a fork's `~n` included (so the `X~2` fork of a conversation sends as `X~2`, never as plain `X`), and `node` is the node's own name (Section 7.0), or the reader's nickname for a peer it has one for. The label is the sender's own description (a Claude session's name, a pi session's name) and is shown apart from it. The harness is not shown. A label containing `@` or `·` is dropped whole, so it can never imitate the attested part; the session stays listed and addressable by its ID, with no label. Only the label is bounded (64 characters); the attested part is always emitted whole, however long the node's name is.
-- **Ancestor Process Walk:** For calls to `agent.sock` (such as MCP tools spawned in child shells), `xmsg` traverses parent PIDs upwards through `/proc/<pid>/stat` (`proc_pidinfo` on macOS) to identify the originating agent session.
+- **Ancestor Process Walk:** For calls to `agent.sock` (such as MCP tools spawned in child shells) and to `http.sock` (A15), `xmsg` traverses parent PIDs upwards through `/proc/<pid>/stat` (`proc_pidinfo` on macOS) to identify the originating session or service, reading the claim table, so a fork acts as `X~n`. A caller on `http.sock` that traces to none is anonymous. A caller on the TCP `--listen` listener carries no peer credentials and is anonymous, except in leaf mode, where it is the leaf principal (AM-2).
 - **Harness-Bound Reply Authorization:** All stored messages record the recipient harness (`claude`, `agy`, or `pi`). A reply is accepted only when:
   ```text
   caller.harness == msg.recipient_harness && caller.session_id == msg.session_id
   ```
-- **Principal-Scoped Idempotency:** Idempotency keys are partitioned by sender principal. For kernel-attested `agent.sock` callers, the principal is `session:<session_id>`, preventing cross-session key collision or interception. For unauthenticated HTTP callers, the principal is scoped as `http:<from_name>` based on the caller-declared `from` field; unauthenticated callers choosing identical sender names share that key namespace.
+- **Principal-Scoped Idempotency:** Idempotency keys are partitioned by sender principal: an attested caller's instance address (a fork's `~n` included) or service name, and an anonymous HTTP caller's `anon:<from>`, from the caller-declared `from` field. Anonymous callers choosing the same `from` share that key namespace.
 
 ### 1.4 Envelope Sanitization & Breakout Protection
 
@@ -93,6 +94,15 @@ flowchart TD
 ### 2.1 `http.sock`
 
 Serves the HTTP API directly over a local Unix domain socket. Peer credentials (`SO_PEERCRED` / `getpeereid`) are checked on every connection, refusing any non-matching UID prior to HTTP framing.
+
+**Who is calling (A15).** The caller's process ancestry is walked from its peer PID, as on `agent.sock`. A caller that traces to a Claude, agy or pi session or a registered service acts as that sender: its sends are attributed (`label · id@node`, and the `from` it supplies is ignored), the replies to them are pushed into its inbox, and it may `reply` to what it received. A caller that traces to none is **anonymous**:
+
+- it may send, labelled `<from> · anon@<node>`, with `from` unattested;
+- it reads the replies to its messages with `GET /v1/messages/{id}/replies`, the message ID being the key;
+- it may not `reply` (`denied`): it has received nothing;
+- its idempotency principal is `anon:<from>`, which a peers-file `principals` filter can name.
+
+`curl --unix-socket` from a Claude session's shell is therefore that session. The TCP `--listen` listener has no peer credentials: its callers are anonymous, or the leaf principal in leaf mode (AM-2).
 
 ### 2.2 `agent.sock`
 
@@ -402,7 +412,18 @@ One order, for every surface that takes a target (`POST /v1/messages`, the `agen
 1. **An instance ID.** A Claude conversation's `X~n` or bare `X`, then an agy or pi session's ID. A bare `X` while the plain ID is free and only `X~n` forks are live is `ambiguous`, listing each fork as `X~n@<node>`; it is never taken as not running.
 2. **A name, among services first.** If a registered service has the name, the send goes to it, whatever any instance is labelled. A session labelled `genie-guard` can never shadow or block the service `genie-guard`; it is reachable only by its ID.
 3. **Instance labels, only when unique.** Only when no service has the name are instance labels (a Claude or pi session's name) considered, and the send resolves only when exactly one live instance carries the label. Two or more give `409 ambiguous`, whose detail lists each candidate as `id@<node>`. Nothing is guessed.
-4. Otherwise `410 gone` (the ID was live here before), or `404 not_found`. Until XA4, a send to an instance that is not running is `not_found`.
+4. **An instance observed here before and not running now** (see the queue, below): a Claude or agy conversation is `queued`; a pi ID is `410 gone`, never queued (its ID is bound to its process, AM-9, AM-10). An `X~n` whose process exited is `410 gone` (step 1; D-4).
+5. Otherwise `404 not_found`, which is also the answer for an ID no process here ever presented.
+
+A federated send arriving at this node takes steps 1 to 3 and answers `gone` or `not_found`: queueing across nodes is not built yet (XA7).
+
+### Delivery and the queue (A14)
+
+- **Outcomes.** A send returns `delivered` (it reached a live recipient) or `queued` (it is held for an instance that is not running).
+- **What queues.** A send to an instance ID this node has observed, while it is not running: a closed Claude conversation, or an agy conversation between turns. "Observed" is the claim table (a Claude process presenting the ID) plus agy registrations. A pi ID and an exited `X~n` are `gone` and never queue.
+- **How long.** A message is held for the reply TTL (`--reply-ttl`, 7 days by default) and dropped unread after it. The ID stays parked, so sends to it queue, for the reply TTL after the conversation was last live, or as long as its queue holds a message, whichever is longer; after that it is `not_found` (D-1's lifetime). Discovery is on demand, so for Claude "last live" is the scan that found the conversation gone, and for agy its last registration.
+- **Delivery.** The queue drains when the conversation is next observed: a new Claude process presenting the ID (the next scan of the session files, which every `list`, `send` and MCP start runs), or an agy registration. Each message is delivered once, in the order sent, and shows when it was sent: `[xmsg] message_id=<id> sent=<RFC 3339 UTC time>`. Its outcome then reads `delivered`.
+- **Across nodes.** The queue is this node's; a send through another node and a queue that follows a conversation to another node are XA7's.
 
 ### Errors
 
@@ -429,7 +450,7 @@ One vocabulary on every surface, as `{"error": <code>, "detail": …}` (HTTP) or
   { "message_id": "01J9XYZ...", "address": "genie-guard@sini.cortex", "outcome": "delivered" }
   ```
   `address` is the resolved address; send follow-ups to it, so they cannot drift to another instance. `outcome` is `delivered` or `queued`.
-- `POST /v1/messages/{id}/replies` `{"text"}`: reply to a message the caller received. An anonymous HTTP caller has received nothing and is `denied` (A15); in leaf mode the caller is the leaf principal.
+- `POST /v1/messages/{id}/replies` `{"text"}`: reply to a message the caller received. A caller traced on `http.sock` replies as its session or service; an anonymous caller has received nothing and is `denied` (A15). On TCP in leaf mode, the caller is the leaf principal (AM-2).
 - `GET /v1/messages/{id}/replies?after={seq}&wait={seconds}`: the stored replies to a message, waiting up to `wait` seconds (capped at 60; at most 128 concurrent waiters) for the first. Anyone holding the message ID may read them.
 - `GET /v1/messages/{id}`: a message's record and its replies (kept; not part of A13's surface).
 
@@ -445,8 +466,8 @@ One vocabulary on every surface, as `{"error": <code>, "detail": …}` (HTTP) or
 
 The database (`--db-path`; default `$XDG_STATE_HOME/xmsg/xmsg.db`, else `~/.local/state/xmsg/xmsg.db`) records its schema version in `PRAGMA user_version`. This schema is version 2. At startup:
 
-- a database at version 1 is opened as it is, so queued messages, stored replies and outbound records survive a restart;
-- a database below it (every build up to and including the deployed `ee1b6ca`, none of which recorded a version, reads 0) has its message state dropped (`messages`, `outbound`, `replies`, the `*_pending_messages` queues, `idempotency_keys`, `peer_mailbox`, and `forwarded_messages` where it exists) and is recreated at version 2, in one transaction. The claim table is kept;
+- a database at version 2 is opened with its rows, so queued messages, stored replies and outbound records survive a restart, and it gains any table version 2 has since been extended with (A14's `instance_queue` and `instance_seen`);
+- a database below it (every build up to and including the deployed `ee1b6ca`, none of which recorded a version, reads 0) has its message state dropped (`messages`, `outbound`, `replies`, the `*_pending_messages` queues, `instance_queue`, `idempotency_keys`, `peer_mailbox`, and `forwarded_messages` where it exists) and is recreated at version 2, in one transaction. The claim table is kept;
 - a database above it is refused, naming both versions.
 
 So the first start after the upgrade from `ee1b6ca` loses messages queued before it, and a reply to a message sent before it fails as unknown. To roll back, copy the database before the upgrade and restore it with the previous binary.

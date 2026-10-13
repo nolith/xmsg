@@ -198,6 +198,7 @@ const MESSAGE_STATE_TABLES: &[&str] = &[
     "idempotency_keys",
     "peer_mailbox",
     "forwarded_messages",
+    "instance_queue",
 ];
 
 const SCHEMA_N: &str = r#"
@@ -324,6 +325,23 @@ const SCHEMA_N: &str = r#"
         CREATE INDEX IF NOT EXISTS idx_instance_claims_id ON instance_claims(id);
         CREATE INDEX IF NOT EXISTS idx_instance_claims_proc ON instance_claims(pid, proc_start);
 
+        CREATE TABLE IF NOT EXISTS instance_queue (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            from_name TEXT NOT NULL,
+            body TEXT NOT NULL,
+            delivered_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_instance_queue_instance ON instance_queue(instance_id, delivered_at);
+
+        CREATE TABLE IF NOT EXISTS instance_seen (
+            id TEXT PRIMARY KEY,
+            harness TEXT NOT NULL,
+            last_live INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS fork_notices (
             id TEXT NOT NULL,
             pid1 INTEGER NOT NULL,
@@ -337,13 +355,14 @@ const SCHEMA_N: &str = r#"
         );
         "#;
 
-/// Opens a database at schema N. A database already at N is used as it is; one below N
-/// (the deployed `ee1b6ca` schema, or none at all) has its message state dropped and is
-/// created at N in one transaction; one above N is refused.
+/// Opens a database at schema N. A database already at N keeps its rows, and gains any
+/// table schema N has since been extended with in place (plan §6 D12); one below N (the
+/// deployed `ee1b6ca` schema, or none at all) has its message state dropped and is created
+/// at N in one transaction; one above N is refused.
 pub fn init_db(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version == SCHEMA_VERSION {
-        return Ok(());
+        return conn.execute_batch(SCHEMA_N);
     }
     if version > SCHEMA_VERSION {
         return Err(rusqlite::Error::SqliteFailure(
@@ -1033,4 +1052,147 @@ pub fn purge_forwarded_messages(conn: &Connection, ttl_secs: u64) -> Result<usiz
 pub fn delete_forwarded_message(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM forwarded_messages WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// A14's local queue: instances observed before and not running now
+// -----------------------------------------------------------------------------
+
+/// A message held for a Claude instance that is not running (A14). `body` is what its inbox
+/// receives, the send time included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedMessage {
+    pub id: String,
+    pub instance_id: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub from_name: String,
+    pub body: String,
+}
+
+pub fn insert_queued(conn: &Connection, msg: &QueuedMessage) -> Result<()> {
+    conn.execute(
+        "INSERT INTO instance_queue (id, instance_id, created_at, expires_at, from_name, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![msg.id, msg.instance_id, msg.created_at, msg.expires_at, msg.from_name, msg.body],
+    )?;
+    Ok(())
+}
+
+/// Takes the unexpired, undelivered messages queued for `instance_id`, oldest first, and
+/// marks them delivered, so a later observation does not deliver them again.
+pub fn take_queued(conn: &Connection, instance_id: &str, now: i64) -> Result<Vec<QueuedMessage>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, instance_id, created_at, expires_at, from_name, body FROM instance_queue WHERE instance_id = ?1 AND delivered_at IS NULL AND expires_at > ?2 ORDER BY created_at ASC, id ASC",
+    )?;
+    let msgs = stmt
+        .query_map(params![instance_id, now], |row| {
+            Ok(QueuedMessage {
+                id: row.get(0)?,
+                instance_id: row.get(1)?,
+                created_at: row.get(2)?,
+                expires_at: row.get(3)?,
+                from_name: row.get(4)?,
+                body: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    for m in &msgs {
+        conn.execute(
+            "UPDATE instance_queue SET delivered_at = ?1 WHERE id = ?2",
+            params![now, m.id],
+        )?;
+    }
+    Ok(msgs)
+}
+
+/// Puts back a message whose delivery failed, for the next observation.
+pub fn untake_queued(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE instance_queue SET delivered_at = NULL WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+pub fn purge_instance_queue(conn: &Connection, ttl_secs: u64) -> Result<usize> {
+    let now = now_epoch_secs();
+    conn.execute(
+        "DELETE FROM instance_queue WHERE expires_at <= ?1 OR (delivered_at IS NOT NULL AND delivered_at < ?2)",
+        params![now, now - ttl_secs as i64],
+    )
+}
+
+/// Records that instance `id` of `harness` was live at `now`: the "ever observed" record
+/// A14's queue and D-1's lifetime read.
+pub fn mark_live(conn: &Connection, id: &str, harness: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO instance_seen (id, harness, last_live) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET harness = excluded.harness, last_live = MAX(last_live, excluded.last_live)",
+        params![id, harness, now],
+    )?;
+    Ok(())
+}
+
+/// An instance observed before: its harness, when it was last live, and whether it has an
+/// unexpired queued message at `now`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenInstance {
+    pub harness: String,
+    pub last_live: i64,
+    pub queued: bool,
+}
+
+pub fn seen_instance(conn: &Connection, id: &str, now: i64) -> Result<Option<SeenInstance>> {
+    let row = conn.query_row(
+        "SELECT harness, last_live FROM instance_seen WHERE id = ?1",
+        params![id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+    );
+    let (harness, last_live) = match row {
+        Ok(r) => r,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let queued: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM instance_queue WHERE instance_id = ?1 AND delivered_at IS NULL AND expires_at > ?2",
+        params![id, now],
+        |r| r.get(0),
+    )?;
+    Ok(Some(SeenInstance {
+        harness,
+        last_live,
+        queued: queued > 0,
+    }))
+}
+
+/// `secs` since the epoch as an RFC 3339 UTC time, `2026-10-12T08:30:00Z`.
+pub fn utc_rfc3339(secs: i64) -> String {
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn utc_rfc3339_known_instants() {
+        assert_eq!(utc_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(utc_rfc3339(1_791_801_000), "2026-10-12T10:30:00Z");
+    }
 }

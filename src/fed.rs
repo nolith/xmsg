@@ -98,7 +98,8 @@ fn target_filter_key(target: &crate::http::ResolvedTarget) -> &str {
             .unwrap_or_else(|| s.session_id.strip_prefix("svc:").unwrap_or(&s.session_id)),
         crate::http::ResolvedTarget::Claude(s, _)
         | crate::http::ResolvedTarget::Agy(s)
-        | crate::http::ResolvedTarget::Pi(s) => &s.session_id,
+        | crate::http::ResolvedTarget::Pi(s)
+        | crate::http::ResolvedTarget::Parked { session: s, .. } => &s.session_id,
     }
 }
 
@@ -2248,7 +2249,10 @@ async fn fed_send_message_handler(
     }
 
     let (target_session_id, recipient_harness) = match &target {
-        crate::http::ResolvedTarget::Claude(s, _) => (s.session_id.clone(), "claude".to_string()),
+        crate::http::ResolvedTarget::Claude(s, _)
+        | crate::http::ResolvedTarget::Parked { session: s, .. } => {
+            (s.session_id.clone(), "claude".to_string())
+        }
         crate::http::ResolvedTarget::Agy(s) => (s.session_id.clone(), "agy".to_string()),
         crate::http::ResolvedTarget::Pi(s) => (s.session_id.clone(), "pi".to_string()),
         crate::http::ResolvedTarget::Svc(s) => (s.session_id.clone(), "svc".to_string()),
@@ -3015,6 +3019,7 @@ async fn resolve_target_session_fed(
         &fed_state.db,
         &fed_state.node_name,
         ref_str,
+        None,
     )
     .await
 }

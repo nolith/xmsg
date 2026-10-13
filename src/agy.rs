@@ -780,6 +780,9 @@ pub async fn flush_agy_queue(
                 return;
             }
         };
+        // A registration is an observation: the conversation is live now (A14).
+        let _ =
+            crate::storage::mark_live(&db_lock, conv_id, "agy", crate::storage::now_epoch_secs());
         match crate::storage::fetch_undelivered_agy_messages(&db_lock, &[session_key, conv_id]) {
             Ok(msgs) => msgs,
             Err(e) => {

@@ -413,27 +413,7 @@ pub async fn run_agent_server(
 
                 let caller_needed = matches!(frame, AgentFrame::Send { .. } | AgentFrame::Reply { .. });
                 let caller = if caller_needed {
-                    let _ = crate::claim::sync_claims(
-                        &state_clone.db,
-                        &state_clone.agy_config.proc_root,
-                        &state_clone.sessions_dirs,
-                        &state_clone.node_name,
-                    )
-                    .await;
-                    let res = {
-                        let db_guard = state_clone.db.lock().ok();
-                        resolve_caller_session(
-                            &state_clone.agy_config.proc_root,
-                            &state_clone.sessions_dirs,
-                            &state_clone.agy_config,
-                            &state_clone.agy_store,
-                            &state_clone.pi_store,
-                            &state_clone.svc_store,
-                            db_guard.as_deref(),
-                            peer_pid,
-                        )
-                    };
-                    match res {
+                    match surface::trace_caller(&state_clone, peer_pid).await {
                         Ok(c) => Some(c),
                         Err(e) => {
                             let err = e.frame();
@@ -479,6 +459,14 @@ pub async fn run_agent_server(
                                         None,
                                     )
                                 });
+                            }
+                            if let Ok(db) = state_clone.db.lock() {
+                                let _ = crate::storage::mark_live(
+                                    &db,
+                                    &session_key,
+                                    "agy",
+                                    crate::storage::now_epoch_secs(),
+                                );
                             }
                             let _ = crate::claim::sync_claims(
                                 &state_clone.db,

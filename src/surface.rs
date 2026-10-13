@@ -168,6 +168,30 @@ pub fn leaf_service_name(principal: &str) -> &str {
     principal.strip_prefix("svc:").unwrap_or(principal)
 }
 
+/// The session or service a local process acts as (A15, D-5): its ancestry, walked from
+/// `pid` through the claim table, to a Claude instance's address, an agy or pi session, or
+/// a registered service. Every surface that identifies a caller by pid reads this.
+pub async fn trace_caller(state: &AppState, pid: u32) -> Result<Session, AppError> {
+    let _ = crate::claim::sync_claims(
+        &state.db,
+        &state.agy_config.proc_root,
+        &state.sessions_dirs,
+        &state.node_name,
+    )
+    .await;
+    let db = state.db.lock().ok();
+    crate::agent::resolve_caller_session(
+        &state.agy_config.proc_root,
+        &state.sessions_dirs,
+        &state.agy_config,
+        &state.agy_store,
+        &state.pi_store,
+        &state.svc_store,
+        db.as_deref(),
+        pid,
+    )
+}
+
 /// Parses one socket frame. A frame with fields `T` does not know is refused
 /// `bad_request` naming every one of them (plan §6 D3), whatever their order.
 pub fn parse_frame<T: serde::de::DeserializeOwned>(line: &str) -> Result<T, AppError> {
@@ -366,7 +390,27 @@ pub(crate) async fn deliver(
             "[xmsg] from={from_name} message_id={message_id} — reply with the xmsg reply tool\n\n{body}"
         )
     };
+    // A queued message shows when it was sent (A14).
+    let sent = storage::utc_rfc3339(storage::now_epoch_secs());
     match target {
+        ResolvedTarget::Parked {
+            session,
+            expires_at,
+        } => {
+            let queued = storage::QueuedMessage {
+                id: message_id.to_string(),
+                instance_id: session.session_id.clone(),
+                created_at: storage::now_epoch_secs(),
+                expires_at: *expires_at,
+                from_name: from_name.to_string(),
+                body: format!(
+                    "{body}\n\n[xmsg] message_id={message_id} sent={sent} — reply with the xmsg reply tool"
+                ),
+            };
+            let db = local.db.lock().map_err(db_err)?;
+            storage::insert_queued(&db, &queued).map_err(db_err)?;
+            Ok((session.session_id.clone(), "claude", "queued"))
+        }
         ResolvedTarget::Claude(session, socket_path) => {
             let body_with_footer = format!(
                 "{body}\n\n[xmsg] message_id={message_id} — reply with the xmsg reply tool"
@@ -395,7 +439,9 @@ pub(crate) async fn deliver(
                 from_name: from_name.to_string(),
                 bytes: body.len(),
                 text: body.to_string(),
-                envelope: envelope_text(),
+                envelope: format!(
+                    "[xmsg] from={from_name} message_id={message_id} sent={sent} — reply with the xmsg reply tool\n\n{body}"
+                ),
                 delivered_at: None,
             };
             let db = local.db.lock().map_err(db_err)?;
@@ -794,6 +840,7 @@ pub async fn send(
         let _ = storage::purge_svc_messages(&db, ttl);
         let _ = storage::purge_peer_mailbox(&db, ttl);
         let _ = storage::purge_forwarded_messages(&db, ttl);
+        let _ = storage::purge_instance_queue(&db, ttl);
     }
 
     // Invariant: message bodies are never logged.

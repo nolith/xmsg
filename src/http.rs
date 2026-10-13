@@ -129,6 +129,12 @@ pub(crate) enum ResolvedTarget {
     Agy(registry::Session),
     Pi(registry::Session),
     Svc(registry::Session),
+    /// A Claude instance observed before and not running now: a send is queued until
+    /// `expires_at` (A14).
+    Parked {
+        session: registry::Session,
+        expires_at: i64,
+    },
 }
 
 impl ResolvedTarget {
@@ -137,7 +143,8 @@ impl ResolvedTarget {
             ResolvedTarget::Claude(s, _)
             | ResolvedTarget::Agy(s)
             | ResolvedTarget::Pi(s)
-            | ResolvedTarget::Svc(s) => s,
+            | ResolvedTarget::Svc(s)
+            | ResolvedTarget::Parked { session: s, .. } => s,
         }
     }
 
@@ -160,7 +167,14 @@ impl ResolvedTarget {
 ///    instance is labelled.
 /// 3. Only when no service has it, instance labels, and only a unique one (A7): two
 ///    live instances labelled alike are `ambiguous`, listing each `id@node`.
-/// 4. Otherwise `gone` (an instance recorded before and since exited) or `not_found`.
+/// 4. Otherwise, with a `reply_ttl` (A14, D-1, AM-9, AM-10): an instance this node
+///    observed and that is not running now, within its parked lifetime (the reply TTL
+///    after it was last live, or as long as its queue), is queued for if it is a Claude
+///    or agy conversation and `gone` if it is a pi; past its lifetime it is `not_found`.
+///    An `X~n` whose process exited is `gone` (D-4, step 1). An ID never observed is
+///    `not_found`.
+/// 5. Without a `reply_ttl` (a send arriving from a peer: the cross-node queue is XA7's),
+///    `gone` for an instance recorded before and since exited, or `not_found`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_target(
     sessions_dirs: &[PathBuf],
@@ -171,21 +185,25 @@ pub(crate) async fn resolve_target(
     db: &Arc<Mutex<rusqlite::Connection>>,
     node_name: &str,
     ref_str: &str,
+    reply_ttl: Option<Duration>,
 ) -> Result<ResolvedTarget, AppError> {
     let proc_root = &agy_config.proc_root;
+    let now = storage::now_epoch_secs();
     let query = registry::SessionsQuery::default();
     let is = |id: &str| id == ref_str;
 
     // One claim scan answers the Claude half of every step.
-    let (claude_by_id, claude_labelled, claude_absence) =
+    let (claude_by_id, claude_labelled, claude_absence, seen) =
         crate::claim::with_claims(db, proc_root, sessions_dirs, node_name, |conn, pairs| {
             (
                 crate::claim::resolve_claude_id_in(conn, pairs, node_name, ref_str),
                 crate::claim::claude_label_matches(pairs, ref_str),
                 crate::claim::claude_absence_in(conn, sessions_dirs, ref_str),
+                storage::seen_instance(conn, ref_str, now),
             )
         })
         .await?;
+    let seen = seen.map_err(|e| AppError::Internal(e.to_string()))?;
 
     // 1. Instance IDs.
     if let Some(res) = claude_by_id {
@@ -233,8 +251,41 @@ pub(crate) async fn resolve_target(
         }
     }
 
-    // 4. Nothing live carries it. A recorded instance whose process still runs has moved
-    // to another conversation: not this one.
+    // 4. Nothing live carries it: an instance observed before (A14, D-1, AM-9, AM-10).
+    if let (Some(ttl), Some(seen)) = (reply_ttl, seen) {
+        let parked = seen.queued || now < seen.last_live + ttl.as_secs() as i64;
+        let parked_session = |harness: &str| registry::Session {
+            session_id: ref_str.to_string(),
+            name: Some(ref_str.to_string()),
+            pid: 0,
+            cwd: "/".to_string(),
+            status: "parked".to_string(),
+            kind: "interactive".to_string(),
+            entrypoint: None,
+            version: None,
+            started_at: 0,
+            updated_at: 0,
+            harness: harness.to_string(),
+            registered: Some(false),
+        };
+        return match seen.harness.as_str() {
+            _ if !parked => Err(AppError::NotFound(ref_str.to_string())),
+            // A pi ID is bound to its process: never queued (AM-9, AM-10).
+            "pi" => Err(AppError::Gone {
+                session_id: ref_str.to_string(),
+                pid: 0,
+            }),
+            // An agy conversation between turns queues where its credentials would.
+            "agy" => Ok(ResolvedTarget::Agy(parked_session("agy"))),
+            _ => Ok(ResolvedTarget::Parked {
+                session: parked_session("claude"),
+                expires_at: now + ttl.as_secs() as i64,
+            }),
+        };
+    }
+
+    // 5. No queue here. A recorded instance whose process still runs has moved to another
+    // conversation: not this one.
     match claude_absence {
         AppError::Gone { pid, .. } if crate::process::starttime(proc_root, pid).is_ok() => {
             Err(AppError::NotFound(ref_str.to_string()))
@@ -256,17 +307,50 @@ pub(crate) async fn resolve_target_session(
         &state.db,
         &state.node_name,
         ref_str,
+        Some(state.reply_ttl),
     )
     .await
 }
 
-/// An HTTP caller: in leaf mode the leaf principal (AM-2), otherwise anonymous (A15's
-/// trace is XA4's).
-fn http_sender(state: &AppState, from: Option<&str>) -> Sender {
-    match state.leaf_principal() {
-        Some(p) if state.is_leaf() => Sender::service(surface::leaf_service_name(p)),
-        _ => Sender::Anonymous(from.unwrap_or_default().to_string()),
+/// How an HTTP caller reached this server. Only `http.sock` carries peer credentials, so
+/// only it yields a pid to trace (A15); a request with no `HttpPeer` (the TCP `--listen`
+/// listener) has none (AM-2).
+#[derive(Debug, Clone, Copy)]
+pub struct HttpPeer {
+    pub pid: Option<u32>,
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, UcredUnixListener>>
+    for HttpPeer
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, UcredUnixListener>) -> Self {
+        HttpPeer {
+            pid: stream
+                .io()
+                .peer_cred()
+                .ok()
+                .and_then(|c| c.pid())
+                .and_then(|p| u32::try_from(p).ok()),
+        }
     }
+}
+
+type PeerInfo = Option<axum::Extension<axum::extract::ConnectInfo<HttpPeer>>>;
+
+/// An HTTP caller (A15, AM-2). On `http.sock`, the caller's ancestry is walked to a session
+/// or service, and a traced caller acts as that sender; an untraced one is anonymous. With
+/// no peer credentials (TCP), the caller is the leaf principal in leaf mode and anonymous
+/// otherwise.
+async fn http_sender(state: &AppState, peer: &PeerInfo, from: Option<&str>) -> Sender {
+    let pid = peer.as_ref().and_then(|p| (p.0).0.pid);
+    if let Some(pid) = pid {
+        if let Ok(session) = surface::trace_caller(state, pid).await {
+            return Sender::Session(session);
+        }
+    } else if let Some(p) = state.leaf_principal().filter(|_| state.is_leaf()) {
+        return Sender::service(surface::leaf_service_name(p));
+    }
+    Sender::Anonymous(from.unwrap_or_default().to_string())
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(
@@ -299,10 +383,11 @@ async fn list_recipients_handler(
 
 async fn send_handler(
     State(state): State<Arc<AppState>>,
+    peer: PeerInfo,
     body: Bytes,
 ) -> Result<Response, AppError> {
     let req: SendRequest = parse_json(&state, &body)?;
-    let sender = http_sender(&state, req.from.as_deref());
+    let sender = http_sender(&state, &peer, req.from.as_deref()).await;
     let res = surface::send(
         &state,
         &sender,
@@ -316,11 +401,12 @@ async fn send_handler(
 
 async fn reply_handler(
     State(state): State<Arc<AppState>>,
+    peer: PeerInfo,
     AxumPath(id): AxumPath<String>,
     body: Bytes,
 ) -> Result<Response, AppError> {
     let req: ReplyRequest = parse_json(&state, &body)?;
-    let caller = match http_sender(&state, None) {
+    let caller = match http_sender(&state, &peer, None).await {
         Sender::Session(s) => s,
         Sender::Anonymous(_) => {
             return Err(AppError::Denied(
