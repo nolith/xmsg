@@ -140,6 +140,15 @@ pub(crate) enum ResolvedTarget {
 }
 
 impl ResolvedTarget {
+    /// Not running now: a parked Claude conversation, or an agy one between turns.
+    pub(crate) fn is_parked(&self) -> bool {
+        match self {
+            ResolvedTarget::Parked { .. } => true,
+            ResolvedTarget::Agy(s) => s.status == "parked",
+            _ => false,
+        }
+    }
+
     pub(crate) fn session(&self) -> &registry::Session {
         match self {
             ResolvedTarget::Claude(s, _)
@@ -160,14 +169,16 @@ impl ResolvedTarget {
 ///    instance is labelled.
 /// 3. Only when no service has it, instance labels, and only a unique one (A7): two
 ///    live instances labelled alike are `ambiguous`, listing each `id@node`.
-/// 4. Otherwise, with a `reply_ttl` (A14, D-1, AM-9, AM-10): an instance this node
+/// 4. Otherwise (A14, D-1, AM-9, AM-10): an instance this node
 ///    observed and that is not running now, within its parked lifetime (the reply TTL
 ///    after it was last live, or as long as its queue), is queued for if it is a Claude
 ///    or agy conversation and `gone` if it is a pi; past its lifetime it is `not_found`.
 ///    An `X~n` whose process exited is `gone` (D-4, step 1). An ID never observed is
 ///    `not_found`.
-/// 5. Without a `reply_ttl` (a send arriving from a peer: the cross-node queue is XA7's),
-///    `gone` for an instance recorded before and since exited, or `not_found`.
+///    A send arriving from a peer queues the same way (XA6); one marked live-only is
+///    refused there instead (`is_parked`, gate v0 C9).
+/// 5. An instance this node never observed: `gone` for a fork recorded before and since
+///    exited, or `not_found`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_target(
     sessions_dirs: &[PathBuf],
@@ -178,7 +189,7 @@ pub(crate) async fn resolve_target(
     db: &Arc<Mutex<rusqlite::Connection>>,
     node_name: &str,
     ref_str: &str,
-    reply_ttl: Option<Duration>,
+    reply_ttl: Duration,
 ) -> Result<ResolvedTarget, AppError> {
     let proc_root = &agy_config.proc_root;
     let now = storage::now_epoch_secs();
@@ -192,12 +203,7 @@ pub(crate) async fn resolve_target(
                 crate::claim::resolve_claude_id_in(conn, pairs, node_name, ref_str),
                 crate::claim::claude_label_matches(pairs, ref_str),
                 crate::claim::claude_absence_in(conn, sessions_dirs, ref_str),
-                storage::seen_instance(
-                    conn,
-                    ref_str,
-                    now,
-                    reply_ttl.map_or(0, |t| t.as_secs() as i64),
-                ),
+                storage::seen_instance(conn, ref_str, now, reply_ttl.as_secs() as i64),
             )
         })
         .await?;
@@ -254,7 +260,8 @@ pub(crate) async fn resolve_target(
     }
 
     // 4. Nothing live carries it: an instance observed before (A14, D-1, AM-9, AM-10).
-    if let (Some(ttl), Some(seen)) = (reply_ttl, seen) {
+    if let Some(seen) = seen {
+        let ttl = reply_ttl;
         let parked = seen.queued || now < seen.last_live + ttl.as_secs() as i64;
         let parked_session = |harness: &str| registry::Session {
             session_id: ref_str.to_string(),
@@ -310,7 +317,7 @@ pub(crate) async fn resolve_target_session(
         &state.db,
         &state.node_name,
         ref_str,
-        Some(state.reply_ttl),
+        state.reply_ttl,
     )
     .await
 }

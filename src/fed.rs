@@ -24,8 +24,15 @@ use crate::storage::{self, MessageRecord};
 
 #[derive(Deserialize)]
 struct WireErrorResponse {
+    #[serde(default)]
+    error: String,
     detail: String,
 }
+
+/// The header marking a send routed by a cached location as live-only (gate v0 C9). It
+/// belongs to one delivery attempt, not to the message: the same message, re-resolved, is
+/// sent again without it.
+pub const LIVE_ONLY_HEADER: &str = "xmsg-live-only";
 
 // -----------------------------------------------------------------------------
 // Peers Configuration & File Format
@@ -1583,6 +1590,10 @@ pub const WIRE_VERSION: u32 = 2;
 #[serde(deny_unknown_fields)]
 pub struct FedForwarded {
     pub forwarder: String,
+    /// The forwarder's `targets` for the destination (A20), which the destination enforces
+    /// on what the reference resolves to there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub targets: Option<Vec<String>>,
 }
 
 /// A message between nodes. Its `origin` is one shape for every sender (A12): the sending
@@ -1919,8 +1930,10 @@ pub fn build_fed_router(fed_state: Arc<FedState>) -> Router {
 async fn fed_send_message_handler(
     State(fed_state): State<Arc<FedState>>,
     Extension(peer): Extension<Arc<AuthenticatedPeer>>,
+    headers: axum::http::HeaderMap,
     Json(envelope): Json<FedEnvelope>,
 ) -> Result<Response, AppError> {
+    let live_only = headers.contains_key(LIVE_ONLY_HEADER);
     if envelope.v != WIRE_VERSION {
         return Err(AppError::BadRequest(format!(
             "unsupported protocol version {}",
@@ -2062,6 +2075,7 @@ async fn fed_send_message_handler(
             created_at: envelope.created_at,
             forwarded: Some(FedForwarded {
                 forwarder: fed_state.node_name.clone(),
+                targets: dest_cfg.targets.clone(),
             }),
         };
 
@@ -2154,6 +2168,22 @@ async fn fed_send_message_handler(
                         "target not allowed for peer".to_string(),
                     ));
                 }
+            }
+            // A20: the forwarder's restriction for this node, on what the ref resolved to.
+            if let Some(allowed) = envelope.forwarded.as_ref().and_then(|f| f.targets.as_ref()) {
+                if !target_matches_allowlist(&t, allowed) {
+                    return Err(AppError::OpDenied(
+                        "target not allowed by the forwarder's targets".to_string(),
+                    ));
+                }
+            }
+            // C9: a cache-routed send is never queued here. Nothing is recorded, so the
+            // sender's re-resolution may bring the same message back.
+            if live_only && t.is_parked() {
+                return Err(AppError::NotLive(format!(
+                    "'{target_ref}' is not live on {}",
+                    fed_state.node_name
+                )));
             }
             t
         }
@@ -2405,7 +2435,7 @@ fn replier_is_recipient(
         return true;
     }
     o.outcome == "queued"
-        && ((replier.id.is_some() && replier.label.as_deref() == Some(typed))
+        && ((!o.resolved && replier.id.is_some() && replier.label.as_deref() == Some(typed))
             || (replier.service.is_some() && is_not_found_reply(text)))
 }
 
@@ -3010,7 +3040,7 @@ async fn resolve_target_session_fed(
         &fed_state.db,
         &fed_state.node_name,
         ref_str,
-        None,
+        fed_state.reply_ttl,
     )
     .await
 }
@@ -3139,6 +3169,16 @@ pub async fn send_federated_message(
     peer_name: &str,
     envelope: &FedEnvelope,
 ) -> Result<DeliveryResponse, AppError> {
+    send_federated_message_with(fed_state, peer_name, envelope, false).await
+}
+
+/// `send_federated_message`, marked live-only when `live_only` (gate v0 C9).
+pub async fn send_federated_message_with(
+    fed_state: &FedState,
+    peer_name: &str,
+    envelope: &FedEnvelope,
+    live_only: bool,
+) -> Result<DeliveryResponse, AppError> {
     let peer = fed_state
         .peers
         .get(peer_name)
@@ -3184,11 +3224,15 @@ pub async fn send_federated_message(
 
         let body_bytes =
             serde_json::to_vec(envelope).map_err(|e| AppError::Internal(e.to_string()))?;
-        let req = hyper::Request::builder()
+        let mut req = hyper::Request::builder()
             .method("POST")
             .uri("/fed/v2/messages")
             .header("content-type", "application/json")
-            .header("host", peer_name)
+            .header("host", peer_name);
+        if live_only {
+            req = req.header(LIVE_ONLY_HEADER, "1");
+        }
+        let req = req
             .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
             .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -3218,6 +3262,7 @@ pub async fn send_federated_message(
             let err_resp: Result<WireErrorResponse, _> = serde_json::from_slice(&body_bytes);
             if let Ok(err) = err_resp {
                 match status {
+                    _ if err.error == "not_live" => Err(AppError::NotLive(err.detail)),
                     StatusCode::NOT_FOUND => Err(AppError::NotFoundDetail(err.detail)),
                     StatusCode::CONFLICT => Err(AppError::Ambiguous(err.detail)),
                     StatusCode::GONE => Err(AppError::Gone {

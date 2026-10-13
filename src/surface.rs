@@ -11,6 +11,7 @@ use crate::error::AppError;
 use crate::fed::FedListEntry;
 use crate::http::{AppState, ResolvedTarget};
 use crate::inbox;
+use crate::mesh::Dest;
 use crate::registry::Session;
 use crate::storage::{self, MessageRecord, Origin, ReplyRecord};
 
@@ -798,55 +799,28 @@ pub async fn send(
     let message_id = ulid::Ulid::new().to_string();
     let now = storage::now_epoch_secs();
 
-    let (address, recipient_harness, outcome, return_host) = match node {
-        Some(node) if node != state.node_name => {
-            let fed_state = state
-                .fed_state
-                .as_ref()
-                .filter(|fs| fs.peers.contains_name(node))
-                .ok_or_else(|| AppError::UnknownPeer(node.to_string()))?
-                .clone();
-            // A typed nickname or canonical name, as this node's entry key.
-            let peer_key = fed_state.peers.key_for(node).unwrap_or(node).to_string();
-            let envelope = crate::fed::FedEnvelope {
-                v: crate::fed::WIRE_VERSION,
-                id: message_id.clone(),
-                // Its node is attested by the receiver (N-2).
-                origin: sender.origin(&state.node_name),
-                to: crate::fed::FedTarget {
-                    r#ref: target_ref.to_string(),
-                },
-                body: text.to_string(),
-                thread_id: message_id.clone(),
-                created_at: now,
-                forwarded: None,
-            };
-            let resp = crate::fed::send_federated_message(&fed_state, &peer_key, &envelope).await?;
-            let outcome = resp.outcome.unwrap_or_else(|| "delivered".to_string());
-            let address = format!("{}@{peer_key}", resp.session_id);
-            // A-2: the outbound reply poller is armed by the sender's kind.
-            if ret_harness.is_some()
-                && fed_state
-                    .peers
-                    .get(&peer_key)
-                    .is_some_and(|p| p.is_outbound())
-            {
-                crate::fed::spawn_outbound_reply_poller(
-                    fed_state.clone(),
-                    peer_key.clone(),
-                    message_id.clone(),
-                );
-            }
-            let db = state.db.lock().map_err(db_err)?;
-            let _ = storage::insert_outbound(&db, &message_id, &peer_key, &address, &outcome, now);
-            (
-                address,
-                "fed".to_string(),
-                outcome,
-                Some(state.node_name.clone()),
-            )
-        }
-        _ => {
+    // `@node` scopes resolution to that node; a bare reference resolves over the view (XA6).
+    let mut dest = match (node, state.fed_state.as_ref()) {
+        (Some(n), _) if n == state.node_name => Dest::Local,
+        (Some(n), Some(fs)) if fs.peers.contains_name(n) => Dest::Peer {
+            node: fs.peers.key_for(n).unwrap_or(n).to_string(),
+            key: target_ref.to_string(),
+            cached: false,
+            id: false,
+        },
+        (Some(n), _) => return Err(AppError::UnknownPeer(n.to_string())),
+        (None, Some(fs)) => crate::mesh::resolve(state, fs, target_ref).await?,
+        (None, None) => Dest::Local,
+    };
+
+    let (address, recipient_harness, outcome, return_host) = loop {
+        let Dest::Peer {
+            node: peer_key,
+            key,
+            cached,
+            id,
+        } = dest
+        else {
             let target = crate::http::resolve_target_session(state, target_ref).await?;
             let (id, harness, outcome) = deliver(
                 &state.local(),
@@ -857,13 +831,76 @@ pub async fn send(
                 sender.origin(&state.node_name),
             )
             .await?;
-            (
+            break (
                 format!("{id}@{}", state.node_name),
                 harness.to_string(),
                 outcome.to_string(),
                 None,
-            )
+            );
+        };
+        let fed_state = state
+            .fed_state
+            .as_ref()
+            .ok_or_else(|| AppError::UnknownPeer(peer_key.clone()))?
+            .clone();
+        let envelope = crate::fed::FedEnvelope {
+            v: crate::fed::WIRE_VERSION,
+            id: message_id.clone(),
+            // Its node is attested by the receiver (N-2).
+            origin: sender.origin(&state.node_name),
+            to: crate::fed::FedTarget { r#ref: key.clone() },
+            body: text.to_string(),
+            thread_id: message_id.clone(),
+            created_at: now,
+            forwarded: None,
+        };
+        let resp =
+            match crate::fed::send_federated_message_with(&fed_state, &peer_key, &envelope, cached)
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) if node.is_none() => {
+                    // A failed delivery invalidates the location, and a cache-routed send
+                    // is resolved again, without the cache (A-12, gate v0 C9).
+                    crate::mesh::forget(state, &key);
+                    if !cached {
+                        return Err(e);
+                    }
+                    dest = crate::mesh::resolve(state, &fed_state, target_ref).await?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+        let outcome = resp.outcome.unwrap_or_else(|| "delivered".to_string());
+        if id && outcome == "delivered" {
+            crate::mesh::remember(state, &key, &peer_key);
         }
+        let address = format!("{}@{peer_key}", resp.session_id);
+        // A-2: the outbound reply poller is armed by the sender's kind.
+        if ret_harness.is_some()
+            && fed_state
+                .peers
+                .get(&peer_key)
+                .is_some_and(|p| p.is_outbound())
+        {
+            crate::fed::spawn_outbound_reply_poller(
+                fed_state.clone(),
+                peer_key.clone(),
+                message_id.clone(),
+            );
+        }
+        let db = state.db.lock().map_err(db_err)?;
+        let _ = storage::insert_outbound(&db, &message_id, &peer_key, &address, &outcome, now);
+        if node.is_none() {
+            // Resolved here: the record holds the recipient's own key (XA5's reply rule).
+            let _ = storage::mark_outbound_resolved(&db, &message_id);
+        }
+        break (
+            address,
+            "fed".to_string(),
+            outcome,
+            Some(state.node_name.clone()),
+        );
     };
 
     let session_id = address

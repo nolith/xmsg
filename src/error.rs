@@ -30,6 +30,15 @@ pub enum AppError {
     #[error("ambiguous session ref: matches {0}")]
     Ambiguous(String),
 
+    /// A bare reference with a node on the path that could not be asked (A-9, D-6).
+    #[error("unavailable: {0}")]
+    Unavailable(String),
+
+    /// A send routed by a cached location reached a node that holds the ID only parked
+    /// (gate v0 C9): not queued there.
+    #[error("not live here: {0}")]
+    NotLive(String),
+
     #[error("session {session_id} process {pid} exited")]
     Gone { session_id: String, pid: u32 },
 
@@ -81,8 +90,8 @@ pub enum AppError {
 
 impl AppError {
     /// The wire code and HTTP status, one vocabulary on every surface (A13): the
-    /// addressing errors `not_found`, `ambiguous`, `denied`, `gone`, and the transport
-    /// errors. `unknown_peer` and `unregistered` fold into `not_found`; a refusal by a
+    /// addressing errors `not_found`, `ambiguous`, `denied`, `gone`, `unavailable` and a
+    /// cache-routed send's `not_live`, and the transport errors. `unknown_peer` and `unregistered` fold into `not_found`; a refusal by a
     /// peer's rights, a reply by a non-recipient and a forward the hub refuses are `denied`.
     pub fn code(&self) -> (StatusCode, &'static str) {
         match self {
@@ -93,6 +102,8 @@ impl AppError {
             | AppError::UnknownPeer(_)
             | AppError::Unregistered(_) => (StatusCode::NOT_FOUND, "not_found"),
             AppError::Ambiguous(_) => (StatusCode::CONFLICT, "ambiguous"),
+            AppError::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+            AppError::NotLive(_) => (StatusCode::CONFLICT, "not_live"),
             AppError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             AppError::Gone { .. } => (StatusCode::GONE, "gone"),
             AppError::PayloadTooLarge { .. } => {
@@ -137,6 +148,8 @@ impl AppError {
             | AppError::NotFoundDetail(d)
             | AppError::BadSender(d)
             | AppError::Ambiguous(d)
+            | AppError::Unavailable(d)
+            | AppError::NotLive(d)
             | AppError::Conflict(d)
             | AppError::InboxUnavailable(d)
             | AppError::Denied(d)

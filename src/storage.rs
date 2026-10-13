@@ -182,7 +182,7 @@ pub fn now_epoch_secs() -> i64 {
 
 /// Schema N: the first schema that records its version (`PRAGMA user_version`).
 /// Neither the deployed `ee1b6ca` nor any build before it set one, so they read 0.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The tables that hold message state. A database below schema N has them in an
 /// older shape, and the migration drops them with their rows (limited release).
@@ -199,6 +199,7 @@ const MESSAGE_STATE_TABLES: &[&str] = &[
     "peer_mailbox",
     "forwarded_messages",
     "instance_queue",
+    "location_cache",
 ];
 
 const SCHEMA_N: &str = r#"
@@ -221,7 +222,8 @@ const SCHEMA_N: &str = r#"
             peer TEXT NOT NULL,
             target_ref TEXT NOT NULL,
             outcome TEXT NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            resolved INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_outbound_created_at ON outbound(created_at);
 
@@ -336,6 +338,12 @@ const SCHEMA_N: &str = r#"
         );
         CREATE INDEX IF NOT EXISTS idx_instance_queue_instance ON instance_queue(instance_id, delivered_at);
 
+        CREATE TABLE IF NOT EXISTS location_cache (
+            id TEXT PRIMARY KEY,
+            node TEXT NOT NULL,
+            cached_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS instance_seen (
             id TEXT PRIMARY KEY,
             harness TEXT NOT NULL,
@@ -443,6 +451,9 @@ pub struct OutboundRecord {
     pub target_ref: String,
     pub outcome: String,
     pub created_at: i64,
+    /// The sending node resolved `target_ref` over its view (XA6), so it is the
+    /// recipient's own ID or service name, not a reference as typed.
+    pub resolved: bool,
 }
 
 pub fn insert_outbound(
@@ -461,8 +472,9 @@ pub fn insert_outbound(
 }
 
 pub fn get_outbound(conn: &Connection, id: &str) -> Result<Option<OutboundRecord>> {
-    let mut stmt = conn
-        .prepare("SELECT id, peer, target_ref, outcome, created_at FROM outbound WHERE id = ?1")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, peer, target_ref, outcome, created_at, resolved FROM outbound WHERE id = ?1",
+    )?;
     let mut rows = stmt.query(params![id])?;
     if let Some(row) = rows.next()? {
         Ok(Some(OutboundRecord {
@@ -471,10 +483,50 @@ pub fn get_outbound(conn: &Connection, id: &str) -> Result<Option<OutboundRecord
             target_ref: row.get(2)?,
             outcome: row.get(3)?,
             created_at: row.get(4)?,
+            resolved: row.get(5)?,
         }))
     } else {
         Ok(None)
     }
+}
+
+pub fn mark_outbound_resolved(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE outbound SET resolved = 1 WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// The node an instance ID was last resolved to, if cached within `ttl_secs` (A-12).
+pub fn cached_location(
+    conn: &Connection,
+    id: &str,
+    now: i64,
+    ttl_secs: i64,
+) -> Result<Option<String>> {
+    match conn.query_row(
+        "SELECT node FROM location_cache WHERE id = ?1 AND cached_at + ?3 > ?2",
+        params![id, now, ttl_secs],
+        |r| r.get(0),
+    ) {
+        Ok(node) => Ok(Some(node)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn cache_location(conn: &Connection, id: &str, node: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO location_cache (id, node, cached_at) VALUES (?1, ?2, ?3)",
+        params![id, node, now],
+    )?;
+    Ok(())
+}
+
+pub fn forget_location(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM location_cache WHERE id = ?1", params![id])?;
+    Ok(())
 }
 
 pub fn update_outbound_outcome(conn: &Connection, id: &str, outcome: &str) -> Result<()> {
