@@ -15,6 +15,8 @@ use xmsg::http::{build_router, AppState};
 use xmsg::pi::{new_pi_store, PiSessionInfo};
 use xmsg::storage;
 
+mod reused_stat;
+
 fn get_self_proc_start() -> String {
     xmsg::process::starttime(
         std::path::Path::new(xmsg::process::LIVE_PROC_ROOT),
@@ -1067,6 +1069,41 @@ async fn test_u8_mcp_start_claude_walk_refuses_parent_younger_than_child() {
         ),
     )
     .unwrap();
+    let refused = agent_rpc(&env.agent_sock, &mcp_start).await;
+    assert_eq!(refused["error"], "unattested", "{refused}");
+
+    // The test process's parent M (a child of session A) has a missing, then a non-numeric,
+    // start time: neither shows M is older than the test process, so the walk ends there
+    // (fail closed) instead of reaching A.
+    let m = 3_999_999;
+    let start = parent_start.max(env.my_proc_start.parse().unwrap());
+    let my_stat = env.proc_root.join(env.my_pid.to_string()).join("stat");
+    fs::write(&my_stat, reused_stat::stat_line(env.my_pid, m, start)).unwrap();
+    let m_dir = env.proc_root.join(m.to_string());
+    fs::create_dir_all(&m_dir).unwrap();
+    for stat in [
+        format!("{m} (m) S {}\n", session_a.pid),
+        format!(
+            "{m} (m) S {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 unreadable 0 0\n",
+            session_a.pid
+        ),
+    ] {
+        fs::write(m_dir.join("stat"), &stat).unwrap();
+        let refused = agent_rpc(&env.agent_sock, &mcp_start).await;
+        assert_eq!(refused["error"], "unattested", "{stat}: {refused}");
+    }
+
+    // The test process's parent M is reused after the step read it: its genuine parent
+    // (under init) when the step reads it, a child of session A that started after the test
+    // process when the walk reaches it. Every walk reads M twice, so the reads alternate.
+    reused_stat::reused_stat(
+        &env.proc_root,
+        m,
+        vec![
+            reused_stat::stat_line(m, 1, start),
+            reused_stat::stat_line(m, session_a.pid, start + 1),
+        ],
+    );
     let refused = agent_rpc(&env.agent_sock, &mcp_start).await;
     assert_eq!(refused["error"], "unattested", "{refused}");
 }

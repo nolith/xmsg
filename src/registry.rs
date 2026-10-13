@@ -294,31 +294,23 @@ pub fn find_ancestor_session_in_dirs(
     sessions_dirs: &[PathBuf],
     start_pid: u32,
 ) -> Result<Session, AppError> {
-    let mut curr_pid = start_pid;
-
-    for _ in 0..32 {
-        let Some(ppid) = process::parent_pid(proc_root, curr_pid) else {
-            break;
-        };
-
-        if ppid <= 1 || !process::started_no_later(proc_root, ppid, curr_pid) {
-            break;
-        }
-
+    for (pid, start) in process::Ancestry::new(proc_root, start_pid)
+        .skip(1)
+        .take(32)
+    {
         for dir in sessions_dirs {
-            let session_file = dir.join(format!("{ppid}.json"));
+            let session_file = dir.join(format!("{pid}.json"));
             if session_file.exists() {
                 if let Ok(content) = std::fs::read_to_string(&session_file) {
                     if let Ok(entry) = serde_json::from_str::<SessionFileEntry>(&content) {
-                        if is_pid_live_in(proc_root, ppid, &entry.proc_start) {
+                        if process::claude_start_token_matches(proc_root, &start, &entry.proc_start)
+                        {
                             return Ok(entry.into());
                         }
                     }
                 }
             }
         }
-
-        curr_pid = ppid;
     }
 
     Err(AppError::NotFound(

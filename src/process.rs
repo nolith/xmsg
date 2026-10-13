@@ -8,8 +8,12 @@
 //! Start times are opaque strings compared for equality: on Linux the
 //! `/proc/<pid>/stat` field 22 (clock ticks since boot), on macOS the process
 //! start as microseconds since the epoch. Both only identify a process together
-//! with its PID, so a reused PID never matches a stored start time. Both are also
-//! numbers that grow with time, which is what [`started_no_later`] orders by.
+//! with its PID, so a reused PID never matches a stored start time.
+//!
+//! [`Ancestry`] also orders a parent against its child. On Linux it orders by the
+//! same field 22, which is monotonic. The macOS token is wall-clock time and steps
+//! back with the clock, so on macOS the walk orders by `ri_proc_start_abstime`
+//! from `proc_pid_rusage(2)` instead, a `mach_absolute_time` reading taken at fork.
 
 use std::fs;
 use std::io;
@@ -49,17 +53,110 @@ pub fn starttime(proc_root: &Path, pid: u32) -> io::Result<String> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat too short"))
 }
 
-/// Whether `parent` started no later than `child`, as every real parent did. An ancestry
-/// walk that attributes identity takes a step only when this holds: a parent that started
-/// after its child is a reused PID read between the two stats, and an unreadable or
-/// non-numeric start time proves nothing, so both fail closed.
-pub fn started_no_later(proc_root: &Path, parent: u32, child: u32) -> bool {
-    let start = |pid| {
-        starttime(proc_root, pid)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-    };
-    matches!((start(parent), start(child)), (Some(p), Some(c)) if p <= c)
+/// One read of a process: its parent, its start token (as [`starttime`] returns it) and the
+/// number its start is ordered by, `None` when that is not a number.
+struct Link {
+    ppid: u32,
+    start: String,
+    order: Option<u64>,
+}
+
+fn read_link(proc_root: &Path, pid: u32) -> Option<Link> {
+    if is_live(proc_root) {
+        #[cfg(target_os = "macos")]
+        return macos::link(pid);
+    }
+    let fields = stat_fields(proc_root, pid).ok()?;
+    let start = fields.get(19)?.clone();
+    Some(Link {
+        ppid: fields.get(1)?.parse().ok()?,
+        order: start.parse().ok(),
+        start,
+    })
+}
+
+/// Why an [`Ancestry`] walk stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkEnd {
+    /// The next parent is PID 0 or 1.
+    Root,
+    /// The stat or start time of `pid` cannot be read, or the start is not a number.
+    Unreadable(u32),
+    /// `parent` started after `child`, so it is a PID reused before it was read.
+    Younger { parent: u32, child: u32 },
+    /// `pid` no longer has the start time read when it was taken as a parent: reused since.
+    Reused(u32),
+}
+
+/// The ancestry walk every identity-attributing caller takes: yields `(pid, start)` for the
+/// start PID and then each ancestor, where `start` is the token to match the process against.
+/// Match against it rather than re-reading the start: a re-read can see a reused PID.
+///
+/// Each step reads the parent once and records its start. When the walk reaches the parent it
+/// reads it again and requires the recorded start, so a PID reused after the step ends the
+/// walk ([`WalkEnd::Reused`]) instead of continuing from the new process's parent. The walk
+/// yields nothing past a failed step, and [`Ancestry::end`] says why it stopped.
+pub struct Ancestry<'a> {
+    proc_root: &'a Path,
+    /// The PID to yield next and the start recorded when it was read as a parent.
+    next: Option<(u32, Option<String>)>,
+    end: Option<WalkEnd>,
+}
+
+impl<'a> Ancestry<'a> {
+    pub fn new(proc_root: &'a Path, start_pid: u32) -> Self {
+        Ancestry {
+            proc_root,
+            next: Some((start_pid, None)),
+            end: None,
+        }
+    }
+
+    /// Why the walk stopped; `None` while it can still go on.
+    pub fn end(&self) -> Option<WalkEnd> {
+        self.end
+    }
+}
+
+impl Iterator for Ancestry<'_> {
+    type Item = (u32, String);
+
+    fn next(&mut self) -> Option<(u32, String)> {
+        let (pid, recorded) = self.next.take()?;
+        let Some(link) = read_link(self.proc_root, pid) else {
+            self.end = Some(WalkEnd::Unreadable(pid));
+            return None;
+        };
+        if recorded.is_some_and(|r| r != link.start) {
+            self.end = Some(WalkEnd::Reused(pid));
+            return None;
+        }
+        let ppid = link.ppid;
+        self.end = if ppid <= 1 {
+            Some(WalkEnd::Root)
+        } else {
+            match read_link(self.proc_root, ppid) {
+                None => Some(WalkEnd::Unreadable(ppid)),
+                Some(parent) => match (parent.order, link.order) {
+                    (None, _) => Some(WalkEnd::Unreadable(ppid)),
+                    (_, None) => Some(WalkEnd::Unreadable(pid)),
+                    // A parent starts no later than its child, so a later start is a reused
+                    // PID. `<=`, not `<`: a child forked within its parent's clock tick (10 ms
+                    // on Linux) has an equal start. The cost: a PID reused within the child's
+                    // own start tick also passes.
+                    (Some(p), Some(c)) if p <= c => {
+                        self.next = Some((ppid, Some(parent.start)));
+                        None
+                    }
+                    _ => Some(WalkEnd::Younger {
+                        parent: ppid,
+                        child: pid,
+                    }),
+                },
+            }
+        };
+        Some((pid, link.start))
+    }
 }
 
 /// Returns the parent PID of `pid`, or `None` when the process cannot be read.
@@ -95,17 +192,23 @@ pub fn cmdline(proc_root: &Path, pid: u32) -> io::Result<Vec<String>> {
 /// to the second, in UTC only. A value equal to [`starttime`] is accepted on
 /// every platform.
 pub fn claude_proc_start_matches(proc_root: &Path, pid: u32, expected: &str) -> bool {
-    if is_live(proc_root) {
-        #[cfg(target_os = "macos")]
-        return match macos::bsdinfo(pid) {
-            Ok(info) => {
-                macos::starttime_token(&info) == expected
-                    || macos::lstart_matches(info.pbi_start_tvsec as i64, expected)
-            }
-            Err(_) => false,
-        };
+    starttime(proc_root, pid).is_ok_and(|st| claude_start_token_matches(proc_root, &st, expected))
+}
+
+/// Whether `token`, a start time [`starttime`] read from `proc_root`, is the process Claude
+/// Code recorded as `expected`, by the rules of [`claude_proc_start_matches`].
+pub fn claude_start_token_matches(proc_root: &Path, token: &str, expected: &str) -> bool {
+    if token == expected {
+        return true;
     }
-    matches!(starttime(proc_root, pid), Ok(st) if st == expected)
+    #[cfg(target_os = "macos")]
+    if is_live(proc_root) {
+        return token
+            .parse::<i64>()
+            .is_ok_and(|us| macos::lstart_matches(us.div_euclid(1_000_000), expected));
+    }
+    let _ = proc_root;
+    false
 }
 
 /// Returns the current working directory of `pid`.
@@ -219,6 +322,35 @@ mod macos {
 
     pub fn starttime_token(info: &libc::proc_bsdinfo) -> String {
         (info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec).to_string()
+    }
+
+    /// The `mach_absolute_time` the kernel recorded when `pid` forked.
+    fn start_abstime(pid: u32) -> Option<u64> {
+        let mut ri = MaybeUninit::<libc::rusage_info_v2>::zeroed();
+        // SAFETY: the buffer is a properly sized and aligned rusage_info_v2, the struct the
+        // RUSAGE_INFO_V2 flavor fills.
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                pid as libc::c_int,
+                libc::RUSAGE_INFO_V2,
+                ri.as_mut_ptr().cast(),
+            )
+        };
+        // SAFETY: proc_pid_rusage returned 0, so it filled the struct.
+        (rc == 0).then(|| unsafe { ri.assume_init() }.ri_proc_start_abstime)
+    }
+
+    /// One read of `pid` for [`super::Ancestry`], ordered by the monotonic fork time. The two
+    /// `proc_bsdinfo` reads bracket the `proc_pid_rusage` one, so all of it is one process.
+    pub fn link(pid: u32) -> Option<super::Link> {
+        let info = bsdinfo(pid).ok()?;
+        let order = start_abstime(pid);
+        let start = starttime_token(&info);
+        (starttime_token(&bsdinfo(pid).ok()?) == start).then_some(super::Link {
+            ppid: info.pbi_ppid,
+            start,
+            order,
+        })
     }
 
     /// Parses `Www Mmm dd hh:mm:ss yyyy` as UTC and compares it to `secs`.

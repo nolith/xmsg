@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-use crate::agy::{self, AgyConfig};
+use crate::agy::AgyConfig;
 use crate::error::AppError;
 use crate::http::AppState;
 use crate::pi::PiStore;
@@ -155,12 +155,13 @@ pub fn resolve_caller_session(
     conn: Option<&rusqlite::Connection>,
     peer_pid: u32,
 ) -> Result<Session, AppError> {
-    let mut curr_pid = peer_pid;
+    let mut walk = crate::process::Ancestry::new(proc_root, peer_pid);
 
-    for _ in 0..32 {
+    for (curr_pid, st) in walk.by_ref().take(32) {
+        // Each store is matched against `st`, the start the walk read, never a re-read.
         // 0. A plugin process holds its addresses per session, so it maps to none: a caller
         // reaching it is anonymous (HA2, harness gate v0 C2).
-        if let (Some(c), Ok(st)) = (conn, crate::process::starttime(proc_root, curr_pid)) {
+        if let Some(c) = conn {
             if crate::plugin::is_plugin_process(c, curr_pid, &st)
                 .map_err(|e| AppError::Internal(e.to_string()))?
             {
@@ -174,7 +175,7 @@ pub fn resolve_caller_session(
         let claude_sessions = registry::read_session_entries(sessions_dirs);
         for entry in claude_sessions {
             if entry.pid == curr_pid
-                && registry::is_pid_live_in(proc_root, curr_pid, &entry.proc_start)
+                && crate::process::claude_start_token_matches(proc_root, &st, &entry.proc_start)
             {
                 let mut session: Session = entry.clone().into();
                 if let Some(c) = conn {
@@ -194,7 +195,8 @@ pub fn resolve_caller_session(
             for info in agy_lock.values() {
                 if info.pid > 0
                     && info.pid == curr_pid
-                    && agy::is_agy_session_alive(proc_root, info)
+                    && !info.starttime.is_empty()
+                    && info.starttime == st
                 {
                     return Ok(Session {
                         session_id: info.conversation_id.clone(),
@@ -222,7 +224,7 @@ pub fn resolve_caller_session(
         {
             let pi_lock = pi_store.read().unwrap();
             for info in pi_lock.values() {
-                if info.pid == curr_pid && crate::pi::is_pi_session_alive(proc_root, info) {
+                if info.pid == curr_pid && info.starttime == st {
                     return Ok(Session {
                         session_id: info.session_id.clone(),
                         name: info.name.clone().or_else(|| Some(info.session_id.clone())),
@@ -245,7 +247,7 @@ pub fn resolve_caller_session(
         {
             let svc_lock = svc_store.read().unwrap();
             for info in svc_lock.values() {
-                if info.pid == curr_pid && crate::svc::is_svc_session_alive(proc_root, info) {
+                if info.pid == curr_pid && info.starttime == st {
                     return Ok(Session {
                         session_id: info.session_id.clone(),
                         name: Some(info.name.clone()),
@@ -263,26 +265,23 @@ pub fn resolve_caller_session(
                 }
             }
         }
-
-        // Step up to PPID
-        let Some(ppid) = crate::process::parent_pid(proc_root, curr_pid) else {
-            break;
-        };
-        if ppid <= 1 {
-            break;
-        }
-        if !crate::process::started_no_later(proc_root, ppid, curr_pid) {
-            return Err(AppError::NotRecipient(format!(
-                "peer PID {peer_pid}: parent {ppid} of {curr_pid} is not older than it"
-            )));
-        }
-
-        curr_pid = ppid;
     }
 
-    Err(AppError::NotRecipient(format!(
-        "peer PID {peer_pid} does not descend from an active agent session"
-    )))
+    use crate::process::WalkEnd;
+    Err(AppError::NotRecipient(match walk.end() {
+        Some(WalkEnd::Younger { parent, child }) => {
+            format!("peer PID {peer_pid}: parent {parent} of {child} is not older than it")
+        }
+        Some(WalkEnd::Unreadable(pid)) => format!(
+            "peer PID {peer_pid}: the start time of {pid} cannot be read, so its ancestry is unproven"
+        ),
+        Some(WalkEnd::Reused(pid)) => {
+            format!("peer PID {peer_pid}: PID {pid} was reused while its ancestry was walked")
+        }
+        Some(WalkEnd::Root) | None => {
+            format!("peer PID {peer_pid} does not descend from an active agent session")
+        }
+    }))
 }
 
 pub async fn run_agent_server(
@@ -509,29 +508,20 @@ pub async fn run_agent_server(
                             .await
                             .ok()
                             .and_then(|active_pairs| {
-                                let mut curr = peer_pid;
-                                for _ in 0..32 {
-                                    if let Some((claim, _)) =
-                                        active_pairs.iter().find(|(c, _)| c.pid == curr)
-                                    {
-                                        return Some(claim.address());
-                                    }
-                                    let ppid = process::parent_pid(
-                                        &state_clone.agy_config.proc_root,
-                                        curr,
-                                    )?;
-                                    if ppid <= 1
-                                        || !process::started_no_later(
-                                            &state_clone.agy_config.proc_root,
-                                            ppid,
-                                            curr,
-                                        )
-                                    {
-                                        break;
-                                    }
-                                    curr = ppid;
-                                }
-                                None
+                                let proc_root = &state_clone.agy_config.proc_root;
+                                process::Ancestry::new(proc_root, peer_pid)
+                                    .take(32)
+                                    .find_map(|(pid, st)| {
+                                        active_pairs.iter().find_map(|(c, _)| {
+                                            (c.pid == pid
+                                                && process::claude_start_token_matches(
+                                                    proc_root,
+                                                    &st,
+                                                    &c.proc_start,
+                                                ))
+                                            .then(|| c.address())
+                                        })
+                                    })
                             });
 
                             if let Some(address) = claude_res {

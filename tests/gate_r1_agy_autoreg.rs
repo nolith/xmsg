@@ -18,6 +18,8 @@ use xmsg::error::AppError;
 use xmsg::http::{build_router, AppState};
 use xmsg::storage;
 
+mod reused_stat;
+
 fn setup_mock_process(
     proc_root: &Path,
     pid: u32,
@@ -739,7 +741,8 @@ fn oracle_4_non_agy_ancestor_gets_no_identity_at_mcp_start() {
 }
 
 /// A15 ordering: the MCP-start walk to the agy ancestor steps to a parent only when that
-/// parent started no later than its child, and an unreadable start time ends it.
+/// parent started no later than its child, and an unreadable start time ends it. A link
+/// reused after the step that read it ends the walk too.
 #[test]
 fn attest_mcp_caller_refuses_parent_younger_than_child_or_unreadable_start() {
     let tmp = tempdir().unwrap();
@@ -801,6 +804,23 @@ fn attest_mcp_caller_refuses_parent_younger_than_child_or_unreadable_start() {
     assert!(
         matches!(attest(), Err(AppError::NotRecipient(_))),
         "an unreadable start must refuse: {:?}",
+        attest()
+    );
+
+    // Caller 6001 -> 6500: 6001's genuine parent (under init) when the step reads it, and a
+    // child of agy 6000 that started after 6001 when the walk reaches it.
+    setup_mock_process(&proc_root, 6001, 6500, None, None, "200");
+    reused_stat::reused_stat(
+        &proc_root,
+        6500,
+        vec![
+            reused_stat::stat_line(6500, 1, 150),
+            reused_stat::stat_line(6500, 6000, 250),
+        ],
+    );
+    assert!(
+        matches!(attest(), Err(AppError::NotRecipient(_))),
+        "a link reused after its step must refuse: {:?}",
         attest()
     );
 }

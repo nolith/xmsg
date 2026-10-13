@@ -1,4 +1,6 @@
 use std::fs;
+
+mod reused_stat;
 use tempfile::tempdir;
 use xmsg::registry::find_ancestor_session_in;
 
@@ -160,5 +162,40 @@ fn test_ancestor_walk_refuses_parent_younger_than_child() {
     assert!(
         refused.is_err(),
         "an unreadable start must end the walk: {refused:?}"
+    );
+}
+
+/// A15: a parent PID reused AFTER the step read its start time. The walk re-reads each link it
+/// reaches and requires the start it recorded, so it stops at 401 instead of continuing from
+/// the new process's parent, session 400.
+#[test]
+fn test_ancestor_walk_refuses_parent_reused_after_its_step() {
+    let temp = tempdir().expect("tempdir");
+    let proc_root = temp.path().join("proc");
+    let sessions_dir = temp.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    write_proc_stat(&proc_root, 400, 1, "400");
+    write_session_file(&sessions_dir, 400, "sess-400", "worker", "400");
+    write_proc_stat(&proc_root, 402, 401, "402");
+
+    // Control: had 401 been session 400's child all along, the walk reaches the session.
+    write_proc_stat(&proc_root, 401, 400, "401");
+    let found = find_ancestor_session_in(&proc_root, &sessions_dir, 402);
+    assert_eq!(found.expect("ordered chain").session_id, "sess-400");
+
+    // 401 is 402's genuine parent (under init) when the step reads it, and a child of
+    // session 400 that started after 402 when the walk reaches it.
+    reused_stat::reused_stat(
+        &proc_root,
+        401,
+        vec![
+            reused_stat::stat_line(401, 1, 401),
+            reused_stat::stat_line(401, 400, 450),
+        ],
+    );
+    let refused = find_ancestor_session_in(&proc_root, &sessions_dir, 402);
+    assert!(
+        refused.is_err(),
+        "a PID reused after its step must end the walk: {refused:?}"
     );
 }

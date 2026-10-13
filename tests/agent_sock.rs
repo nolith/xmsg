@@ -15,6 +15,8 @@ use xmsg::error::AppError;
 use xmsg::http::AppState;
 use xmsg::pi::new_pi_store;
 
+mod reused_stat;
+
 #[test]
 fn test_ensure_secure_socket_dir_permissions_and_ownership() {
     let tmp = tempdir().unwrap();
@@ -267,6 +269,21 @@ fn test_resolve_caller_session_ancestor_walk() {
 /// The A15 walk over a synthetic chain 3000 -> 2000 -> 1000 (a live Claude session), with
 /// 2000's start time `parent_start`; 1000 started at 100 and 3000 at 300.
 fn resolve_through_middle_link(parent_start: &str) -> Result<xmsg::registry::Session, AppError> {
+    resolve_with_middle_link(|proc_root| {
+        let dir = proc_root.join("2000");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("stat"),
+            format!("2000 (p) S 1000 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {parent_start} 0 0\n"),
+        )
+        .unwrap();
+    })
+}
+
+/// The chain of [`resolve_through_middle_link`] with 2000's stat written by `middle`.
+fn resolve_with_middle_link(
+    middle: impl FnOnce(&std::path::Path),
+) -> Result<xmsg::registry::Session, AppError> {
     let tmp = tempdir().unwrap();
     let proc_root = tmp.path().join("proc");
     let sessions_dir = tmp.path().join("sessions");
@@ -288,7 +305,7 @@ fn resolve_through_middle_link(parent_start: &str) -> Result<xmsg::registry::Ses
         .unwrap();
     };
     stat(1000, 1, "100");
-    stat(2000, 1000, parent_start);
+    middle(&proc_root);
     stat(3000, 2000, "300");
     let session = serde_json::json!({
         "pid": 1000, "sessionId": "sess-a", "cwd": "/", "status": "idle",
@@ -329,8 +346,29 @@ fn test_resolve_caller_session_rejects_parent_younger_than_child() {
 #[test]
 fn test_resolve_caller_session_fails_closed_on_unreadable_start() {
     match resolve_through_middle_link("unreadable") {
-        Err(AppError::NotRecipient(msg)) => assert!(msg.contains("not older"), "{msg}"),
+        Err(AppError::NotRecipient(msg)) => assert!(msg.contains("cannot be read"), "{msg}"),
         other => panic!("expected NotRecipient for an unreadable start time: {other:?}"),
+    }
+}
+
+/// A15: 2000 is reused AFTER the step read its start time: 3000's genuine parent (under init)
+/// when the step reads it, a child of session 1000 that started after 3000 when the walk
+/// reaches it. The walk requires the start it recorded, so the caller stays anonymous.
+#[test]
+fn test_resolve_caller_session_refuses_parent_reused_after_its_step() {
+    let reused = resolve_with_middle_link(|proc_root| {
+        reused_stat::reused_stat(
+            proc_root,
+            2000,
+            vec![
+                reused_stat::stat_line(2000, 1, 200),
+                reused_stat::stat_line(2000, 1000, 400),
+            ],
+        )
+    });
+    match reused {
+        Err(AppError::NotRecipient(msg)) => assert!(msg.contains("reused"), "{msg}"),
+        other => panic!("expected NotRecipient for a PID reused mid-walk: {other:?}"),
     }
 }
 

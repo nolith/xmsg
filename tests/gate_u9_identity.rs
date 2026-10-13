@@ -10,6 +10,8 @@ use xmsg::agy::{
 use xmsg::error::AppError;
 use xmsg::pi::verify_pi_process;
 
+mod reused_stat;
+
 fn setup_mock_process(
     proc_root: &Path,
     pid: u32,
@@ -515,6 +517,7 @@ fn test_live_macos_agy_probe() {
 
 /// A15 ordering: the walk to the agy ancestor steps to a parent only when that parent started
 /// no later than its child, and a link whose start time cannot be read ends it (fail closed).
+/// A link reused after the step that read it ends the walk too.
 #[test]
 fn cell_parent_younger_than_child_or_unreadable_start_is_refused() {
     let tmp = tempdir().unwrap();
@@ -584,6 +587,23 @@ fn cell_parent_younger_than_child_or_unreadable_start_is_refused() {
     assert!(
         matches!(verify(), Err(AppError::NotRecipient(_))),
         "an unreadable start must refuse: {:?}",
+        verify()
+    );
+
+    // Peer 3000 -> 2500: 3000's genuine parent (under init) when the step reads it, and a
+    // child of agy 2000 that started after 3000 when the walk reaches it.
+    setup_mock_process(&proc_root, 3000, 2500, None, None, "2000", None);
+    reused_stat::reused_stat(
+        &proc_root,
+        2500,
+        vec![
+            reused_stat::stat_line(2500, 1, 1500),
+            reused_stat::stat_line(2500, 2000, 2100),
+        ],
+    );
+    assert!(
+        matches!(verify(), Err(AppError::NotRecipient(_))),
+        "a link reused after its step must refuse: {:?}",
         verify()
     );
 }

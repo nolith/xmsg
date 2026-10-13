@@ -516,20 +516,13 @@ pub fn verify_registration(
         .collect();
 
     // 5. Ancestor walk from peer_pid to find an ancestor satisfying BOTH (a) and (b)
-    let mut curr_pid = peer_pid;
     let mut chosen_ancestor = None;
 
-    for _ in 0..32 {
+    // `st1` is the start the walk read; the step 7 re-read must still equal it.
+    for (curr_pid, st1) in crate::process::Ancestry::new(proc_root, peer_pid).take(32) {
         if curr_pid <= 1 {
             break;
         }
-
-        // Read starttime first at top of iteration before checks
-        let st1 = match crate::process::starttime(proc_root, curr_pid) {
-            Ok(st) => st,
-            // Unreadable, so no link above it can be shown to be the caller's (fail closed).
-            Err(_) => break,
-        };
 
         // (a) EXECUTABLE check: kernel-reported executable path matches a trusted exe
         let exe_matches = match crate::process::exe_path(proc_root, curr_pid) {
@@ -552,14 +545,6 @@ pub fn verify_registration(
                 break;
             }
         }
-
-        let Some(ppid) = crate::process::parent_pid(proc_root, curr_pid) else {
-            break;
-        };
-        if !crate::process::started_no_later(proc_root, ppid, curr_pid) {
-            break;
-        }
-        curr_pid = ppid;
     }
 
     let (chosen_pid, initial_starttime) = match chosen_ancestor {
@@ -670,19 +655,13 @@ pub fn attest_mcp_caller(
     }
 
     // 5. Ancestor walk from peer_pid to find an ancestor satisfying BOTH (a) and (b)
-    let mut curr_pid = peer_pid;
     let mut chosen = None;
 
-    for _ in 0..32 {
+    // `st1` is the start the walk read; the final re-read must still equal it.
+    for (curr_pid, st1) in crate::process::Ancestry::new(proc_root, peer_pid).take(32) {
         if curr_pid <= 1 {
             break;
         }
-
-        let st1 = match crate::process::starttime(proc_root, curr_pid) {
-            Ok(st) => st,
-            // Unreadable, so no link above it can be shown to be the caller's (fail closed).
-            Err(_) => break,
-        };
 
         // (a) EXECUTABLE check: kernel-reported executable path matches a trusted exe
         let exe_matches = match crate::process::exe_path(proc_root, curr_pid) {
@@ -719,14 +698,6 @@ pub fn attest_mcp_caller(
                 break;
             }
         }
-
-        let Some(ppid) = crate::process::parent_pid(proc_root, curr_pid) else {
-            break;
-        };
-        if !crate::process::started_no_later(proc_root, ppid, curr_pid) {
-            break;
-        }
-        curr_pid = ppid;
     }
 
     let (chosen_pid, initial_starttime, conv_id) = match chosen {
