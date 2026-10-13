@@ -200,6 +200,7 @@ const MESSAGE_STATE_TABLES: &[&str] = &[
     "forwarded_messages",
     "instance_queue",
     "location_cache",
+    "handoff_owed",
 ];
 
 const SCHEMA_N: &str = r#"
@@ -337,6 +338,14 @@ const SCHEMA_N: &str = r#"
             delivered_at INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_instance_queue_instance ON instance_queue(instance_id, delivered_at);
+
+        CREATE TABLE IF NOT EXISTS handoff_owed (
+            id TEXT NOT NULL,
+            holder TEXT NOT NULL,
+            acks TEXT NOT NULL DEFAULT '[]',
+            until INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (id, holder)
+        );
 
         CREATE TABLE IF NOT EXISTS location_cache (
             id TEXT PRIMARY KEY,
@@ -1145,19 +1154,121 @@ pub fn insert_handed_over(conn: &Connection, msg: &QueuedMessage) -> Result<bool
     Ok(n == 1)
 }
 
-/// Drops what a hand-off acknowledged (D-1): the messages `ids` queued for `instance_id`,
-/// and then, unless a message for it arrived since the transfer, this node's parked
-/// listing of it.
-pub fn drop_handed_over(conn: &Connection, instance_id: &str, ids: &[String]) -> Result<()> {
+/// Drops what a hand-off to `peer` acknowledged (D-1): the messages `ids` queued for
+/// `instance_id`, and then, unless a message for it arrived since the transfer, this node's
+/// parked listing of it. Each dropped message is recorded as forwarded to `peer`, as a hub
+/// records a forward (X26), so its recipient's reply there is authorized and travels on to
+/// its origin: a reply travels by message ID (A8a). Returns how many unexpired messages
+/// for `instance_id` are still held here at `now`.
+pub fn drop_handed_over(
+    conn: &Connection,
+    instance_id: &str,
+    ids: &[String],
+    peer: &str,
+    now: i64,
+) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
     for id in ids {
-        conn.execute(
+        let dropped = tx.execute(
             "DELETE FROM instance_queue WHERE id = ?1 AND instance_id = ?2",
             params![id, instance_id],
         )?;
+        if dropped == 0 {
+            continue;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO outbound (id, peer, target_ref, outcome, created_at, resolved) VALUES (?1, ?2, ?3, 'queued', ?4, 1)",
+            params![id, peer, instance_id, now],
+        )?;
+        // A remote sender's reply goes on to its node; a local one's is pushed here.
+        if let Some(origin) = get_message(&tx, id)?
+            .and_then(|m| m.return_host)
+            .filter(|h| !h.is_empty())
+        {
+            insert_forwarded_message(&tx, id, &origin, now)?;
+        }
     }
-    conn.execute(
+    tx.execute(
         "DELETE FROM instance_seen WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM instance_queue WHERE instance_id = ?1 AND delivered_at IS NULL)",
         params![instance_id],
+    )?;
+    let remaining = queued_for(&tx, instance_id, now)?.len();
+    tx.commit()?;
+    Ok(remaining)
+}
+
+/// A hand-off this node owes or is owed (D-1): it has asked `holder` for `id`'s queue and
+/// not yet settled, and holds `acks`, handed over and not yet acknowledged, until `until`,
+/// their latest expiry (after which the holder hands them to nobody).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwedHandoff {
+    pub id: String,
+    pub holder: String,
+    pub acks: Vec<String>,
+    pub until: i64,
+}
+
+pub fn owe_handoff(conn: &Connection, id: &str, holder: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO handoff_owed (id, holder) VALUES (?1, ?2)",
+        params![id, holder],
+    )?;
+    Ok(())
+}
+
+pub fn get_owed_handoff(conn: &Connection, id: &str, holder: &str) -> Result<Option<OwedHandoff>> {
+    Ok(owed_handoffs(conn)?
+        .into_iter()
+        .find(|o| o.id == id && o.holder == holder))
+}
+
+pub fn owed_handoffs(conn: &Connection) -> Result<Vec<OwedHandoff>> {
+    let mut stmt =
+        conn.prepare("SELECT id, holder, acks, until FROM handoff_owed ORDER BY id, holder")?;
+    let rows = stmt
+        .query_map([], |r| {
+            let acks: String = r.get(2)?;
+            Ok(OwedHandoff {
+                id: r.get(0)?,
+                holder: r.get(1)?,
+                acks: serde_json::from_str(&acks).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                until: r.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Records the acknowledgement owed to `holder` for `acks` (empty once it landed).
+pub fn set_owed_acks(
+    conn: &Connection,
+    id: &str,
+    holder: &str,
+    acks: &[String],
+    until: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE handoff_owed SET acks = ?3, until = ?4 WHERE id = ?1 AND holder = ?2",
+        params![
+            id,
+            holder,
+            serde_json::Value::from(acks.to_vec()).to_string(),
+            until
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn settle_handoff(conn: &Connection, id: &str, holder: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM handoff_owed WHERE id = ?1 AND holder = ?2",
+        params![id, holder],
     )?;
     Ok(())
 }

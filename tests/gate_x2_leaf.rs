@@ -208,7 +208,7 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
         key_der: node_b_key.clone(),
         rate_limiter: Arc::new(RateLimiter::new(60, 20)),
         db: node_b_db.clone(),
-        sessions_dir: sess_dir.clone(),
+        sessions_dirs: vec![sess_dir.clone()],
         agy_config: AgyConfig {
             presence_dir: tmp.path().join("presence"),
             proc_locks_path: tmp.path().join("proc_locks"),
@@ -304,7 +304,7 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
         key_der: leaf_key,
         rate_limiter: Arc::new(RateLimiter::new(60, 20)),
         db: leaf_db.clone(),
-        sessions_dir: sess_dir.clone(),
+        sessions_dirs: vec![sess_dir.clone()],
         agy_config: AgyConfig {
             presence_dir: tmp.path().join("leaf_presence"),
             proc_locks_path: tmp.path().join("leaf_proc_locks"),
@@ -463,7 +463,7 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
         key_der: node_b_key,
         rate_limiter: Arc::new(RateLimiter::new(60, 20)),
         db: node_b_db.clone(),
-        sessions_dir: sess_dir.clone(),
+        sessions_dirs: vec![sess_dir.clone()],
         agy_config: AgyConfig {
             presence_dir: tmp.path().join("presence"),
             proc_locks_path: tmp.path().join("proc_locks"),
@@ -599,7 +599,7 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
         key_der: leaf_key,
         rate_limiter: Arc::new(RateLimiter::new(60, 20)),
         db: leaf_db.clone(),
-        sessions_dir: sess_dir.clone(),
+        sessions_dirs: vec![sess_dir.clone()],
         agy_config: AgyConfig {
             presence_dir: tmp.path().join("leaf_presence"),
             proc_locks_path: tmp.path().join("leaf_proc_locks"),

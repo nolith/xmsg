@@ -151,7 +151,7 @@ async fn create_fed_test_node(
         key_der,
         rate_limiter,
         db: db.clone(),
-        sessions_dir: sessions_dir.clone(),
+        sessions_dirs: vec![sessions_dir.clone()],
         agy_config: agy_config.clone(),
         agy_store: agy_store.clone(),
         pi_store: pi_store.clone(),

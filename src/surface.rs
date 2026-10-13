@@ -51,7 +51,7 @@ impl crate::fed::FedState {
     pub fn local(&self) -> Local<'_> {
         Local {
             db: &self.db,
-            sessions_dirs: std::slice::from_ref(&self.sessions_dir),
+            sessions_dirs: &self.sessions_dirs,
             node_name: &self.node_name,
             agy_config: &self.agy_config,
             agy_store: &self.agy_store,

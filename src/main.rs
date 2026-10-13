@@ -706,7 +706,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             key_der: key_der.clone(),
             rate_limiter: Arc::new(xmsg::fed::RateLimiter::new(60, 20)),
             db: db.clone(),
-            sessions_dir: sessions_dirs.first().cloned().unwrap_or_default(),
+            sessions_dirs: sessions_dirs.clone(),
             agy_config: agy_config.clone(),
             agy_store: agy_store.clone(),
             pi_store: pi_store.clone(),

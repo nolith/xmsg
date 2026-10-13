@@ -131,7 +131,7 @@ async fn create_test_node(
         key_der,
         rate_limiter: Arc::new(RateLimiter::new(60, 20)),
         db,
-        sessions_dir: sessions_dir.clone(),
+        sessions_dirs: vec![sessions_dir.clone()],
         agy_config,
         agy_store,
         pi_store,

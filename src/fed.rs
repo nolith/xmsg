@@ -1834,7 +1834,9 @@ pub struct FedState {
     pub key_der: Vec<u8>,
     pub rate_limiter: Arc<RateLimiter>,
     pub db: Arc<Mutex<rusqlite::Connection>>,
-    pub sessions_dir: PathBuf,
+    /// Every sessions dir this node scans: a fed-side scan that saw fewer would release
+    /// the claims held in the others.
+    pub sessions_dirs: Vec<PathBuf>,
     pub agy_config: crate::agy::AgyConfig,
     pub agy_store: crate::agy::AgyStore,
     pub pi_store: crate::pi::PiStore,
@@ -3034,7 +3036,7 @@ async fn resolve_target_session_fed(
     ref_str: &str,
 ) -> Result<crate::http::ResolvedTarget, AppError> {
     crate::http::resolve_target(
-        std::slice::from_ref(&fed_state.sessions_dir),
+        &fed_state.sessions_dirs,
         &fed_state.agy_config,
         &fed_state.agy_store,
         &fed_state.pi_store,

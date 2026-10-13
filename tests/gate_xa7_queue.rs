@@ -11,7 +11,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,10 +25,19 @@ use xmsg::fed::{make_tls_connector, normalize_pin, spki_sha256_from_der, PeerCon
 
 mod hop_client;
 use hop_client::Origin;
+mod http_child;
+use http_child::{FakeParent, Via};
 
 const BIN: &str = env!("CARGO_BIN_EXE_xmsg");
+const CHILD: &str = "http_child_entry";
 const X: &str = "0a7a7a7a-0000-4000-8000-00000000000a";
 const ALL: &[&str] = &["send", "reply", "list"];
+
+/// The HTTP child of a talking Claude fake (A15's walk finds the fake as its caller).
+#[test]
+fn http_child_entry() {
+    http_child::serve_if_child();
+}
 
 fn uri(node: &str) -> String {
     let (user, host) = node.split_once('.').unwrap();
@@ -138,6 +147,17 @@ impl Drop for Node {
 
 /// Starts `xmsg serve` as `name` with `creds` and `peers`, HOME in its tempdir (§1a).
 async fn start(name: &str, p: Prepared, creds: &Creds, peers: Value) -> Node {
+    start_with(name, p, creds, peers, &[]).await
+}
+
+/// `start`, with `extra` serve arguments.
+async fn start_with(
+    name: &str,
+    p: Prepared,
+    creds: &Creds,
+    peers: Value,
+    extra: &[String],
+) -> Node {
     let Prepared {
         tmp,
         fed_port,
@@ -180,7 +200,10 @@ async fn start(name: &str, p: Prepared, creds: &Creds, peers: Value) -> Node {
         s(&run_dir.join("agent.sock")),
         "--http-sock".into(),
         s(&run_dir.join("http.sock")),
-    ];
+    ]
+    .into_iter()
+    .chain(extra.iter().cloned())
+    .collect();
     let mut node = Node {
         name: name.to_string(),
         tmp,
@@ -318,6 +341,11 @@ struct Mesh {
 }
 
 async fn mesh(names: &[&str], dead: &[&str]) -> Mesh {
+    mesh_with(names, dead, &[]).await
+}
+
+/// `mesh`, with extra serve arguments for some nodes.
+async fn mesh_with(names: &[&str], dead: &[&str], extra: &[(&str, Vec<String>)]) -> Mesh {
     let ca = Ca::new();
     let creds: HashMap<String, Creds> =
         names.iter().map(|n| (n.to_string(), ca.issue(n))).collect();
@@ -334,7 +362,11 @@ async fn mesh(names: &[&str], dead: &[&str]) -> Mesh {
         for other in names.iter().chain(dead).filter(|o| **o != me) {
             peers.insert(other.to_string(), entry(fed_ports[*other], &ca_file, other));
         }
-        let node = start(me, p, &creds[me], Value::Object(peers)).await;
+        let args = extra
+            .iter()
+            .find(|(n, _)| *n == me)
+            .map_or(&[][..], |(_, a)| a.as_slice());
+        let node = start_with(me, p, &creds[me], Value::Object(peers), args).await;
         nodes.insert(me.to_string(), node);
     }
     Mesh {
@@ -379,15 +411,26 @@ impl Drop for Sleeper {
     }
 }
 
+/// The process behind a Claude fake: a sleeper, or one whose children make HTTP requests.
+enum Proc {
+    Sleep(Sleeper),
+    Talk(FakeParent),
+}
+
 /// A Claude fake presenting `id` on a node, behind a live process, with an inbox.
 struct Claude {
     file: PathBuf,
-    _proc: Sleeper,
+    proc: Proc,
     lines: Arc<Mutex<Vec<String>>>,
     _dir: TempDir,
 }
 
 fn claude(node: &Node, id: &str) -> Claude {
+    claude_in(&node.sessions_dir, id, false)
+}
+
+/// A Claude fake in sessions dir `sessions`; one that `talks` makes HTTP requests.
+fn claude_in(sessions: &Path, id: &str, talks: bool) -> Claude {
     let dir = tempdir().unwrap();
     let sock = dir.path().join("inbox.sock");
     let listener = UnixListener::bind(&sock).unwrap();
@@ -400,25 +443,32 @@ fn claude(node: &Node, id: &str) -> Claude {
             rx.lock().unwrap().push(buf);
         }
     });
-    let proc = Sleeper(
-        Command::new("sleep")
-            .arg("600")
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("spawn sleep"),
-    );
-    let pid = proc.0.id();
+    let proc = if talks {
+        Proc::Talk(FakeParent::spawn(CHILD))
+    } else {
+        Proc::Sleep(Sleeper(
+            Command::new("sleep")
+                .arg("600")
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn sleep"),
+        ))
+    };
+    let pid = match &proc {
+        Proc::Sleep(s) => s.0.id(),
+        Proc::Talk(f) => f.pid(),
+    };
     let start = xmsg::process::starttime(Path::new(xmsg::process::LIVE_PROC_ROOT), pid).unwrap();
     let session = json!({
         "pid": pid, "sessionId": id, "name": "x", "cwd": "/w", "status": "idle",
         "kind": "interactive", "startedAt": 1, "updatedAt": 2, "procStart": start,
         "messagingSocketPath": sock.display().to_string(),
     });
-    let file = node.sessions_dir.join(format!("{pid}-{id}.json"));
+    let file = sessions.join(format!("{pid}-{id}.json"));
     fs::write(&file, session.to_string()).unwrap();
     Claude {
         file,
-        _proc: proc,
+        proc,
         lines,
         _dir: dir,
     }
@@ -445,6 +495,24 @@ impl Claude {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         false
+    }
+    /// A request to `node`'s `http.sock` from this fake's child: (status, body).
+    async fn req(&self, node: &Node, method: &str, path: &str, body: Value) -> (u16, Value) {
+        let Proc::Talk(fp) = &self.proc else {
+            panic!("this Claude fake does not talk");
+        };
+        let (st, body) = fp
+            .request(
+                &Via::Unix(node.run_dir.join("http.sock")),
+                method,
+                path,
+                Some(&body),
+            )
+            .await;
+        (
+            st,
+            serde_json::from_str(&body).unwrap_or(Value::String(body)),
+        )
     }
 }
 
@@ -500,6 +568,11 @@ async fn drained(node: &Node) -> bool {
 struct Fault {
     path: &'static str,
     forward: bool,
+    /// While set, every request on `path` is answered 502 and never reaches the holder.
+    drop: Option<Arc<AtomicBool>>,
+    /// The first request on `path` waits for `crashed`'s resume, then is forwarded and
+    /// answered as the holder answers.
+    hold_before: bool,
     crashed: Option<(
         tokio::sync::mpsc::UnboundedSender<()>,
         Arc<tokio::sync::Notify>,
@@ -555,23 +628,39 @@ async fn proxy(
                             let (method, path) =
                                 (req.method().to_string(), req.uri().path().to_string());
                             let body = req.into_body().collect().await.unwrap().to_bytes();
-                            let first =
-                                path == fault.path && seen.fetch_add(1, Ordering::SeqCst) == 0;
-                            let answer = if first && !fault.forward {
+                            let on_path = path == fault.path;
+                            let first = on_path && seen.fetch_add(1, Ordering::SeqCst) == 0;
+                            let dropped = on_path
+                                && fault
+                                    .drop
+                                    .as_ref()
+                                    .is_some_and(|d| d.load(Ordering::SeqCst));
+                            let answer = if dropped {
                                 None
-                            } else {
+                            } else if first && fault.hold_before {
+                                if let Some((tx, resume)) = &fault.crashed {
+                                    tx.send(()).unwrap();
+                                    resume.notified().await;
+                                }
                                 forward(&asker, &holder_pin, holder_port, &method, &path, &body)
                                     .await
-                            };
-                            let answer = match (first, answer) {
-                                (true, _) => {
-                                    if let Some((tx, resume)) = &fault.crashed {
-                                        tx.send(()).unwrap();
-                                        resume.notified().await;
-                                    }
+                            } else {
+                                let answer = if first && !fault.forward {
                                     None
+                                } else {
+                                    forward(&asker, &holder_pin, holder_port, &method, &path, &body)
+                                        .await
+                                };
+                                match (first, answer) {
+                                    (true, _) => {
+                                        if let Some((tx, resume)) = &fault.crashed {
+                                            tx.send(()).unwrap();
+                                            resume.notified().await;
+                                        }
+                                        None
+                                    }
+                                    (false, a) => a,
                                 }
-                                (false, a) => a,
                             };
                             let (status, bytes) =
                                 answer.unwrap_or((502, bytes::Bytes::from_static(b"{}")));
@@ -703,6 +792,8 @@ async fn test_oracle_3_a_lost_acknowledgement_delivers_once() {
         let m = mesh_with_proxy(Fault {
             path: "/fed/v2/handoff/ack",
             forward: false,
+            drop: None,
+            hold_before: false,
             crashed: None,
         })
         .await;
@@ -734,25 +825,48 @@ struct Proxied {
 
 /// P and Q of user sini, with Q's entry for P routed through a fault proxy.
 async fn mesh_with_proxy(fault: Fault) -> Proxied {
+    mesh_with_proxy_and(&[], fault).await
+}
+
+/// P, Q and `others`, fully peered, with only Q's entry for P routed through a fault proxy.
+async fn mesh_with_proxy_and(others: &[&str], fault: Fault) -> Proxied {
     let ca = Ca::new();
-    let (cp, cq) = (ca.issue("sini.p"), ca.issue("sini.q"));
-    let (pp, pq) = (prepare(&ca), prepare(&ca));
+    let names: Vec<&str> = ["sini.p", "sini.q"].iter().chain(others).copied().collect();
+    let creds: HashMap<String, Creds> =
+        names.iter().map(|n| (n.to_string(), ca.issue(n))).collect();
+    let preps: Vec<(&str, Prepared)> = names.iter().map(|n| (*n, prepare(&ca))).collect();
+    let fed_ports: HashMap<String, u16> = preps
+        .iter()
+        .map(|(n, p)| (n.to_string(), p.fed_port))
+        .collect();
     // Q reaches P through the proxy, whose port is fixed before Q starts.
-    let (proxy_port, seen) = proxy(&cq, &cp, pp.fed_port, fault).await;
-    let peers_p = json!({ "sini.q": entry(pq.fed_port, &pp.tmp.path().join("ca.pem"), "sini.q") });
-    let peers_q = json!({ "sini.p": entry(proxy_port, &pq.tmp.path().join("ca.pem"), "sini.p") });
-    let p_fed = pp.fed_port;
-    let q_fed = pq.fed_port;
-    let p = start("sini.p", pp, &cp, peers_p).await;
-    let q = start("sini.q", pq, &cq, peers_q).await;
+    let (proxy_port, seen) = proxy(
+        &creds["sini.q"],
+        &creds["sini.p"],
+        fed_ports["sini.p"],
+        fault,
+    )
+    .await;
+    let mut nodes = HashMap::new();
+    for (me, p) in preps {
+        let ca_file = p.tmp.path().join("ca.pem");
+        let mut peers = serde_json::Map::new();
+        for other in names.iter().filter(|o| **o != me) {
+            let port = if (me, *other) == ("sini.q", "sini.p") {
+                proxy_port
+            } else {
+                fed_ports[*other]
+            };
+            peers.insert(other.to_string(), entry(port, &ca_file, other));
+        }
+        let node = start(me, p, &creds[me], Value::Object(peers)).await;
+        nodes.insert(me.to_string(), node);
+    }
     Proxied {
         mesh: Mesh {
-            creds: HashMap::from([("sini.p".to_string(), cp), ("sini.q".to_string(), cq)]),
-            nodes: HashMap::from([("sini.p".to_string(), p), ("sini.q".to_string(), q)]),
-            fed_ports: HashMap::from([
-                ("sini.p".to_string(), p_fed),
-                ("sini.q".to_string(), q_fed),
-            ]),
+            creds,
+            nodes,
+            fed_ports,
         },
         seen,
     }
@@ -849,6 +963,8 @@ async fn test_oracle_6_a_crash_loses_nothing() {
         let mut m = mesh_with_proxy(Fault {
             path: "/fed/v2/handoff",
             forward: true,
+            drop: None,
+            hold_before: false,
             crashed: Some((crashed_tx, resume.clone())),
         })
         .await;
@@ -864,7 +980,10 @@ async fn test_oracle_6_a_crash_loses_nothing() {
             Some("live")
         );
 
-        crashed.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), crashed.recv())
+            .await
+            .expect("no transfer was asked for within 30s")
+            .unwrap();
         let p = m.mesh.nodes.get_mut("sini.p").unwrap();
         p.crash().await;
         resume.notify_one();
@@ -928,6 +1047,343 @@ async fn test_oracle_8_pull_all() {
             "Q's queue not delivered on R"
         );
         assert!(drained(p).await && drained(q).await);
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 9 (C1; A8a: "Replies are unaffected: they travel by message ID"). X is parked on
+// P, and two senders queue a message for it there: one on O (another node of the user)
+// and one on P itself. X registers on Q, receives both, and replies to each: both replies
+// are accepted and reach their senders, through P.
+// Mutant: P records no forward at the acknowledgement => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_9_a_handed_over_message_keeps_its_reply() {
+    run_with_port_retry(|| async {
+        const AT_O: &str = "5e5e5e5e-0000-4000-8000-00000000005e";
+        const AT_P: &str = "5f5f5f5f-0000-4000-8000-00000000005f";
+        let m = mesh(&["sini.o", "sini.p", "sini.q"], &[]).await;
+        let (o, p, q) = (m.node("sini.o"), m.node("sini.p"), m.node("sini.q"));
+        park(p, X).await;
+        let (from_o, from_p) = (
+            claude_in(&o.sessions_dir, AT_O, true),
+            claude_in(&p.sessions_dir, AT_P, true),
+        );
+        assert_eq!(o.status_of(AT_O).await.as_deref(), Some("live"));
+        assert_eq!(p.status_of(AT_P).await.as_deref(), Some("live"));
+        let mut ids = Vec::new();
+        for (who, node, text) in [(&from_o, o, "asked-from-o"), (&from_p, p, "asked-from-p")] {
+            let (st, body) = who
+                .req(
+                    node,
+                    "POST",
+                    "/v1/messages",
+                    json!({ "to": X, "text": text }),
+                )
+                .await;
+            assert_eq!(st, 202, "{body}");
+            assert_eq!(body["outcome"], "queued", "{body}");
+            ids.push(body["message_id"].as_str().unwrap().to_string());
+        }
+
+        let x = claude_in(&q.sessions_dir, X, true);
+        assert_eq!(q.status_of(X).await.as_deref(), Some("live"));
+        assert!(x.got("asked-from-o").await, "not delivered on Q");
+        assert!(x.got("asked-from-p").await, "not delivered on Q");
+        assert!(drained(p).await, "P still holds the queue");
+        for (mid, answer) in ids.iter().zip(["answer-to-o", "answer-to-p"]) {
+            let (st, body) = x
+                .req(
+                    q,
+                    "POST",
+                    &format!("/v1/messages/{mid}/replies"),
+                    json!({ "text": answer }),
+                )
+                .await;
+            assert_eq!(st, 200, "the reply to {mid} was refused on Q: {body}");
+        }
+        assert!(
+            from_o.got("answer-to-o").await,
+            "the reply never reached O's sender"
+        );
+        assert!(
+            from_p.got("answer-to-p").await,
+            "the reply never reached P's sender"
+        );
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 10 (C2; D-1: "a transfer repeated after a lost acknowledgement delivers nothing
+// twice"). Q's acknowledgements to P are lost; X leaves Q, Q restarts, and only then do
+// acknowledgements land again. Q acknowledges what it owed from its database, so when X
+// moves on to R, P hands R nothing: the message is delivered once overall.
+// Mutant: the owed acknowledgement is not resumed at start => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_10_an_owed_acknowledgement_survives_a_restart() {
+    run_with_port_retry(|| async {
+        let dropping = Arc::new(AtomicBool::new(true));
+        let mut m = mesh_with_proxy_and(
+            &["sini.r"],
+            Fault {
+                path: "/fed/v2/handoff/ack",
+                forward: true,
+                drop: Some(dropping.clone()),
+                hold_before: false,
+                crashed: None,
+            },
+        )
+        .await;
+        let q_fed = m.mesh.fed_ports["sini.q"];
+        {
+            let (p, q) = (m.mesh.node("sini.p"), m.mesh.node("sini.q"));
+            park(p, X).await;
+            queue_at(p, "once overall").await;
+            let on_q = claude(q, X);
+            assert_eq!(q.status_of(X).await.as_deref(), Some("live"));
+            assert!(on_q.got("once overall").await, "not delivered on Q");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(on_q.count("once overall"), 1, "delivered twice on Q");
+            for _ in 0..200 {
+                if m.seen.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(m.seen.load(Ordering::SeqCst) > 0, "Q never acknowledged");
+            assert_eq!(p.queued(X).len(), 1, "an acknowledgement landed");
+            on_q.exit();
+            assert_eq!(q.status_of(X).await.as_deref(), Some("parked"));
+        }
+        let q = m.mesh.nodes.get_mut("sini.q").unwrap();
+        q.crash().await;
+        dropping.store(false, Ordering::SeqCst);
+        q.spawn(q_fed).await;
+        assert!(
+            drained(m.mesh.node("sini.p")).await,
+            "the owed acknowledgement was not resumed after the restart"
+        );
+
+        let r = m.mesh.node("sini.r");
+        let on_r = claude(r, X);
+        assert_eq!(r.status_of(X).await.as_deref(), Some("live"));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(on_r.count("once overall"), 0, "delivered again on R");
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 11 (C2: the asker's pull resumes after a restart). Q cannot reach P's hand-off
+// while X goes live on Q, and Q restarts before it can; X is still live there, so no scan
+// newly observes it. Q resumes the ask it recorded, and the queue is delivered on Q.
+// Mutant: the recorded ask is not resumed at start => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_11_a_pull_resumes_after_a_restart() {
+    run_with_port_retry(|| async {
+        let dropping = Arc::new(AtomicBool::new(true));
+        let mut m = mesh_with_proxy(Fault {
+            path: "/fed/v2/handoff",
+            forward: true,
+            drop: Some(dropping.clone()),
+            hold_before: false,
+            crashed: None,
+        })
+        .await;
+        let q_fed = m.mesh.fed_ports["sini.q"];
+        {
+            let p = m.mesh.node("sini.p");
+            park(p, X).await;
+            queue_at(p, "after the restart").await;
+        }
+        let on_q = claude(m.mesh.node("sini.q"), X);
+        assert_eq!(
+            m.mesh.node("sini.q").status_of(X).await.as_deref(),
+            Some("live")
+        );
+        for _ in 0..200 {
+            if m.seen.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(m.seen.load(Ordering::SeqCst) > 0, "Q never asked P");
+        let q = m.mesh.nodes.get_mut("sini.q").unwrap();
+        q.crash().await;
+        dropping.store(false, Ordering::SeqCst);
+        q.spawn(q_fed).await;
+        assert!(
+            on_q.got("after the restart").await,
+            "the ask was not resumed after the restart"
+        );
+        assert!(drained(m.mesh.node("sini.p")).await, "never acknowledged");
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 12 (C3). A send reaches P between its transfer and Q's acknowledgement. The
+// acknowledgement's answer counts it, Q asks again, and it is delivered on Q.
+// Mutant: the asker ignores the count => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_12_a_send_in_the_window_follows() {
+    run_with_port_retry(|| async {
+        let (tx, mut held) = tokio::sync::mpsc::unbounded_channel();
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let m = mesh_with_proxy(Fault {
+            path: "/fed/v2/handoff/ack",
+            forward: true,
+            drop: None,
+            hold_before: true,
+            crashed: Some((tx, resume.clone())),
+        })
+        .await;
+        let (p, q) = (m.mesh.node("sini.p"), m.mesh.node("sini.q"));
+        park(p, X).await;
+        queue_at(p, "before the transfer").await;
+        let on_q = claude(q, X);
+        assert_eq!(q.status_of(X).await.as_deref(), Some("live"));
+        tokio::time::timeout(Duration::from_secs(30), held.recv())
+            .await
+            .expect("Q never acknowledged within 30s")
+            .unwrap();
+        let (status, body) = http_send(p, &format!("{X}@sini.p"), "in the window").await;
+        assert_eq!(
+            (status, body["outcome"].as_str()),
+            (202, Some("queued")),
+            "{body}"
+        );
+        resume.notify_one();
+        assert!(on_q.got("before the transfer").await, "not delivered on Q");
+        assert!(
+            on_q.got("in the window").await,
+            "the send in the window is stranded at P"
+        );
+        assert!(drained(p).await, "P still holds a message");
+        assert_eq!(p.status_of(X).await, None, "P still lists X");
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 13 (C4). P holds more for X than one transfer may carry (80 messages of about
+// 1 KB, with `--max-body 1024`). P pages the transfer and Q asks again while P holds
+// more, so all 80 are delivered on Q and P holds none.
+// Mutant: one page holds the whole queue => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_13_a_queue_over_one_transfer_moves_whole() {
+    run_with_port_retry(|| async {
+        const N: usize = 80;
+        let small = vec!["--max-body".to_string(), "1024".to_string()];
+        let m = mesh_with(
+            &["sini.p", "sini.q"],
+            &[],
+            &[("sini.p", small.clone()), ("sini.q", small)],
+        )
+        .await;
+        let (p, q) = (m.node("sini.p"), m.node("sini.q"));
+        park(p, X).await;
+        let pad = "z".repeat(900);
+        for i in 0..N {
+            queue_at(p, &format!("big-{i:03}-{pad}")).await;
+        }
+        let on_q = claude(q, X);
+        assert_eq!(q.status_of(X).await.as_deref(), Some("live"));
+        for _ in 0..400 {
+            if on_q.count("big-") == N {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(on_q.count("big-"), N, "the queue did not move whole");
+        assert!(drained(p).await, "P still holds part of the queue");
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 14 (C5). P scans two sessions dirs, and Y is live in the second. A hand-off ask
+// at P (for an X it does not hold) leaves Y's claim unreleased, as it leaves Y2's in the
+// first dir.
+// Mutant: the fed side scans the first sessions dir only => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_14_a_handoff_ask_keeps_every_dirs_claims() {
+    run_with_port_retry(|| async {
+        const Y: &str = "0b0b0b0b-0000-4000-8000-00000000000b";
+        const Y2: &str = "0c0c0c0c-0000-4000-8000-00000000000c";
+        let d2 = tempdir().unwrap();
+        fs::set_permissions(d2.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let second = vec![
+            "--sessions-dir".to_string(),
+            d2.path().display().to_string(),
+        ];
+        let m = mesh_with(&["sini.p", "sini.q"], &[], &[("sini.p", second)]).await;
+        let p = m.node("sini.p");
+        let (_y, _y2) = (claude_in(d2.path(), Y, false), claude(p, Y2));
+        assert_eq!(p.status_of(Y).await.as_deref(), Some("live"));
+        assert_eq!(p.status_of(Y2).await.as_deref(), Some("live"));
+        let released = |id: &str| -> Vec<i64> {
+            let db = p.db();
+            let mut s = db
+                .prepare("SELECT released FROM instance_claims WHERE id = ?1")
+                .unwrap();
+            s.query_map([id], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let c = &m.creds["sini.q"];
+        let (status, res) = hop_client::request(
+            &Origin {
+                cert_der: &c.cert_der,
+                key_der: &c.key_der,
+            },
+            &m.creds["sini.p"].pin,
+            m.fed_ports["sini.p"],
+            "POST",
+            "/fed/v2/handoff",
+            Some(json!({ "id": X })),
+        )
+        .await;
+        assert_eq!(status, 404, "{res}");
+        assert_eq!(released(Y2), vec![0], "the first dir's claim was released");
+        assert_eq!(released(Y), vec![0], "the second dir's claim was released");
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 15 (C5). Q scans two sessions dirs, and X registers in the second. P's view of Q
+// lists X live, so P hands its queue over and it is delivered on Q.
+// Mutant: the fed side scans the first sessions dir only => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_15_the_queue_follows_into_a_second_sessions_dir() {
+    run_with_port_retry(|| async {
+        let d2 = tempdir().unwrap();
+        fs::set_permissions(d2.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let second = vec![
+            "--sessions-dir".to_string(),
+            d2.path().display().to_string(),
+        ];
+        let m = mesh_with(&["sini.p", "sini.q"], &[], &[("sini.q", second)]).await;
+        let (p, q) = (m.node("sini.p"), m.node("sini.q"));
+        park(p, X).await;
+        queue_at(p, "into dir two").await;
+        let x = claude_in(d2.path(), X, false);
+        assert_eq!(q.status_of(X).await.as_deref(), Some("live"));
+        assert!(
+            x.got("into dir two").await,
+            "not delivered in Q's second dir"
+        );
+        assert!(drained(p).await, "P still holds the queue");
     })
     .await;
 }
