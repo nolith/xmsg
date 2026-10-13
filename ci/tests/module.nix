@@ -84,6 +84,24 @@ let
 
   failedAssertions = cfg: map (a: a.message) (lib.filter (a: !a.assertion) cfg.assertions);
 
+  # The failed assertions of the fixture with one more peer, `bad`.
+  badPeer =
+    peer:
+    failedAssertions (hmEval "x86_64-linux" { programs.xmsg.server.federation.peers.bad = peer; });
+  badMsg = m: [ "programs.xmsg.server.federation.peers.bad: ${m}" ];
+  caPeer = {
+    address = "bad.example.org:7790";
+    ca = "/run/secrets/xmsg-root.crt";
+  };
+
+  # Whether `fed.key` set to `key` passes its type: the refusal is a throw, read as data.
+  keyAccepted =
+    key:
+    let
+      c = hmEval "x86_64-linux" { programs.xmsg.server.federation.key = lib.mkForce key; };
+    in
+    (builtins.tryEval (builtins.deepSeq c.programs.xmsg.server.federation.key true)).success;
+
   linux = hmEval "x86_64-linux" { };
   exe = lib.getExe xmsg.packages.x86_64-linux.default;
   agyAnchor = "${linux.programs.antigravity-cli.package}/bin/agy";
@@ -169,8 +187,9 @@ in
       expr = {
         mcp = linux.programs.antigravity-cli.mcpServers.xmsg;
         skill = linux.programs.antigravity-cli.skills.xmsg;
+        # `.source` is a writeText derivation; its `text` attribute is the file, read without IFD.
         hooks = builtins.fromJSON (
-          builtins.unsafeDiscardStringContext (file linux ".gemini/config/hooks.json").text
+          builtins.unsafeDiscardStringContext (file linux ".gemini/config/hooks.json").source.text
         );
       };
       expected = {
@@ -197,6 +216,77 @@ in
         skill = builtins.readFile ../../nix/modules/skills/xmsg/SKILL.md;
       };
     };
+    # C3: the module owns hooks.json. A second `.text` is refused by assertion; a second
+    # `.source` conflicts in the option's merge (a throw, read as data).
+    test-agy-hooks-owned = {
+      expr = {
+        text = failedAssertions (
+          hmEval "x86_64-linux" { home.file.".gemini/config/hooks.json".text = "{}"; }
+        );
+        source =
+          (builtins.tryEval (
+            builtins.deepSeq
+              (hmEval "x86_64-linux" { home.file.".gemini/config/hooks.json".source = ./fixtures/peer.crt; })
+              .home.file.".gemini/config/hooks.json".source.outPath
+              true
+          )).success;
+      };
+      expected = {
+        text = [
+          "programs.xmsg.harnesses.agy.enable owns ~/.gemini/config/hooks.json; remove the other home.file.\".gemini/config/hooks.json\".text definition."
+        ];
+        source = false;
+      };
+    };
+
+    # C4: `fed.key` is a runtime path; a store path is refused.
+    test-fed-key-not-store = {
+      expr = {
+        interpolated = keyAccepted "${./fixtures/peer.crt}";
+        storeString = keyAccepted "${builtins.storeDir}/0000000000000000000000000000000-k";
+        runtime = keyAccepted "/run/secrets/k";
+      };
+      expected = {
+        interpolated = false;
+        storeString = false;
+        runtime = true;
+      };
+    };
+
+    # C5: the loader's peer rules, refused at evaluation (src/fed.rs).
+    test-peer-ca-needs-identities = {
+      expr = badPeer caPeer;
+      expected = badMsg "ca needs identities.";
+    };
+    test-peer-identities-not-with-pin = {
+      expr = badPeer {
+        address = "bad.example.org:7790";
+        pin = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        identities = [ "spiffe://example.org/host/bad/user/alice" ];
+      };
+      expected = badMsg "identities is only valid with ca, not with pin or pinFromCert.";
+    };
+    test-peer-identities-exactly-one = {
+      expr = badPeer (
+        caPeer
+        // {
+          identities = [
+            "spiffe://example.org/host/bad/user/alice"
+            "spiffe://example.org/host/bad/user/bob"
+          ];
+        }
+      );
+      expected = badMsg "identities holds exactly one identity.";
+    };
+    test-peer-from-nonempty = {
+      expr = badPeer {
+        address = "bad.example.org:7790";
+        pin = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        from = [ ];
+      };
+      expected = badMsg "from must hold at least one CIDR, or be null.";
+    };
+
     # D19: a switch whose harness module is off is refused, naming the option.
     test-switch-needs-harness = {
       expr = failedAssertions (

@@ -61,10 +61,13 @@ let
             "send"
             "reply"
             "list"
+            "forward"
+            "relayed"
+            "relay"
           ]
         );
         default = [ ];
-        description = "Operations the peer may perform here.";
+        description = "Operations the peer may perform here, as the loader reads them (src/fed.rs): on a hub, `forward` relays the peer's sends; on a recipient, `relayed` (or `relay`) accepts what the peer relays (README 7.7).";
       };
       from = mkOption {
         type = types.nullOr (types.listOf types.str);
@@ -234,7 +237,7 @@ in
           description = "`--fed-cert`: this node's PEM certificate.";
         };
         key = mkOption {
-          type = types.str;
+          type = types.addCheck types.str (s: !builtins.hasContext s && !lib.hasPrefix builtins.storeDir s);
           description = "`--fed-key`: this node's PEM private key, a runtime path (never a store path).";
         };
         reloadInterval = mkOption {
@@ -268,15 +271,41 @@ in
         ++ lib.optional cfg.harnesses.agy.enable (
           requireHarness "agy" "programs.antigravity-cli.enable" config.programs.antigravity-cli.enable
         )
-        ++ lib.mapAttrsToList (name: p: {
-          assertion =
-            lib.count (x: x != null) [
-              p.pin
-              p.pinFromCert
-              p.ca
-            ] == 1;
-          message = "programs.xmsg.server.federation.peers.${name}: set exactly one of pin, pinFromCert and ca.";
-        }) fed.peers;
+        ++ lib.concatLists (
+          lib.mapAttrsToList (
+            name: p:
+            let
+              peer = rule: message: {
+                assertion = rule;
+                message = "programs.xmsg.server.federation.peers.${name}: ${message}";
+              };
+            in
+            # The loader's rules (src/fed.rs, PeersMap parse), refused here rather than at `xmsg serve`.
+            [
+              (peer (
+                lib.count (x: x != null) [
+                  p.pin
+                  p.pinFromCert
+                  p.ca
+                ] == 1
+              ) "set exactly one of pin, pinFromCert and ca.")
+              (peer (p.ca == null || p.identities != null) "ca needs identities.")
+              (peer (
+                p.pin == null && p.pinFromCert == null || p.identities == null
+              ) "identities is only valid with ca, not with pin or pinFromCert.")
+              (peer (
+                p.identities == null || lib.length p.identities == 1
+              ) "identities holds exactly one identity.")
+              (peer (p.from != [ ]) "from must hold at least one CIDR, or be null.")
+            ]
+          ) fed.peers
+        )
+        # The module owns hooks.json through `.source`; a `.text` definition elsewhere would
+        # otherwise lose silently to it (HM sets `source` from `text` at default priority).
+        ++ lib.optional cfg.harnesses.agy.enable {
+          assertion = config.home.file.".gemini/config/hooks.json".text == null;
+          message = "programs.xmsg.harnesses.agy.enable owns ~/.gemini/config/hooks.json; remove the other home.file.\".gemini/config/hooks.json\".text definition.";
+        };
     }
 
     # Runs as the sessions' own user: the inbox sockets live in 0700 dirs. Its HTTP API is
@@ -332,14 +361,16 @@ in
       # agy registers its language-server credentials before every turn. `--hook` reads them
       # from the hook's stdin JSON. programs.antigravity-cli has no hook option, so this
       # module owns the whole file.
-      home.file.".gemini/config/hooks.json".text = builtins.toJSON {
-        xmsg-register.PreInvocation = [
-          {
-            type = "command";
-            command = "${exe} register agy --hook";
-          }
-        ];
-      };
+      home.file.".gemini/config/hooks.json".source = pkgs.writeText "hooks.json" (
+        builtins.toJSON {
+          xmsg-register.PreInvocation = [
+            {
+              type = "command";
+              command = "${exe} register agy --hook";
+            }
+          ];
+        }
+      );
     })
 
     # pi auto-discovers extensions under ~/.pi/agent/extensions.

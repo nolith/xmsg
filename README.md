@@ -759,10 +759,11 @@ option, so it composes with the rest of your configuration:
 - `programs.xmsg.harnesses.agy.enable`: the server in `programs.antigravity-cli.mcpServers`, the skill in
   `programs.antigravity-cli.skills`, and the PreInvocation hook `xmsg register agy --hook` (Section 3.3).
   Needs `programs.antigravity-cli.enable`. **Cost:** `programs.antigravity-cli` has no hook option, so the module
-  writes the whole `~/.gemini/config/hooks.json`; it conflicts with any other agy hook you declare.
+  writes the whole `~/.gemini/config/hooks.json`; any other definition of that file fails evaluation.
 - `programs.xmsg.harnesses.pi.enable`: the extension (`extensions/pi/index.ts`) as
-  `~/.pi/agent/extensions/xmsg-pi.ts`, which pi auto-discovers, and the skill as `~/.pi/agent/skills/xmsg/SKILL.md`.
-  If your `~/.pi/agent/settings.json` lists `extensions` explicitly, add `~/.pi/agent/extensions/xmsg-pi.ts` there.
+  `~/.pi/agent/extensions/xmsg-pi.ts`, and the skill as `~/.pi/agent/skills/xmsg/SKILL.md`. pi loads everything
+  under `~/.pi/agent/extensions` whether or not `settings.json` lists `extensions`: plain entries there add to the
+  directory, and only a `!` or `-` pattern that matches `xmsg-pi.ts` disables it.
 
 A Claude or agy switch whose harness module is off fails evaluation, naming the option it needs, rather than
 installing nothing.
@@ -783,8 +784,9 @@ programs.xmsg.server.federation = {
       pinFromCert = ./cortex.crt;
       allow = [ "send" "reply" "list" ];
     };
-    # CA-signed: the trust anchor and the peer's one URI SAN
-    bitstream = {
+    # CA-signed: the trust anchor and the peer's one URI SAN. The key is the node name the
+    # identity derives (Section 7.0): .../host/bitstream/user/alice is `alice.bitstream`.
+    "alice.bitstream" = {
       address = "bitstream.example.org:7788";
       ca = ./xmsg-root.crt;
       identities = [ "spiffe://example.org/host/bitstream/user/alice" ];
@@ -795,8 +797,9 @@ programs.xmsg.server.federation = {
 ```
 
 `peers` renders the `--peers-file` from the schema of Section 7.3 (`address`, `pin`, `ca`, `identities`, `allow`,
-`from`, `leaf`, `principals`, `targets`, `dial`); unset fields are omitted. Each entry sets exactly one of `pin`,
-`pinFromCert` and `ca`.
+`from`, `leaf`, `principals`, `targets`, `dial`); unset fields are omitted. Evaluation refuses what the loader
+would refuse at `xmsg serve`: each entry sets exactly one of `pin`, `pinFromCert` and `ca`; `ca` needs `identities`,
+which holds exactly one identity and is refused with `pin` or `pinFromCert`; and `from`, when set, is non-empty.
 
 On NixOS, open the port with the system module:
 

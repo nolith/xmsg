@@ -1,10 +1,18 @@
-# Oracle 2: the typed `peers` option renders what nix-config's renderer renders today
+# Plan oracle 6: every peers file the typed `peers` option renders is accepted by THIS
+# revision's loader (`xmsg check-peers`, the package this flake builds): the CA form, the pin
+# form and a hub entry allowed to `forward`.
+# Second property: the CA and pin forms equal what nix-config's renderer renders today
 # (nix-config 174eb64c, modules/den/aspects/applications/dev/ai/mcp/xmsg.nix:352-397), for
-# an equivalent input, in the CA form and in the pin form. Compared after `jq -S`.
+# an equivalent input, compared after `jq -S`.
 { inputs, ... }:
 {
   perSystem =
-    { pkgs, lib, ... }:
+    {
+      pkgs,
+      lib,
+      system,
+      ...
+    }:
     let
       inherit (inputs) xmsg home-manager;
       crt = ./fixtures/peer.crt;
@@ -49,14 +57,17 @@
         lib.elemAt argv (lib.lists.findFirstIndex (a: a == "--peers-file") null argv + 1);
 
       # nix-config's renderer, verbatim but for its owner bindings (host names, the
-      # spiffe scheme, the domain), which are the fixture's here.
+      # spiffe scheme, the domain), which are the fixture's here. A CA entry is keyed by the
+      # node name its identity derives (README 7.0), so its key is `caNode`, not the host;
+      # the pin entry keeps the host as its nickname.
       peerNode = "cortex";
+      caNode = "alice.cortex";
       address = "cortex.ts.example.org:7788";
       spiffe = "spiffe://example.org/host/cortex/user/alice";
       leaves = [
         {
-          name = "genie";
-          identity = "spiffe://example.org/cluster/axon/genie";
+          name = "genie.axon";
+          identity = "spiffe://example.org/ns/axon/sa/genie";
           allow = [ "reply" ];
           targets = [ "genie-guard" ];
         }
@@ -64,7 +75,7 @@
       refCa = pkgs.writeText "xmsg-peers.json" (
         builtins.toJSON (
           {
-            ${peerNode} = {
+            ${caNode} = {
               inherit address;
               ca = "${caCrt crt}";
               identities = [ spiffe ];
@@ -112,16 +123,16 @@
         "list"
       ];
       mineCa = modulePeers {
-        cortex = {
+        ${caNode} = {
           inherit address;
           ca = crt;
           identities = [ spiffe ];
           allow = allowAll;
         };
-        genie = {
-          address = "genie.invalid:7788";
+        "genie.axon" = {
+          address = "genie.axon.invalid:7788";
           ca = crt;
-          identities = [ "spiffe://example.org/cluster/axon/genie" ];
+          identities = [ "spiffe://example.org/ns/axon/sa/genie" ];
           leaf = true;
           allow = [ "reply" ];
           targets = [ "genie-guard" ];
@@ -134,6 +145,27 @@
           allow = allowAll;
         };
       };
+      # README 7.7: a hub's entry for a peer whose sends it relays (`forward`), and a
+      # recipient's entry for that hub (`relayed`).
+      mineHub = modulePeers {
+        relayer = {
+          address = "relayer.example.org:7788";
+          pin = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+          allow = [
+            "send"
+            "relayed"
+          ];
+        };
+        hub = {
+          address = "hub.example.org:7788";
+          pin = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+          allow = [
+            "send"
+            "forward"
+          ];
+        };
+      };
+      xmsgExe = lib.getExe xmsg.packages.${system}.default;
     in
     {
       checks.peers-render =
@@ -154,6 +186,15 @@
               fi
               echo "peers-render: $1 form equal"
             }
+            loads() {
+              if ! ${xmsgExe} check-peers "$2"; then
+                echo "peers-render: the $1 form is refused by this revision's loader" >&2
+                exit 1
+              fi
+            }
+            loads CA ${mineCa}
+            loads pin ${minePin}
+            loads hub ${mineHub}
             same CA ${mineCa} ${refCa}
             same pin ${minePin} ${refPin}
             touch $out
