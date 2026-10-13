@@ -302,55 +302,13 @@ pub fn handle_jsonrpc(
             })
         }),
         "tools/list" => id.map(|id| {
-            let list_tool = json!({
-                "name": "list",
-                "description": "List active agent sessions on the local host, or on a federated peer when host is specified",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "host": {
-                            "type": "string",
-                            "description": "Optional federated peer host name to list sessions from"
-                        }
-                    },
-                    "additionalProperties": false
-                }
-            });
-            let send_tool = json!({
-                "name": "send",
-                "description": "Send a message to a session by ID, PID, or name. Sender identity is automatically derived from the calling session.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "ref": { "type": "string", "description": "Target session ID, PID, or name" },
-                        "text": { "type": "string", "description": "Message content" },
-                        "push_replies": { "type": "boolean", "description": "Whether to push replies back to the sender session (default: true). Set false for poll-only replies." },
-                        "idempotency_key": { "type": "string", "description": "Optional client-supplied idempotency key for at-most-once delivery" }
-                    },
-                    "required": ["ref", "text"],
-                    "additionalProperties": false
-                }
-            });
-            let reply_tool = json!({
-                "name": "reply",
-                "description": "Reply to a received message by message_id. Sender identity is automatically derived from the calling session.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "message_id": { "type": "string", "description": "ID of the message being replied to" },
-                        "text": { "type": "string", "description": "Reply text" }
-                    },
-                    "required": ["message_id", "text"],
-                    "additionalProperties": false
-                }
-            });
-
-            let tools = if config.reply_only {
-                vec![reply_tool]
-            } else {
-                vec![list_tool, send_tool, reply_tool]
-            };
-
+            let tools: Vec<Value> = tool_definitions()
+                .into_iter()
+                .filter(|t| {
+                    !config.reply_only
+                        || REPLY_ONLY_TOOLS.contains(&t["name"].as_str().unwrap_or(""))
+                })
+                .collect();
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -361,8 +319,14 @@ pub fn handle_jsonrpc(
         }),
         "tools/call" => id.map(|id| {
             let params = msg.get("params");
-            let name = params.and_then(|p| p.get("name")).and_then(Value::as_str).unwrap_or("");
-            let args = params.and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+            let name = params
+                .and_then(|p| p.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let args = params
+                .and_then(|p| p.get("arguments"))
+                .cloned()
+                .unwrap_or(json!({}));
 
             let res = execute_tool(config, client, name, &args);
             json!({
@@ -396,15 +360,19 @@ fn tool_err(text: String) -> Value {
 }
 
 fn call_agent_sock(sock_path: &std::path::Path, payload: &Value) -> Result<Value, String> {
+    call_agent_sock_within(sock_path, payload, Duration::from_secs(5))
+}
+
+fn call_agent_sock_within(
+    sock_path: &std::path::Path,
+    payload: &Value,
+    read_timeout: Duration,
+) -> Result<Value, String> {
     let my_uid = crate::agent::current_uid();
     if let Some(parent) = sock_path.parent() {
         crate::agent::ensure_secure_socket_dir(parent, my_uid)
             .map_err(|e| format!("insecure agent socket directory: {e}"))?;
     }
-
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-    use std::time::Duration;
 
     let mut stream = UnixStream::connect(sock_path).map_err(|e| {
         format!(
@@ -416,7 +384,7 @@ fn call_agent_sock(sock_path: &std::path::Path, payload: &Value) -> Result<Value
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(read_timeout))
         .map_err(|e| e.to_string())?;
 
     let line = format!("{payload}\n");
@@ -451,22 +419,138 @@ fn call_agent_sock(sock_path: &std::path::Path, payload: &Value) -> Result<Value
     }
 }
 
+/// The tools reply-only mode offers.
+pub const REPLY_ONLY_TOOLS: &[&str] = &["reply", "replies"];
+
+/// A13's four tools. MCP carries no `idempotency_key`: agents don't retry a send by
+/// accident, and programs that retry use HTTP or `agent.sock`.
+pub fn tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "list",
+            "description": "List the recipients you can message: each entry gives its address (id@node for an instance, name@node for a service), its kind (service or instance), its label and its status. Filter by name, node or kind; node lists a federated peer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Only recipients with this label or service name" },
+                    "node": { "type": "string", "description": "List this node (a federated peer) instead of the local one" },
+                    "kind": { "type": "string", "enum": ["service", "instance"], "description": "Only services or only instances" }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "send",
+            "description": "Send a message. `to` is an instance ID (a UUID, optionally ~n), a service name or an instance label, optionally followed by @node to reach another node (one @ at most). A name resolves among services first and only when exactly one live recipient carries it; otherwise the error lists the candidates. Returns the message ID, the resolved address (use it for follow-ups) and the outcome. Your identity is derived from your session; replies are pushed to you.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string", "description": "<id or name>[@<node>]" },
+                    "text": { "type": "string", "description": "Message content" }
+                },
+                "required": ["to", "text"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "reply",
+            "description": "Reply to a message you received, by its message_id. Your identity is derived from your session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": { "type": "string", "description": "ID of the message being replied to" },
+                    "text": { "type": "string", "description": "Reply text" }
+                },
+                "required": ["message_id", "text"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "replies",
+            "description": "Read the stored replies to a message you sent, waiting up to `wait` seconds (at most 60) for the first. Use it after a restart or a missed push, or to send and then block for the answer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": { "type": "string", "description": "ID of the message you sent" },
+                    "wait": { "type": "integer", "minimum": 0, "description": "Seconds to wait for a first reply (capped at 60)" }
+                },
+                "required": ["message_id"],
+                "additionalProperties": false
+            }
+        }),
+    ]
+}
+
+/// Refuses an argument the tool's schema does not declare.
+fn check_args(name: &str, args: &Value) -> Result<(), String> {
+    let allowed: Vec<String> = tool_definitions()
+        .into_iter()
+        .find(|t| t["name"] == name)
+        .and_then(|t| t["inputSchema"]["properties"].as_object().cloned())
+        .map(|p| p.keys().cloned().collect())
+        .unwrap_or_default();
+    match args.as_object() {
+        Some(obj) => match obj.keys().find(|k| !allowed.contains(k)) {
+            // Invariant: a caller-supplied sender is refused (§8.3a).
+            Some(k) if k == "from" => Err("error: 'from' argument is forbidden; sender identity is automatically derived from the calling session".to_string()),
+            Some(k) => Err(format!("error: unknown argument '{k}' for tool '{name}'")),
+            None => Ok(()),
+        },
+        None => Err(format!("error: arguments for tool '{name}' must be an object")),
+    }
+}
+
+/// Runs one `agent.sock` frame for a tool; the result is the frame's `key` member, or the
+/// whole answer without its `status` when `key` is `None`.
+fn agent_tool(
+    config: &McpConfig,
+    payload: &Value,
+    key: Option<&str>,
+    read_timeout: Duration,
+) -> Value {
+    match call_agent_sock_within(&config.agent_sock, payload, read_timeout) {
+        Ok(mut resp) => {
+            if let Some(obj) = resp.as_object_mut() {
+                obj.remove("status");
+            }
+            let result = match key {
+                Some(k) => resp.get(k).cloned().unwrap_or(Value::Null),
+                None => resp,
+            };
+            tool_ok(result.to_string())
+        }
+        Err(e) => tool_err(e),
+    }
+}
+
 pub fn execute_tool(
     config: &McpConfig,
     client: &reqwest::blocking::Client,
     name: &str,
     args: &Value,
 ) -> Value {
-    if config.reply_only && name != "reply" {
+    if config.reply_only && !REPLY_ONLY_TOOLS.contains(&name) {
         return tool_err(format!("tool '{name}' is not available in reply-only mode"));
     }
+    if !tool_definitions().iter().any(|t| t["name"] == name) {
+        return tool_err(format!("unknown tool: {name}"));
+    }
+    if let Err(e) = check_args(name, args) {
+        return tool_err(e);
+    }
+    let str_arg = |k: &str| args.get(k).and_then(Value::as_str);
 
     match name {
         "list" => {
-            let host_opt = args.get("host").and_then(|v| v.as_str());
-            let path = match host_opt {
-                Some(host) => format!("/v1/sessions?peer={host}"),
-                None => "/v1/sessions".to_string(),
+            let mut url = reqwest::Url::parse("http://xmsg/v1/recipients").expect("static url");
+            for k in ["name", "node", "kind"] {
+                if let Some(v) = str_arg(k) {
+                    url.query_pairs_mut().append_pair(k, v);
+                }
+            }
+            let path = match url.query() {
+                Some(q) => format!("{}?{q}", url.path()),
+                None => url.path().to_string(),
             };
             let sock_path = config
                 .http_sock
@@ -475,16 +559,9 @@ pub fn execute_tool(
             if let Some(ref sock) = sock_path {
                 if sock.exists() {
                     match crate::http::http_get_unix(sock, &path) {
-                        Ok((status, text)) => {
-                            if status.is_success() {
-                                return tool_ok(text);
-                            } else {
-                                return tool_err(format!("HTTP {status}: {text}"));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("failed to query http.sock for list: {e}");
-                        }
+                        Ok((status, text)) if status.is_success() => return tool_ok(text),
+                        Ok((status, text)) => return tool_err(format!("HTTP {status}: {text}")),
+                        Err(e) => tracing::debug!("failed to query http.sock for list: {e}"),
                     }
                 }
             }
@@ -504,65 +581,37 @@ pub fn execute_tool(
             }
         }
         "send" => {
-            // Invariant: Reject any caller-supplied 'from' argument (§8.3a)
-            if args.get("from").is_some() {
-                return tool_err("error: 'from' argument is forbidden; sender identity is automatically derived from the calling session".to_string());
-            }
-
-            let Some(target_ref) = args.get("ref").and_then(Value::as_str) else {
-                return tool_err("missing required string argument 'ref'".to_string());
+            let (Some(to), Some(text)) = (str_arg("to"), str_arg("text")) else {
+                return tool_err("missing required string arguments 'to' and 'text'".to_string());
             };
-            let Some(text) = args.get("text").and_then(Value::as_str) else {
-                return tool_err("missing required string argument 'text'".to_string());
-            };
-            let push_replies = args
-                .get("push_replies")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            let idempotency_key = args
-                .get("idempotency_key")
-                .or_else(|| args.get("idempotencyKey"))
-                .and_then(Value::as_str);
-
-            let mut payload = json!({
-                "action": "send",
-                "ref": target_ref,
-                "text": text,
-                "push_replies": push_replies,
-            });
-            if let Some(key) = idempotency_key {
-                payload["idempotency_key"] = json!(key);
-            }
-
-            match call_agent_sock(&config.agent_sock, &payload) {
-                Ok(resp) => {
-                    let delivery_val = resp.get("delivery").cloned().unwrap_or(resp);
-                    tool_ok(delivery_val.to_string())
-                }
-                Err(e) => tool_err(e),
-            }
+            let payload = json!({ "action": "send", "to": to, "text": text });
+            agent_tool(config, &payload, None, Duration::from_secs(5))
         }
         "reply" => {
-            let Some(message_id) = args.get("message_id").and_then(Value::as_str) else {
+            let (Some(message_id), Some(text)) = (str_arg("message_id"), str_arg("text")) else {
+                return tool_err(
+                    "missing required string arguments 'message_id' and 'text'".to_string(),
+                );
+            };
+            let payload = json!({ "action": "reply", "message_id": message_id, "text": text });
+            agent_tool(config, &payload, Some("reply"), Duration::from_secs(5))
+        }
+        "replies" => {
+            let Some(message_id) = str_arg("message_id") else {
                 return tool_err("missing required string argument 'message_id'".to_string());
             };
-            let Some(text) = args.get("text").and_then(Value::as_str) else {
-                return tool_err("missing required string argument 'text'".to_string());
-            };
-
-            let payload = json!({
-                "action": "reply",
-                "messageId": message_id,
-                "text": text
-            });
-
-            match call_agent_sock(&config.agent_sock, &payload) {
-                Ok(resp) => {
-                    let reply_val = resp.get("reply").cloned().unwrap_or(resp);
-                    tool_ok(reply_val.to_string())
-                }
-                Err(e) => tool_err(e),
-            }
+            let wait = args
+                .get("wait")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(crate::surface::MAX_WAIT_SECS);
+            let payload = json!({ "action": "replies", "message_id": message_id, "wait": wait });
+            agent_tool(
+                config,
+                &payload,
+                Some("replies"),
+                Duration::from_secs(wait + 5),
+            )
         }
         _ => tool_err(format!("unknown tool: {name}")),
     }

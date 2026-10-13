@@ -199,17 +199,26 @@ async fn create_fed_test_node(
     tokio::spawn(async move {
         let _ = run_register_server(
             r_sock,
-            reg_config,
-            reg_store,
-            reg_pi_store,
-            reg_db,
-            reg_pi_notify,
-            Duration::from_secs(3600),
+            std::sync::Arc::new(xmsg::http::AppState {
+                sessions_dirs: vec![],
+                agy_config: reg_config,
+                agy_store: reg_store,
+                pi_store: reg_pi_store,
+                pi_notify_tx: reg_pi_notify,
+                svc_store: reg_svc_store,
+                svc_notify_tx: reg_svc_notify,
+                node_name: xmsg::node::local_node_name(),
+                max_body: 65536,
+                request_counter: std::sync::atomic::AtomicU64::new(1),
+                db: reg_db,
+                notify_tx: tokio::sync::broadcast::channel(16).0,
+                reply_ttl: Duration::from_secs(3600),
+                idempotency_ttl: std::time::Duration::from_secs(86400),
+                long_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
+                fed_state: None,
+            }),
             my_uid,
-            reg_svc_store,
             reg_trusted_svc,
-            reg_svc_notify,
-            None,
         )
         .await;
     });
@@ -382,7 +391,7 @@ async fn test_oracle_1_peer_with_targets_delivers_to_allowed_target() {
 
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": "svc:genie-expert@host-b",
+        "to": "genie-expert@host-b",
         "text": "expert task 1",
     });
     writer_a
@@ -400,10 +409,7 @@ async fn test_oracle_1_peer_with_targets_delivers_to_allowed_target() {
         send_resp
     );
     assert_eq!(
-        send_resp
-            .get("delivery")
-            .and_then(|d| d.get("outcome"))
-            .and_then(|o| o.as_str()),
+        send_resp.get("outcome").and_then(|o| o.as_str()),
         Some("delivered")
     );
 
@@ -510,7 +516,7 @@ async fn test_oracle_2_peer_with_targets_refused_for_other_svc_and_claude_sessio
 
     let send_req1 = serde_json::json!({
         "action": "send",
-        "ref": "svc:other-worker@host-b",
+        "to": "other-worker@host-b",
         "text": "unauthorized svc payload",
     });
     writer_a
@@ -527,7 +533,7 @@ async fn test_oracle_2_peer_with_targets_refused_for_other_svc_and_claude_sessio
     );
     assert_eq!(
         send_resp1.get("error").and_then(|s| s.as_str()),
-        Some("op_denied")
+        Some("denied")
     );
     assert_eq!(
         send_resp1.get("detail").and_then(|s| s.as_str()),
@@ -537,8 +543,7 @@ async fn test_oracle_2_peer_with_targets_refused_for_other_svc_and_claude_sessio
     // Verify nothing queued for svc:other-worker
     {
         let db = node_b.db.lock().unwrap();
-        let pending_svc_count =
-            storage::count_pending_svc_messages(&db, "svc:other-worker").unwrap();
+        let pending_svc_count = storage::count_pending_svc_messages(&db, "other-worker").unwrap();
         assert_eq!(
             pending_svc_count, 0,
             "no messages should be queued for other-worker"
@@ -548,7 +553,7 @@ async fn test_oracle_2_peer_with_targets_refused_for_other_svc_and_claude_sessio
     // 4. Node A attempts to send to agent-claude@host-b => refused with OpDenied
     let send_req2 = serde_json::json!({
         "action": "send",
-        "ref": "agent-claude@host-b",
+        "to": "agent-claude@host-b",
         "text": "unauthorized claude payload",
     });
     writer_a
@@ -565,7 +570,7 @@ async fn test_oracle_2_peer_with_targets_refused_for_other_svc_and_claude_sessio
     );
     assert_eq!(
         send_resp2.get("error").and_then(|s| s.as_str()),
-        Some("op_denied")
+        Some("denied")
     );
     assert_eq!(
         send_resp2.get("detail").and_then(|s| s.as_str()),
@@ -662,7 +667,7 @@ async fn test_oracle_3_peer_without_targets_reaches_session_and_svc() {
 
     let send_req1 = serde_json::json!({
         "action": "send",
-        "ref": "svc:my-daemon@host-b",
+        "to": "my-daemon@host-b",
         "text": "payload for daemon",
     });
     writer_a
@@ -702,7 +707,7 @@ async fn test_oracle_3_peer_without_targets_reaches_session_and_svc() {
     // 4. Node A sends to agent-claude@host-b => succeeds
     let send_req2 = serde_json::json!({
         "action": "send",
-        "ref": "agent-claude@host-b",
+        "to": "agent-claude@host-b",
         "text": "payload for claude",
     });
     writer_a
@@ -835,10 +840,9 @@ async fn test_oracle_4_refused_target_does_not_consume_rate_limit_or_create_stor
             name: "sender-a".to_string(),
         },
         to: FedTarget {
-            r#ref: "svc:other-worker".to_string(),
+            r#ref: "other-worker".to_string(),
         },
         body: "Payload for refused target".to_string(),
-        push_replies: false,
         thread_id: refused_id.to_string(),
         created_at: storage::now_epoch_secs(),
         forwarded: None,
@@ -858,7 +862,7 @@ async fn test_oracle_4_refused_target_does_not_consume_rate_limit_or_create_stor
             stored_refused.is_none(),
             "refused message must NOT be stored in the messages table"
         );
-        let queued_other = storage::count_pending_svc_messages(&db, "svc:other-worker").unwrap();
+        let queued_other = storage::count_pending_svc_messages(&db, "other-worker").unwrap();
         assert_eq!(
             queued_other, 0,
             "refused message must NOT be queued in svc_pending_messages"
@@ -877,10 +881,9 @@ async fn test_oracle_4_refused_target_does_not_consume_rate_limit_or_create_stor
             name: "sender-a".to_string(),
         },
         to: FedTarget {
-            r#ref: "svc:genie-expert".to_string(),
+            r#ref: "genie-expert".to_string(),
         },
         body: "Payload for allowed target".to_string(),
-        push_replies: false,
         thread_id: allowed_id.to_string(),
         created_at: storage::now_epoch_secs(),
         forwarded: None,

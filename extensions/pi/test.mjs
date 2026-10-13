@@ -59,16 +59,18 @@ async function runTest1() {
   const mockPi = new MockExtensionAPI();
   extensionDefault(mockPi);
 
-  assert.equal(mockPi.tools.length, 3);
+  assert.equal(mockPi.tools.length, 4);
   const toolNames = mockPi.tools.map((t) => t.name);
   assert.ok(toolNames.includes("list"), "list tool must be registered");
   assert.ok(toolNames.includes("send"), "send tool must be registered");
   assert.ok(toolNames.includes("reply"), "reply tool must be registered");
+  assert.ok(toolNames.includes("replies"), "replies tool must be registered");
 
   const sendTool = mockPi.tools.find((t) => t.name === "send");
-  assert.ok(sendTool.parameters.properties.ref);
+  assert.ok(sendTool.parameters.properties.to);
   assert.ok(sendTool.parameters.properties.text);
-  assert.ok(sendTool.parameters.properties.push_replies);
+  assert.equal(sendTool.parameters.properties.push_replies, undefined);
+  assert.equal(sendTool.parameters.properties.ref, undefined);
 
   const replyTool = mockPi.tools.find((t) => t.name === "reply");
   assert.equal(typeof replyTool.description, "string");
@@ -193,7 +195,16 @@ async function runTest3() {
       for (const line of lines) {
         if (!line.trim()) continue;
         receivedReq = JSON.parse(line);
-        if (receivedReq.messageId === "msg-valid") {
+        if (receivedReq.action === "send") {
+          socket.write(
+            JSON.stringify({
+              status: "ok",
+              message_id: "msg-sent-1",
+              address: "victim-session@node",
+              outcome: "delivered",
+            }) + "\n"
+          );
+        } else if (receivedReq.message_id === "msg-valid") {
           socket.write(
             JSON.stringify({
               status: "ok",
@@ -207,11 +218,11 @@ async function runTest3() {
               },
             }) + "\n"
           );
-        } else if (receivedReq.messageId === "msg-not-recipient") {
+        } else if (receivedReq.message_id === "msg-not-recipient") {
           socket.write(
             JSON.stringify({
               status: "error",
-              error: "not_recipient",
+              error: "denied",
               detail: "caller is not recipient",
             }) + "\n"
           );
@@ -250,7 +261,8 @@ async function runTest3() {
   );
 
   assert.equal(receivedReq.action, "reply");
-  assert.equal(receivedReq.messageId, "msg-valid");
+  assert.equal(receivedReq.message_id, "msg-valid");
+  assert.equal(receivedReq.messageId, undefined);
   assert.equal(receivedReq.text, "Hello from Pi!");
   assert.equal(result1.content[0].text, "Reply sent (seq 1)");
   assert.equal(result1.details.seq, 1);
@@ -265,7 +277,7 @@ async function runTest3() {
   );
 
   assert.ok(result2.content[0].text.includes("not recipient of message msg-not-recipient"));
-  assert.equal(result2.details.error, "not_recipient");
+  assert.equal(result2.details.error, "denied");
 
   // 3. Successful send over agent.sock (never HTTP)
   bridge.registerSendTool();
@@ -274,16 +286,18 @@ async function runTest3() {
 
   const result3 = await sendTool.execute(
     "call-3",
-    { ref: "victim-session", text: "Hello from Pi via agent.sock", push_replies: true },
+    { to: "victim-session", text: "Hello from Pi via agent.sock" },
     undefined,
     undefined,
     { sessionManager: { getSessionId: () => "pi-sess-replier" } },
   );
 
   assert.equal(receivedReq.action, "send");
-  assert.equal(receivedReq.ref, "victim-session");
+  assert.equal(receivedReq.to, "victim-session");
   assert.equal(receivedReq.text, "Hello from Pi via agent.sock");
-  assert.equal(receivedReq.push_replies, true);
+  assert.deepEqual(Object.keys(receivedReq).sort(), ["action", "text", "to"]);
+  assert.equal(result3.details.address, "victim-session@node");
+  assert.equal(result3.details.message_id, "msg-sent-1");
 
   await new Promise((r) => server.close(r));
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -299,7 +313,7 @@ async function runTest4_oracle1() {
 
   let fakeSocketReqReceived = false;
   const socketServer = http.createServer((req, res) => {
-    if (req.url === "/v1/sessions" && req.method === "GET") {
+    if (req.url === "/v1/recipients" && req.method === "GET") {
       fakeSocketReqReceived = true;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify([{ sessionId: "oracle-1-sess", name: "sess-1", harness: "claude" }]));
@@ -330,7 +344,7 @@ async function runTest4_oracle1() {
 
     const result = await listTool.execute("call-oracle-1", {});
 
-    assert.equal(fakeSocketReqReceived, true, "Oracle 1: fake server on http.sock must receive GET /v1/sessions");
+    assert.equal(fakeSocketReqReceived, true, "Oracle 1: fake server on http.sock must receive GET /v1/recipients");
     assert.ok(Array.isArray(result.details), "Oracle 1: result details must be an array of sessions");
     assert.equal(result.details[0].sessionId, "oracle-1-sess");
     console.log("✔ Oracle 1 passed: With no XMSG_URL and a fake server on http.sock, list returns server sessions");
@@ -347,7 +361,7 @@ async function runTest4_oracle1() {
 async function runTest5_oracle2() {
   let fakeTcpReqReceived = false;
   const tcpServer = http.createServer((req, res) => {
-    if (req.url === "/v1/sessions" && req.method === "GET") {
+    if (req.url === "/v1/recipients" && req.method === "GET") {
       fakeTcpReqReceived = true;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify([{ sessionId: "oracle-2-tcp-sess", name: "sess-tcp" }]));
@@ -375,7 +389,7 @@ async function runTest5_oracle2() {
 
     const result = await listTool.execute("call-oracle-2", {});
 
-    assert.equal(fakeTcpReqReceived, true, "Oracle 2: fake TCP server at XMSG_URL must receive GET /v1/sessions");
+    assert.equal(fakeTcpReqReceived, true, "Oracle 2: fake TCP server at XMSG_URL must receive GET /v1/recipients");
     assert.ok(Array.isArray(result.details), "Oracle 2: result details must be an array of sessions");
     assert.equal(result.details[0].sessionId, "oracle-2-tcp-sess");
     console.log("✔ Oracle 2 passed: With XMSG_URL set to TCP fake, list uses it as override");

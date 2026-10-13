@@ -145,11 +145,8 @@ async fn test_gate_probe_b1_reserved_prefix_bypasses() {
 
     for hostile in hostile_froms {
         let res = client
-            .post(format!(
-                "{}/v1/sessions/my-worker/messages",
-                harness.base_url
-            ))
-            .json(&serde_json::json!({
+            .post(format!("{}/v1/messages", harness.base_url))
+            .json(&serde_json::json!({"to": "my-worker",
                 "from": hostile,
                 "text": "attempting prefix spoof"
             }))
@@ -167,11 +164,8 @@ async fn test_gate_probe_b1_reserved_prefix_bypasses() {
 
     // Verify legitimate senders are accepted
     let res = client
-        .post(format!(
-            "{}/v1/sessions/my-worker/messages",
-            harness.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", harness.base_url))
+        .json(&serde_json::json!({"to": "my-worker",
             "from": "legit-sender",
             "text": "hello"
         }))

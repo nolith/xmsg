@@ -790,31 +790,12 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         }));
 
         let reg_sock = register_sock_path.clone();
-        let reg_config = agy_config.clone();
-        let reg_store = agy_store.clone();
-        let reg_pi_store = pi_store.clone();
-        let reg_db = db.clone();
-        let reg_pi_notify_tx = pi_notify_tx.clone();
-        let reg_svc_store = svc_store.clone();
+        let reg_state = state.clone();
         let reg_trusted_svc_exes = trusted_svc_exes.clone();
-        let reg_svc_notify_tx = svc_notify_tx.clone();
-        let reg_fed_state = fed_state.clone();
         bg_tasks.push(tokio::spawn(async move {
-            if let Err(e) = xmsg::agy::run_register_server(
-                reg_sock,
-                reg_config,
-                reg_store,
-                reg_pi_store,
-                reg_db,
-                reg_pi_notify_tx,
-                reply_ttl,
-                my_uid,
-                reg_svc_store,
-                reg_trusted_svc_exes,
-                reg_svc_notify_tx,
-                reg_fed_state,
-            )
-            .await
+            if let Err(e) =
+                xmsg::agy::run_register_server(reg_sock, reg_state, my_uid, reg_trusted_svc_exes)
+                    .await
             {
                 tracing::error!("register server error: {e}");
             }
@@ -833,7 +814,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     if args.leaf {
         let leaf_reg_sock = args
@@ -843,25 +824,11 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 xmsg::agent::default_register_sock_path().expect("default register sock")
             });
         let leaf_p = args.leaf_principal.clone().unwrap();
-        let leaf_proc_root = agy_config.proc_root.clone();
-        let leaf_svc_store = svc_store.clone();
-        let leaf_db = db.clone();
-        let leaf_svc_notify_tx = svc_notify_tx.clone();
-        let leaf_fed_state = fed_state.clone();
+        let leaf_state = state.clone();
 
         bg_tasks.push(tokio::spawn(async move {
-            if let Err(e) = xmsg::svc::run_leaf_register_server(
-                leaf_reg_sock,
-                leaf_proc_root,
-                leaf_svc_store,
-                my_uid,
-                leaf_db,
-                leaf_svc_notify_tx,
-                reply_ttl,
-                leaf_p,
-                leaf_fed_state,
-            )
-            .await
+            if let Err(e) =
+                xmsg::svc::run_leaf_register_server(leaf_reg_sock, leaf_state, my_uid, leaf_p).await
             {
                 tracing::error!("leaf register server error: {e}");
             }

@@ -362,12 +362,19 @@ export class XmsgPiBridge {
     this.pi.registerTool({
       name: "list",
       label: "List",
-      description: "List active agent sessions on the local host, or on a federated peer when host is specified",
+      description: "List the recipients you can message: each entry gives its address (id@node for an instance, name@node for a service), its kind (service or instance), its label and its status. Filter by name, node or kind; node lists a federated peer.",
       parameters: Type.Object({
-        host: Type.Optional(Type.String({ description: "Optional federated peer host name to list sessions from" })),
+        name: Type.Optional(Type.String({ description: "Only recipients with this label or service name" })),
+        node: Type.Optional(Type.String({ description: "List this node (a federated peer) instead of the local one" })),
+        kind: Type.Optional(Type.Union([Type.Literal("service"), Type.Literal("instance")], { description: "Only services or only instances" })),
       }),
-      execute: async ({ host }: { host?: string } = {}) => {
-        const queryPath = host ? `/v1/sessions?peer=${encodeURIComponent(host)}` : "/v1/sessions";
+      execute: async (_toolCallId: string, params: { name?: string; node?: string; kind?: string } = {}) => {
+        const query = new URLSearchParams();
+        for (const key of ["name", "node", "kind"] as const) {
+          if (params?.[key]) query.set(key, params[key] as string);
+        }
+        const qs = query.toString();
+        const queryPath = qs ? `/v1/recipients?${qs}` : "/v1/recipients";
         if (this.xmsgUrl) {
           try {
             const res = await fetch(`${this.xmsgUrl}${queryPath}`);
@@ -474,24 +481,23 @@ export class XmsgPiBridge {
     this.pi.registerTool({
       name: "send",
       label: "Send",
-      description: "Send a cross-session message to another agent by session ID, PID, or name. Sender identity is automatically derived.",
+      description: "Send a message. `to` is an instance ID (a UUID, optionally ~n), a service name or an instance label, optionally followed by @node to reach another node (one @ at most). A name resolves among services first and only when exactly one live recipient carries it; otherwise the error lists the candidates. Returns the message ID, the resolved address (use it for follow-ups) and the outcome. Your identity is derived from your session; replies are pushed to you.",
       parameters: Type.Object({
-        ref: Type.String({ description: "Target session ID, PID, or name" }),
+        to: Type.String({ description: "<id or name>[@<node>]" }),
         text: Type.String({ description: "Message content" }),
-        push_replies: Type.Optional(Type.Boolean({ description: "Whether to push replies back to the sender session (default: true)" })),
       }),
       execute: async (_toolCallId, params: any) => {
         const req = {
           action: "send",
-          ref: params.ref,
+          to: params.to,
           text: params.text,
-          push_replies: params.push_replies ?? true,
         };
         const resp = await this.callAgentSock(req);
         if (resp.status === "ok") {
+          const { status: _status, ...result } = resp;
           return {
-            content: [{ type: "text", text: `Message sent (id ${resp.delivery?.messageId || resp.delivery})` }],
-            details: resp.delivery || resp,
+            content: [{ type: "text", text: `Message sent to ${resp.address} (id ${resp.message_id}, ${resp.outcome})` }],
+            details: result,
           };
         } else {
           return {
@@ -515,7 +521,7 @@ export class XmsgPiBridge {
       execute: async (_toolCallId, params: any) => {
         const req = {
           action: "reply",
-          messageId: params.message_id,
+          message_id: params.message_id,
           text: params.text,
         };
         const resp = await this.callAgentSock(req);
@@ -524,10 +530,10 @@ export class XmsgPiBridge {
             content: [{ type: "text", text: `Reply sent (seq ${resp.reply?.seq})` }],
             details: resp.reply,
           };
-        } else if (resp.error === "not_recipient") {
+        } else if (resp.error === "denied") {
           return {
             content: [{ type: "text", text: `Error: not recipient of message ${params.message_id}` }],
-            details: { error: "not_recipient", status: 403, detail: resp.detail },
+            details: { error: "denied", status: 403, detail: resp.detail },
           };
         } else {
           return {
@@ -539,10 +545,38 @@ export class XmsgPiBridge {
     });
   }
 
+  public registerRepliesTool() {
+    this.pi.registerTool({
+      name: "replies",
+      label: "Replies",
+      description: "Read the stored replies to a message you sent, waiting up to `wait` seconds (at most 60) for the first. Use it after a restart or a missed push, or to send and then block for the answer.",
+      parameters: Type.Object({
+        message_id: Type.String({ description: "ID of the message you sent" }),
+        wait: Type.Optional(Type.Integer({ minimum: 0, description: "Seconds to wait for a first reply (capped at 60)" })),
+      }),
+      execute: async (_toolCallId, params: any) => {
+        const wait = Math.min(params.wait ?? 0, 60);
+        const req = { action: "replies", message_id: params.message_id, wait };
+        const resp = await this.callAgentSock(req);
+        if (resp.status === "ok") {
+          return {
+            content: [{ type: "text", text: JSON.stringify(resp.replies, null, 2) }],
+            details: resp.replies,
+          };
+        }
+        return {
+          content: [{ type: "text", text: `Error reading replies: ${resp.detail || resp.error || JSON.stringify(resp)}` }],
+          details: resp,
+        };
+      },
+    });
+  }
+
   public registerTools() {
     this.registerListTool();
     this.registerSendTool();
     this.registerReplyTool();
+    this.registerRepliesTool();
   }
 }
 

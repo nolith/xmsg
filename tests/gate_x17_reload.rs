@@ -245,7 +245,6 @@ fn make_envelope(target: &str, body: &str) -> FedEnvelope {
             r#ref: target.to_string(),
         },
         body: body.to_string(),
-        push_replies: false,
         thread_id: format!("thr-{}", ulid::Ulid::new()),
         created_at: 1000,
         forwarded: None,

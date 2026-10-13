@@ -23,26 +23,6 @@ pub struct InboxMessage {
     pub content: String,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SendMessageRequest {
-    #[serde(default)]
-    pub from: String,
-    pub text: String,
-    #[serde(default = "default_true", alias = "pushReplies")]
-    pub push_replies: bool,
-    #[serde(
-        default,
-        alias = "idempotencyKey",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub idempotency_key: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryResponse {

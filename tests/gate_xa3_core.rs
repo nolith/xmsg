@@ -151,8 +151,8 @@ impl Node {
         let (status, body) = self
             .http(
                 "POST",
-                &format!("/v1/sessions/{to}/messages"),
-                Some(serde_json::json!({ "from": "ci", "text": text })),
+                "/v1/messages",
+                Some(serde_json::json!({"to": to,  "from": "ci", "text": text })),
             )
             .await;
         (
@@ -162,7 +162,7 @@ impl Node {
     }
 
     async fn list(&self) -> Vec<serde_json::Value> {
-        let (status, body) = self.http("GET", "/v1/sessions", None).await;
+        let (status, body) = self.http("GET", "/v1/recipients", None).await;
         assert_eq!(status, 200, "{body}");
         serde_json::from_str(&body).unwrap()
     }
@@ -371,13 +371,18 @@ async fn test_oracle_1_services_resolve_before_instance_labels() {
     assert!(
         listed
             .iter()
-            .any(|s| s["sessionId"] == ID_A && s["name"] == "genie-guard"),
+            .any(|s| s["address"] == format!("{ID_A}@{}", node_name())
+                && s["label"] == "genie-guard"),
         "the impostor is live and labelled genie-guard: {listed:?}"
     );
 
     let (status, body) = node.send("genie-guard", "for the guard").await;
     assert_eq!(status, 202, "{body}");
-    assert_eq!(body["sessionId"], "genie-guard", "{body}");
+    assert_eq!(
+        body["address"],
+        format!("genie-guard@{}", node_name()),
+        "{body}"
+    );
     let delivered = guard.poll(3).await.expect("the service receives it");
     assert_eq!(delivered["text"], "for the guard");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -434,7 +439,9 @@ async fn test_oracle_3_bare_id_with_only_forks_live_is_ambiguous() {
     let listed = node.list().await;
     let fork = format!("{ID_X}~2");
     assert!(
-        listed.iter().any(|s| s["sessionId"] == fork),
+        listed
+            .iter()
+            .any(|s| s["address"] == format!("{fork}@{}", node_name())),
         "P2 holds X~2: {listed:?}"
     );
 
@@ -485,7 +492,7 @@ async fn test_oracle_8_label_render() {
     claude_file(&node, "me", std::process::id(), ID_L, "lab", &me_inbox.sock);
 
     let resp = node
-        .agent(serde_json::json!({ "action": "send", "ref": ID_T, "text": "hi" }))
+        .agent(serde_json::json!({ "action": "send", "to": ID_T, "text": "hi" }))
         .await;
     assert_eq!(resp["status"], "ok", "{resp}");
     let line = target_inbox.wait_line().await.expect("delivered");
@@ -497,10 +504,10 @@ async fn test_oracle_8_label_render() {
     let listed = node.list().await;
     let entry = listed
         .iter()
-        .find(|s| s["sessionId"] == ID_A)
+        .find(|s| s["address"] == format!("{ID_A}@{}", node_name()))
         .unwrap_or_else(|| panic!("the session stays listed: {listed:?}"));
     assert!(
-        entry["name"].is_null(),
+        entry["label"].is_null(),
         "a label carrying `@` or `·` is dropped: {entry}"
     );
 }
@@ -534,7 +541,7 @@ async fn test_oracle_8_fork_sends_as_its_address() {
     node.list().await; // this process takes X~2
 
     let resp = node
-        .agent(serde_json::json!({ "action": "send", "ref": ID_T, "text": "from the fork" }))
+        .agent(serde_json::json!({ "action": "send", "to": ID_T, "text": "from the fork" }))
         .await;
     assert_eq!(resp["status"], "ok", "{resp}");
     let line = target_inbox.wait_line().await.expect("delivered");
@@ -629,7 +636,7 @@ async fn test_oracle_9_schema_n_survives_restart() {
     let keeper = Service::register(&node, "keeper").await;
     let (status, body) = node.send("keeper", "kept across a restart").await;
     assert_eq!(status, 202, "{body}");
-    let message_id = body["messageId"].as_str().unwrap().to_string();
+    let message_id = body["message_id"].as_str().unwrap().to_string();
     drop(keeper);
     node.stop();
     {
@@ -650,4 +657,362 @@ async fn test_oracle_9_schema_n_survives_restart() {
         .expect("the message queued at schema N survives the restart");
     assert_eq!(delivered["messageId"], message_id.as_str());
     assert_eq!(delivered["text"], "kept across a restart");
+}
+
+/// One `agent.sock` frame from this test process, answered within `secs` seconds.
+async fn agent_within(node: &Node, frame: serde_json::Value, secs: u64) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(secs), node.agent(frame))
+        .await
+        .unwrap_or_else(|_| panic!("agent.sock did not answer within {secs}s"))
+}
+
+// =============================================================================
+// Oracle 4 (A10 as amended by A-2). Replies are pushed by sender kind: to a Claude
+// session that sent to a service, and to a service that sent to a Claude session, whose
+// push lands in its inbox with `in_reply_to`.
+// Mutant: push only to sessions => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_4_claude_sender_gets_a_service_reply_pushed() {
+    let tmp = tempdir().unwrap();
+    let node = Node::start(tmp.path(), &["helper"]);
+    let mut helper = Service::register(&node, "helper").await;
+    let me_inbox = inbox();
+    claude_file(
+        &node,
+        "me",
+        std::process::id(),
+        ID_L,
+        "asker",
+        &me_inbox.sock,
+    );
+
+    let resp = node
+        .agent(serde_json::json!({ "action": "send", "to": "helper", "text": "question" }))
+        .await;
+    assert_eq!(resp["status"], "ok", "{resp}");
+    let message_id = resp["message_id"].as_str().unwrap().to_string();
+    let delivered = helper.poll(3).await.expect("the service receives it");
+    assert_eq!(delivered["messageId"], message_id.as_str());
+    assert_eq!(delivered["origin"]["id"], ID_L, "{delivered}");
+    assert_eq!(
+        delivered["origin"]["node"],
+        node_name().as_str(),
+        "{delivered}"
+    );
+
+    let ack = helper
+        .call(serde_json::json!({ "action": "reply", "messageId": message_id, "text": "answer" }))
+        .await;
+    assert_eq!(ack["status"], "ok", "{ack}");
+    assert!(
+        me_inbox
+            .wait_for(&format!("[xmsg] reply to message_id={message_id}"))
+            .await,
+        "the reply is pushed into the Claude session"
+    );
+    let line = me_inbox.wait_line().await.unwrap();
+    assert_eq!(from_name(&line), format!("helper@{}", node_name()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_4_service_sender_gets_a_claude_reply_in_its_inbox() {
+    let tmp = tempdir().unwrap();
+    let node = Node::start(tmp.path(), &["asker"]);
+    let mut asker = Service::register(&node, "asker").await;
+    let target = Sleeper::new();
+    let target_inbox = inbox();
+    claude_file(&node, "t", target.pid(), ID_T, "expert", &target_inbox.sock);
+
+    // The service sends over agent.sock, attributed by its pid (plan §6 D15).
+    let resp = node
+        .agent(serde_json::json!({ "action": "send", "to": ID_T, "text": "please answer" }))
+        .await;
+    assert_eq!(resp["status"], "ok", "{resp}");
+    let message_id = resp["message_id"].as_str().unwrap().to_string();
+    let line = target_inbox.wait_line().await.expect("delivered");
+    assert_eq!(from_name(&line), format!("asker@{}", node_name()));
+
+    // The conversation moves to this process: the old holder exits, and this process
+    // takes the plain ID and answers as the recipient.
+    fs::remove_file(node.sessions.join(format!("{}_t.json", target.pid()))).unwrap();
+    target.end();
+    node.list().await;
+    let me_inbox = inbox();
+    claude_file(
+        &node,
+        "me",
+        std::process::id(),
+        ID_T,
+        "expert",
+        &me_inbox.sock,
+    );
+    let resp = node
+        .agent(serde_json::json!({ "action": "reply", "message_id": message_id, "text": "the answer" }))
+        .await;
+    assert_eq!(resp["status"], "ok", "{resp}");
+    assert_eq!(resp["reply"]["pushOutcome"], "pushed", "{resp}");
+
+    let pushed = asker
+        .poll(3)
+        .await
+        .expect("the reply lands in the service's inbox");
+    assert_eq!(pushed["inReplyTo"], message_id.as_str(), "{pushed}");
+    assert_eq!(pushed["text"], "the answer");
+    assert_eq!(pushed["origin"]["id"], ID_T, "{pushed}");
+}
+
+// =============================================================================
+// Oracle 5 (A10, A-12). A sender reads the stored reply with `replies`, and
+// `wait=600` returns within the 60 s cap.
+// Mutant: no cap. The call is bounded by a timeout, so a hang is RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_5_replies_reads_the_stored_reply_and_caps_wait() {
+    let tmp = tempdir().unwrap();
+    let node = Node::start(tmp.path(), &["answerer"]);
+    let mut answerer = Service::register(&node, "answerer").await;
+
+    let (status, body) = node.send("answerer", "anonymous question").await;
+    assert_eq!(status, 202, "{body}");
+    let message_id = body["message_id"].as_str().unwrap().to_string();
+    let delivered = answerer.poll(3).await.expect("delivered");
+    let ack = answerer
+        .call(serde_json::json!({ "action": "reply", "messageId": message_id, "text": "stored answer" }))
+        .await;
+    assert_eq!(ack["status"], "ok", "{ack}");
+    assert_eq!(delivered["origin"]["label"], "ci", "{delivered}");
+
+    let (status, body) = node
+        .http("GET", &format!("/v1/messages/{message_id}/replies"), None)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("stored answer"), "HTTP replies: {body}");
+    let resp = agent_within(
+        &node,
+        serde_json::json!({ "action": "replies", "message_id": message_id }),
+        5,
+    )
+    .await;
+    assert_eq!(resp["status"], "ok", "{resp}");
+    assert_eq!(resp["replies"][0]["text"], "stored answer", "{resp}");
+
+    // An unanswered message: `wait=600` comes back empty at the 60 s cap.
+    let (status, body) = node.send("answerer", "never answered").await;
+    assert_eq!(status, 202, "{body}");
+    let unanswered = body["message_id"].as_str().unwrap().to_string();
+    let started = std::time::Instant::now();
+    let resp = agent_within(
+        &node,
+        serde_json::json!({ "action": "replies", "message_id": unanswered, "wait": 600 }),
+        75,
+    )
+    .await;
+    let waited = started.elapsed();
+    assert_eq!(resp["status"], "ok", "{resp}");
+    assert_eq!(resp["replies"], serde_json::json!([]), "{resp}");
+    assert!(
+        waited >= Duration::from_secs(55) && waited <= Duration::from_secs(70),
+        "wait=600 is capped at 60 s: waited {waited:?}"
+    );
+}
+
+// =============================================================================
+// Oracle 6 (the deploy-skew oracle, plan §6 D3). Old clients are refused: the old
+// HTTP routes are gone and an old agent.sock send frame is `bad_request` naming `ref`.
+// Mutant: accept unknown fields => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_6_old_clients_are_refused() {
+    let tmp = tempdir().unwrap();
+    let node = Node::start(tmp.path(), &[]);
+    let (status, body) = node.http("GET", "/v1/sessions", None).await;
+    assert_eq!(status, 404, "GET /v1/sessions is gone: {body}");
+    let (status, body) = node
+        .http(
+            "POST",
+            "/v1/sessions/x/messages",
+            Some(serde_json::json!({ "from": "ci", "text": "old" })),
+        )
+        .await;
+    assert_eq!(
+        status, 404,
+        "POST /v1/sessions/{{ref}}/messages is gone: {body}"
+    );
+    let (status, body) = node.http("GET", "/v1/recipients?peer=x", None).await;
+    assert_eq!(status, 400, "?peer= has no alias: {body}");
+    let (status, body) = node
+        .http(
+            "POST",
+            "/v1/messages",
+            Some(serde_json::json!({ "to": "x", "text": "old", "push_replies": false })),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.contains("push_replies"),
+        "the refusal names the field: {body}"
+    );
+
+    let resp = node
+        .agent(serde_json::json!({
+            "action": "send",
+            "ref": "x",
+            "text": "old client",
+            "push_replies": true,
+        }))
+        .await;
+    assert_eq!(resp["status"], "error", "{resp}");
+    assert_eq!(resp["error"], "bad_request", "{resp}");
+    assert!(
+        resp["detail"].as_str().unwrap().contains("`ref`"),
+        "the refusal names `ref`: {resp}"
+    );
+}
+
+// =============================================================================
+// Oracle 7 (A13). A resolved address doesn't drift: `send` by `foo` returns `id@node`,
+// and after a second `foo` appears a follow-up to that address still reaches the first.
+// Mutant: return the name instead => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_7_send_returns_the_resolved_address() {
+    let tmp = tempdir().unwrap();
+    let node = Node::start(tmp.path(), &[]);
+    let (p1, p2) = (Sleeper::new(), Sleeper::new());
+    let (in1, in2) = (inbox(), inbox());
+    claude_file(&node, "a", p1.pid(), ID_A, "foo", &in1.sock);
+
+    let (status, body) = node.send("foo", "first").await;
+    assert_eq!(status, 202, "{body}");
+    let address = body["address"].as_str().unwrap().to_string();
+    assert_eq!(address, format!("{ID_A}@{}", node_name()), "{body}");
+    assert_eq!(body["outcome"], "delivered", "{body}");
+    assert!(in1.wait_for("first").await);
+
+    claude_file(&node, "b", p2.pid(), ID_B, "foo", &in2.sock);
+    let (status, body) = node.send("foo", "by name").await;
+    assert_eq!(status, 409, "two foo are ambiguous now: {body}");
+
+    let (status, body) = node.send(&address, "follow-up").await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["address"], address.as_str(), "{body}");
+    assert!(
+        in1.wait_for("follow-up").await,
+        "the address reaches the first"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(in2.is_empty(), "the second foo never gets the follow-up");
+}
+
+// =============================================================================
+// Oracle 10 (A13). MCP: `tools/list` shows four tools, or two in reply-only mode, and
+// an MCP `send` carries no `idempotency_key`.
+// Mutant: keep three tools => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_10_mcp_four_tools_and_no_idempotency_key() {
+    let tmp = tempdir().unwrap();
+    let run = tmp.path().join("run");
+    fs::create_dir_all(&run).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = run.join("agent.sock");
+
+    // A stand-in agent.sock that records the frame MCP sends.
+    let listener = UnixListener::bind(&sock).unwrap();
+    let frames = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let seen = frames.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (r, mut w) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(r).read_line(&mut line).await.unwrap();
+            seen.lock()
+                .unwrap()
+                .push(serde_json::from_str(&line).unwrap());
+            let ok = serde_json::json!({ "status": "ok", "message_id": "M", "address": "x@n", "outcome": "delivered" });
+            let _ = w.write_all(format!("{ok}\n").as_bytes()).await;
+        }
+    });
+
+    let config = xmsg::mcp::McpConfig::new(vec![], "http://127.0.0.1:9".to_string())
+        .with_agent_sock(sock.clone());
+    let res = tokio::task::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::new();
+        let list = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let names = |config: &xmsg::mcp::McpConfig| -> Vec<String> {
+            let resp = xmsg::mcp::handle_jsonrpc(config, &client, &list).unwrap();
+            resp["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let mut reply_only = config.clone();
+        reply_only.reply_only = true;
+        let tools = (names(&config), names(&reply_only));
+        let ok = xmsg::mcp::execute_tool(
+            &config,
+            &client,
+            "send",
+            &serde_json::json!({ "to": "x", "text": "hi" }),
+        );
+        let refused = xmsg::mcp::execute_tool(
+            &config,
+            &client,
+            "send",
+            &serde_json::json!({ "to": "x", "text": "hi", "idempotency_key": "k" }),
+        );
+        (ok, refused, tools)
+    })
+    .await
+    .unwrap();
+    assert_eq!(res.2 .0, ["list", "send", "reply", "replies"]);
+    assert_eq!(res.2 .1, ["reply", "replies"], "reply-only mode");
+
+    let send_schema = xmsg::mcp::tool_definitions()
+        .into_iter()
+        .find(|t| t["name"] == "send")
+        .unwrap();
+    assert!(
+        send_schema["inputSchema"]["properties"]
+            .get("idempotency_key")
+            .is_none(),
+        "MCP send declares no idempotency_key: {send_schema}"
+    );
+    assert_eq!(res.0["isError"], false, "{}", res.0);
+    assert_eq!(res.1["isError"], true, "{}", res.1);
+    let frames = frames.lock().unwrap().clone();
+    assert_eq!(
+        frames.len(),
+        1,
+        "only the valid send reached agent.sock: {frames:?}"
+    );
+    assert_eq!(
+        frames[0],
+        serde_json::json!({ "action": "send", "to": "x", "text": "hi" }),
+        "the MCP send frame carries no idempotency_key"
+    );
+}
+
+// =============================================================================
+// Oracle 11 (A3, B4). There is no hop in the grammar: `send` with `to = x@dest@hub`
+// returns `bad_request`, over HTTP and over agent.sock.
+// Mutant: keep X26's hop parse for `to` => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_11_no_hop_in_the_grammar() {
+    let tmp = tempdir().unwrap();
+    let node = Node::start(tmp.path(), &[]);
+    let me_inbox = inbox();
+    claude_file(&node, "me", std::process::id(), ID_L, "me", &me_inbox.sock);
+
+    let (status, body) = node.send("x@dest@hub", "hop").await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "bad_request", "{body}");
+    let resp = node
+        .agent(serde_json::json!({ "action": "send", "to": "x@dest@hub", "text": "hop" }))
+        .await;
+    assert_eq!(resp["error"], "bad_request", "{resp}");
 }

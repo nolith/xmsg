@@ -34,12 +34,7 @@ fn get_free_port() -> u16 {
     listener.local_addr().expect("local addr").port()
 }
 
-async fn send_via_agent_sock(
-    agent_sock: &Path,
-    target_ref: &str,
-    text: &str,
-    push_replies: bool,
-) -> Value {
+async fn send_via_agent_sock(agent_sock: &Path, target_ref: &str, text: &str) -> Value {
     let stream = UnixStream::connect(agent_sock)
         .await
         .expect("connect to agent.sock");
@@ -48,9 +43,8 @@ async fn send_via_agent_sock(
 
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": target_ref,
+        "to": target_ref,
         "text": text,
-        "push_replies": push_replies,
     });
     writer
         .write_all(format!("{send_req}\n").as_bytes())
@@ -71,7 +65,7 @@ async fn reply_via_agent_sock(agent_sock: &Path, message_id: &str, text: &str) -
 
     let reply_req = serde_json::json!({
         "action": "reply",
-        "messageId": message_id,
+        "message_id": message_id,
         "text": text,
     });
     writer
@@ -330,6 +324,7 @@ where
 // Line: test_oracle_1_relay_and_reply
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_1_relay_and_reply() {
     run_test_with_port_retry("test_oracle_1_relay_and_reply", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -388,7 +383,6 @@ async fn test_oracle_1_relay_and_reply() {
             &node_a.agent_sock,
             "bob@node-b@hub",
             "Hello Bob from Alice via Hub!",
-            true,
         )
         .await;
 
@@ -455,6 +449,7 @@ async fn test_oracle_1_relay_and_reply() {
 // Line: test_oracle_2_polling_sender
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_2_polling_sender() {
     run_test_with_port_retry("test_oracle_2_polling_sender", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -509,12 +504,11 @@ async fn test_oracle_2_polling_sender() {
             &node_a.agent_sock,
             "bob@node-b@hub",
             "Polling sender test message",
-            false,
         )
         .await;
 
         assert_eq!(send_resp["status"], "ok");
-        let sent_msg_id = send_resp["delivery"]["messageId"].as_str().unwrap();
+        let sent_msg_id = send_resp["message_id"].as_str().unwrap();
 
         let b_msg = wait_for_inbox_message(&rx_b, Duration::from_secs(5))
             .await
@@ -572,6 +566,7 @@ async fn test_oracle_2_polling_sender() {
 // Line: test_oracle_3_undialable_client
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_3_undialable_client() {
     run_test_with_port_retry("test_oracle_3_undialable_client", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -631,7 +626,6 @@ async fn test_oracle_3_undialable_client() {
             &node_a.agent_sock,
             "bob@node-b@hub",
             "Outbound client send to Bob",
-            true,
         )
         .await;
 
@@ -669,6 +663,7 @@ async fn test_oracle_3_undialable_client() {
 // Line: test_oracle_4_gates
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_4_gates() {
     run_test_with_port_retry("test_oracle_4_gates", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -727,17 +722,12 @@ async fn test_oracle_4_gates() {
             create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
 
         // Gate 4a: Send through Hub without "forward" capability must fail with no_forward
-        let res_4a = send_via_agent_sock(
-            &node_a.agent_sock,
-            "bob@node-b@hub",
-            "Test lacking forward",
-            true,
-        )
-        .await;
+        let res_4a =
+            send_via_agent_sock(&node_a.agent_sock, "bob@node-b@hub", "Test lacking forward").await;
 
         assert_eq!(res_4a["status"], "error");
         assert_eq!(
-            res_4a["error"], "no_forward",
+            res_4a["error"], "denied",
             "4a: H must refuse send lacking 'forward' with no_forward: {:?}",
             res_4a
         );
@@ -746,6 +736,7 @@ async fn test_oracle_4_gates() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_4b_recipient_relayed_gate() {
     run_test_with_port_retry("test_oracle_4b_recipient_relayed_gate", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -800,13 +791,12 @@ async fn test_oracle_4b_recipient_relayed_gate() {
             &node_a.agent_sock,
             "bob@node-b@hub",
             "Test lacking relayed on B",
-            true,
         )
         .await;
 
         assert_eq!(res_4b["status"], "error");
         assert_eq!(
-            res_4b["error"], "op_denied",
+            res_4b["error"], "denied",
             "4b: B must refuse forwarded message lacking 'relayed' with op_denied: {:?}",
             res_4b
         );
@@ -815,6 +805,7 @@ async fn test_oracle_4b_recipient_relayed_gate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_4c_dest_targets_gate() {
     run_test_with_port_retry("test_oracle_4c_dest_targets_gate", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -870,13 +861,12 @@ async fn test_oracle_4c_dest_targets_gate() {
             &node_a.agent_sock,
             "forbidden_bob@node-b@hub",
             "Test targets check",
-            true,
         )
         .await;
 
         assert_eq!(res_4c["status"], "error");
         assert_eq!(
-            res_4c["error"], "op_denied",
+            res_4c["error"], "denied",
             "4c: H must check dest targets and reject forbidden ref with op_denied: {:?}",
             res_4c
         );
@@ -891,6 +881,7 @@ async fn test_oracle_4c_dest_targets_gate() {
 // Line: test_oracle_5_one_hop
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_5_one_hop() {
     run_test_with_port_retry("test_oracle_5_one_hop", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -961,13 +952,12 @@ async fn test_oracle_5_one_hop() {
             &node_a.agent_sock,
             "bob@node-b@hub2@hub1",
             "Two-hop attempt",
-            true,
         )
         .await;
 
         assert_eq!(res["status"], "error");
         assert_eq!(
-            res["error"], "no_forward",
+            res["error"], "denied",
             "H2 must refuse already-forwarded envelope with no_forward: {:?}",
             res
         );
@@ -982,6 +972,7 @@ async fn test_oracle_5_one_hop() {
 // Line: test_oracle_6_off_by_default
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_6_off_by_default() {
     run_test_with_port_retry("test_oracle_6_off_by_default", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -1035,13 +1026,12 @@ async fn test_oracle_6_off_by_default() {
             &node_a.agent_sock,
             "bob@node-b@hub",
             "Send to unconfigured hub",
-            true,
         )
         .await;
 
         assert_eq!(res["status"], "error");
         assert_eq!(
-            res["error"], "no_forward",
+            res["error"], "denied",
             "Hub without forward capability must refuse with no_forward: {:?}",
             res
         );
@@ -1050,16 +1040,15 @@ async fn test_oracle_6_off_by_default() {
 }
 
 // =============================================================================
-// Oracle 6b: Direct federated send with push_replies: false records disabled
-// A direct fed send A->B with push_replies: false: B's session replies, and
-// B's reply record has push_outcome "disabled" with NO push attempted.
+// Oracle 6b (as amended by XA3, A10/A-2): a direct federated send A->B; B's session
+// replies, and the reply is pushed back to the origin, which delivers it to the sender.
 // Mutant: unconditional push to return_host without is_forwarded check => RED (push_failed)
-// Line: test_oracle_6b_direct_send_push_replies_false_disabled
+// Line: test_oracle_6b_direct_send_reply_pushed_back
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_oracle_6b_direct_send_push_replies_false_disabled() {
+async fn test_oracle_6b_direct_send_reply_pushed_back() {
     run_test_with_port_retry(
-        "test_oracle_6b_direct_send_push_replies_false_disabled",
+        "test_oracle_6b_direct_send_reply_pushed_back",
         || async move {
             let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
             let (cert_b, key_b, pin_b) = generate_self_signed_ed25519_pem("node-b").unwrap();
@@ -1098,7 +1087,6 @@ async fn test_oracle_6b_direct_send_push_replies_false_disabled() {
                 &node_a.agent_sock,
                 "bob@node-b",
                 "Direct send without push replies",
-                false,
             )
             .await;
 
@@ -1119,22 +1107,20 @@ async fn test_oracle_6b_direct_send_push_replies_false_disabled() {
             .await;
 
             assert_eq!(reply_res["status"], "ok");
-            // H0 invariant: direct non-push send records pushOutcome == "disabled"
+            // A-2: the reply travels back to the origin node, which pushes it to Alice
+            // (a session has an inbox; the per-message opt-out is gone).
             assert_eq!(
-                reply_res["reply"]["pushOutcome"], "disabled",
-                "Direct send reply must record pushOutcome = disabled: {:?}",
+                reply_res["reply"]["pushOutcome"], "pushed",
+                "Direct send reply is pushed back to the origin: {:?}",
                 reply_res
             );
-
-            // Verify no push was attempted to Alice's inbox
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            {
-                let guard = rx_a.lock().unwrap();
-                assert!(
-                    guard.is_empty(),
-                    "Alice inbox should receive zero pushed replies"
-                );
-            }
+            let a_msg = wait_for_inbox_message(&rx_a, Duration::from_secs(5))
+                .await
+                .expect("Alice receives the pushed reply");
+            assert!(
+                a_msg.contains("Bob direct reply to non-push sender"),
+                "{a_msg}"
+            );
         },
     )
     .await;

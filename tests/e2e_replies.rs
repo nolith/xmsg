@@ -10,8 +10,9 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use xmsg::agent::run_agent_server;
 use xmsg::http::{build_router, AppState, MessageDetailResponse};
-use xmsg::inbox::{self, DeliveryResponse};
+use xmsg::inbox;
 use xmsg::storage::ReplyRecord;
+use xmsg::surface::SendResult as DeliveryResponse;
 
 fn get_self_proc_start() -> String {
     xmsg::process::starttime(
@@ -49,7 +50,7 @@ async fn post_agent_sock_reply(
         .map_err(|e| e.to_string())?;
     let req = serde_json::json!({
         "action": "reply",
-        "messageId": message_id,
+        "message_id": message_id,
         "text": text
     });
     stream
@@ -207,15 +208,13 @@ async fn test_reply_roundtrip_and_envelope_footer() {
 
     // 1. Deliver message to recipient
     let post_msg_payload = serde_json::json!({
+        "to": "recipient-worker",
         "from": "orchestrator",
         "text": "Review pull request #42"
     });
 
     let res = client
-        .post(format!(
-            "{}/v1/sessions/recipient-worker/messages",
-            harness.base_url
-        ))
+        .post(format!("{}/v1/messages", harness.base_url))
         .json(&post_msg_payload)
         .send()
         .await
@@ -223,8 +222,7 @@ async fn test_reply_roundtrip_and_envelope_footer() {
 
     assert_eq!(res.status(), reqwest::StatusCode::ACCEPTED);
     let delivery: DeliveryResponse = res.json().await.unwrap();
-    assert_eq!(delivery.session_id, "sess-recipient-1111");
-    assert_eq!(delivery.from_name, "orchestrator · anon@test-host");
+    assert_eq!(delivery.address, "sess-recipient-1111@test-host");
     assert!(!delivery.message_id.is_empty());
     let message_id = delivery.message_id;
 
@@ -258,7 +256,7 @@ async fn test_reply_roundtrip_and_envelope_footer() {
     );
     drop(lines);
 
-    // 3a. Red Demo 1: HTTP POST to /v1/messages/{id}/replies returns 405 Method Not Allowed
+    // 3a. Red Demo 1: an HTTP caller cannot reply on the session's behalf
     let http_res = client
         .post(format!(
             "{}/v1/messages/{}/replies",
@@ -271,7 +269,9 @@ async fn test_reply_roundtrip_and_envelope_footer() {
         .send()
         .await
         .unwrap();
-    assert_eq!(http_res.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    // The body cannot name the replier (A13: `{text}` only); an anonymous HTTP caller has
+    // received nothing to reply to (A15).
+    assert_eq!(http_res.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // 3b. POST reply via agent.sock
     let reply = post_agent_sock_reply(
@@ -326,14 +326,12 @@ async fn test_reply_not_recipient_403() {
 
     // Deliver message to recipient (sess-recipient-1111)
     let post_msg_payload = serde_json::json!({
+        "to": "recipient-worker",
         "from": "orchestrator",
         "text": "For recipient only"
     });
     let res = client
-        .post(format!(
-            "{}/v1/sessions/recipient-worker/messages",
-            harness.base_url
-        ))
+        .post(format!("{}/v1/messages", harness.base_url))
         .json(&post_msg_payload)
         .send()
         .await
@@ -373,7 +371,7 @@ async fn test_reply_not_recipient_403() {
     .await
     .unwrap_err();
 
-    assert_eq!(err, "not_recipient");
+    assert_eq!(err, "denied");
 }
 
 #[tokio::test]
@@ -393,11 +391,8 @@ async fn test_reply_error_conditions() {
 
     // Deliver a valid message for remaining tests
     let res = client
-        .post(format!(
-            "{}/v1/sessions/recipient-worker/messages",
-            harness.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", harness.base_url))
+        .json(&serde_json::json!({"to": "recipient-worker",
             "from": "tester",
             "text": "Valid message"
         }))
@@ -413,7 +408,7 @@ async fn test_reply_error_conditions() {
         .unwrap_err();
     assert_eq!(err, "bad_request");
 
-    // 3. HTTP POST to /v1/messages/{id}/replies returns 405 Method Not Allowed
+    // 3. HTTP POST to /v1/messages/{id}/replies from an anonymous caller is denied
     let res = client
         .post(format!(
             "{}/v1/messages/{valid_id}/replies",
@@ -425,7 +420,12 @@ async fn test_reply_error_conditions() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(
+        body["error"], "denied",
+        "an anonymous HTTP caller may not reply (A15)"
+    );
 }
 
 #[tokio::test]
@@ -435,11 +435,8 @@ async fn test_long_poll_replies() {
 
     // 1. Deliver message
     let res = client
-        .post(format!(
-            "{}/v1/sessions/recipient-worker/messages",
-            harness.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", harness.base_url))
+        .json(&serde_json::json!({"to": "recipient-worker",
             "from": "orchestrator",
             "text": "Ping"
         }))
@@ -530,11 +527,8 @@ async fn test_ttl_purge_on_reply() {
 
     // Deliver message
     let res = client
-        .post(format!(
-            "{}/v1/sessions/recipient-worker/messages",
-            harness.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", harness.base_url))
+        .json(&serde_json::json!({"to": "recipient-worker",
             "from": "orchestrator",
             "text": "Test TTL"
         }))

@@ -195,9 +195,9 @@ async fn start_server(
 async fn test_oracle_1_send_twice_one_key_one_delivery() {
     let harness = start_harness(None).await;
     let client = reqwest::Client::new();
-    let url = format!("{}/v1/sessions/target-worker/messages", harness.base_url);
+    let url = format!("{}/v1/messages", harness.base_url);
 
-    let payload = serde_json::json!({
+    let payload = serde_json::json!({"to": "target-worker",
         "from": "sender-alpha",
         "text": "deterministic payload",
         "idempotency_key": "x10-key-oracle-1"
@@ -207,9 +207,9 @@ async fn test_oracle_1_send_twice_one_key_one_delivery() {
     let res1 = client.post(&url).json(&payload).send().await.unwrap();
     assert_eq!(res1.status(), reqwest::StatusCode::ACCEPTED);
     let json1: serde_json::Value = res1.json().await.unwrap();
-    let msg_id1 = json1["messageId"]
+    let msg_id1 = json1["message_id"]
         .as_str()
-        .expect("messageId in response")
+        .expect("message_id in response")
         .to_string();
     assert!(!msg_id1.is_empty());
 
@@ -224,7 +224,9 @@ async fn test_oracle_1_send_twice_one_key_one_delivery() {
     let res2 = client.post(&url).json(&payload).send().await.unwrap();
     assert_eq!(res2.status(), reqwest::StatusCode::ACCEPTED);
     let json2: serde_json::Value = res2.json().await.unwrap();
-    let msg_id2 = json2["messageId"].as_str().expect("messageId in response");
+    let msg_id2 = json2["message_id"]
+        .as_str()
+        .expect("message_id in response");
 
     assert_eq!(
         msg_id1, msg_id2,
@@ -245,9 +247,9 @@ async fn test_oracle_1_send_twice_one_key_one_delivery() {
 async fn test_oracle_2_same_key_different_body_409() {
     let harness = start_harness(None).await;
     let client = reqwest::Client::new();
-    let url = format!("{}/v1/sessions/target-worker/messages", harness.base_url);
+    let url = format!("{}/v1/messages", harness.base_url);
 
-    let payload1 = serde_json::json!({
+    let payload1 = serde_json::json!({"to": "target-worker",
         "from": "sender-alpha",
         "text": "first body",
         "idempotency_key": "x10-key-oracle-2"
@@ -261,6 +263,7 @@ async fn test_oracle_2_same_key_different_body_409() {
 
     // Send 2: same key, different body
     let payload2 = serde_json::json!({
+        "to": "target-worker",
         "from": "sender-alpha",
         "text": "second conflicting body",
         "idempotency_key": "x10-key-oracle-2"
@@ -290,9 +293,9 @@ async fn test_oracle_2_same_key_different_body_409() {
 async fn test_oracle_3_different_principals_independent() {
     let harness = start_harness(None).await;
     let client = reqwest::Client::new();
-    let url = format!("{}/v1/sessions/target-worker/messages", harness.base_url);
+    let url = format!("{}/v1/messages", harness.base_url);
 
-    let payload_alice = serde_json::json!({
+    let payload_alice = serde_json::json!({"to": "target-worker",
         "from": "alice",
         "text": "message from alice",
         "idempotency_key": "shared-client-key"
@@ -301,13 +304,14 @@ async fn test_oracle_3_different_principals_independent() {
     let res_alice = client.post(&url).json(&payload_alice).send().await.unwrap();
     assert_eq!(res_alice.status(), reqwest::StatusCode::ACCEPTED);
     let json_alice: serde_json::Value = res_alice.json().await.unwrap();
-    let msg_id_alice = json_alice["messageId"].as_str().unwrap().to_string();
+    let msg_id_alice = json_alice["message_id"].as_str().unwrap().to_string();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(harness.received_lines.lock().await.len(), 1);
 
     // Bob sends with the SAME key but his own identity (and different text)
     let payload_bob = serde_json::json!({
+        "to": "target-worker",
         "from": "bob",
         "text": "message from bob",
         "idempotency_key": "shared-client-key"
@@ -320,7 +324,7 @@ async fn test_oracle_3_different_principals_independent() {
         "Different principal with same key must succeed independently"
     );
     let json_bob: serde_json::Value = res_bob.json().await.unwrap();
-    let msg_id_bob = json_bob["messageId"].as_str().unwrap().to_string();
+    let msg_id_bob = json_bob["message_id"].as_str().unwrap().to_string();
 
     assert_ne!(
         msg_id_alice, msg_id_bob,
@@ -354,6 +358,8 @@ async fn test_oracle_4_survives_server_restart_persisted() {
 
     let client = reqwest::Client::new();
     let payload = serde_json::json!({
+        "to": "target-worker",
+        "to": "target-worker",
         "from": "persisted-sender",
         "text": "payload to survive restart",
         "idempotency_key": "x10-persist-key"
@@ -363,12 +369,12 @@ async fn test_oracle_4_survives_server_restart_persisted() {
     let original_msg_id = {
         let (base_url1, _, server_task1, agent_task1) =
             start_server(sess_dir.path(), None, Some(db_path.clone())).await;
-        let url1 = format!("{}/v1/sessions/target-worker/messages", base_url1);
+        let url1 = format!("{}/v1/messages", base_url1);
 
         let res1 = client.post(&url1).json(&payload).send().await.unwrap();
         assert_eq!(res1.status(), reqwest::StatusCode::ACCEPTED);
         let json1: serde_json::Value = res1.json().await.unwrap();
-        let id = json1["messageId"].as_str().unwrap().to_string();
+        let id = json1["message_id"].as_str().unwrap().to_string();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(received_lines.lock().await.len(), 1);
@@ -384,13 +390,13 @@ async fn test_oracle_4_survives_server_restart_persisted() {
     // Server 2: starts using the same db_path and same sess_dir
     let (base_url2, _, server_task2, agent_task2) =
         start_server(sess_dir.path(), None, Some(db_path.clone())).await;
-    let url2 = format!("{}/v1/sessions/target-worker/messages", base_url2);
+    let url2 = format!("{}/v1/messages", base_url2);
 
     // Send duplicate to server 2: must return original messageId and deliver nothing
     let res2 = client.post(&url2).json(&payload).send().await.unwrap();
     assert_eq!(res2.status(), reqwest::StatusCode::ACCEPTED);
     let json2: serde_json::Value = res2.json().await.unwrap();
-    let replayed_msg_id = json2["messageId"].as_str().unwrap();
+    let replayed_msg_id = json2["message_id"].as_str().unwrap();
 
     assert_eq!(
         replayed_msg_id, original_msg_id,
@@ -406,6 +412,7 @@ async fn test_oracle_4_survives_server_restart_persisted() {
 
     // Also verify conflict check survives restart:
     let payload_conflict = serde_json::json!({
+        "to": "target-worker",
         "from": "persisted-sender",
         "text": "tampered body after restart",
         "idempotency_key": "x10-persist-key"
@@ -428,7 +435,7 @@ async fn test_oracle_4_survives_server_restart_persisted() {
 }
 
 /// Oracle 5: Attested session (agent.sock) and anonymous HTTP caller with identical idempotency key
-/// are isolated by principal (session:<id> vs http:<from>) and do not collide or hijack keys.
+/// are isolated by principal (the instance ID vs anon:<from>) and do not collide or hijack keys.
 #[tokio::test]
 async fn test_oracle_5_attested_agent_and_anonymous_http_principal_isolation() {
     let harness = start_harness(None).await;
@@ -440,7 +447,7 @@ async fn test_oracle_5_attested_agent_and_anonymous_http_principal_isolation() {
 
     let agent_req = serde_json::json!({
         "action": "send",
-        "ref": "target-worker",
+        "to": "target-worker",
         "text": "attested message body from agent",
         "idempotency_key": "cross-protocol-shared-key"
     });
@@ -453,7 +460,7 @@ async fn test_oracle_5_attested_agent_and_anonymous_http_principal_isolation() {
     agent_reader.read_line(&mut agent_line).await.unwrap();
     let agent_resp: serde_json::Value = serde_json::from_str(&agent_line).unwrap();
     assert_eq!(agent_resp["status"], "ok");
-    let agent_msg_id = agent_resp["delivery"]["messageId"]
+    let agent_msg_id = agent_resp["message_id"]
         .as_str()
         .expect("agent messageId")
         .to_string();
@@ -467,8 +474,8 @@ async fn test_oracle_5_attested_agent_and_anonymous_http_principal_isolation() {
 
     // 2. Anonymous HTTP send with identical key and declared from matching session
     let client = reqwest::Client::new();
-    let http_url = format!("{}/v1/sessions/target-worker/messages", harness.base_url);
-    let http_req = serde_json::json!({
+    let http_url = format!("{}/v1/messages", harness.base_url);
+    let http_req = serde_json::json!({"to": "target-worker",
         "from": "live-session-1234",
         "text": "anonymous http message body",
         "idempotency_key": "cross-protocol-shared-key"
@@ -477,7 +484,7 @@ async fn test_oracle_5_attested_agent_and_anonymous_http_principal_isolation() {
     let res_http = client.post(&http_url).json(&http_req).send().await.unwrap();
     assert_eq!(res_http.status(), reqwest::StatusCode::ACCEPTED);
     let http_json: serde_json::Value = res_http.json().await.unwrap();
-    let http_msg_id = http_json["messageId"]
+    let http_msg_id = http_json["message_id"]
         .as_str()
         .expect("http messageId")
         .to_string();
@@ -508,7 +515,7 @@ async fn test_oracle_5_attested_agent_and_anonymous_http_principal_isolation() {
     let agent_resp2: serde_json::Value = serde_json::from_str(&agent_line2).unwrap();
     assert_eq!(agent_resp2["status"], "ok");
     assert_eq!(
-        agent_resp2["delivery"]["messageId"].as_str().unwrap(),
+        agent_resp2["message_id"].as_str().unwrap(),
         agent_msg_id,
         "Agent replay must return original agent messageId"
     );
@@ -525,7 +532,7 @@ async fn test_oracle_5_attested_agent_and_anonymous_http_principal_isolation() {
     assert_eq!(res_http_replay.status(), reqwest::StatusCode::ACCEPTED);
     let http_replay_json: serde_json::Value = res_http_replay.json().await.unwrap();
     assert_eq!(
-        http_replay_json["messageId"].as_str().unwrap(),
+        http_replay_json["message_id"].as_str().unwrap(),
         http_msg_id,
         "HTTP replay must return original http messageId"
     );
@@ -539,6 +546,7 @@ async fn test_oracle_5_attested_agent_and_anonymous_http_principal_isolation() {
 
     // 5. Conflicting HTTP body returns 409 Conflict without affecting agent record
     let http_conflict_req = serde_json::json!({
+        "to": "target-worker",
         "from": "live-session-1234",
         "text": "tampered conflicting http body",
         "idempotency_key": "cross-protocol-shared-key"
@@ -554,25 +562,26 @@ async fn test_oracle_5_attested_agent_and_anonymous_http_principal_isolation() {
     // 6. Verify SQLite table has two independent records under distinct principals
     {
         let db = harness.db.lock().unwrap();
+        // Keyed on the instance ID for the session, `anon:<from>` for the anonymous
+        // caller (A15).
         let agent_rec = xmsg::storage::get_idempotency_record(
             &db,
-            "session:live-session-1234",
+            "live-session-1234",
             "cross-protocol-shared-key",
             86400,
         )
         .unwrap()
-        .expect("agent idempotency record must exist under session:live-session-1234");
+        .expect("agent idempotency record must exist under its instance ID");
         assert_eq!(agent_rec.message_id, agent_msg_id);
 
-        let http_from_name = http_json["fromName"].as_str().unwrap();
         let http_rec = xmsg::storage::get_idempotency_record(
             &db,
-            &format!("http:{http_from_name}"),
+            "anon:live-session-1234",
             "cross-protocol-shared-key",
             86400,
         )
         .unwrap()
-        .expect("http idempotency record must exist under http:<from_name>");
+        .expect("http idempotency record must exist under anon:<from>");
         assert_eq!(http_rec.message_id, http_msg_id);
     }
 }

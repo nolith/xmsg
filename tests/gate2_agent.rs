@@ -168,17 +168,26 @@ async fn setup(max_body: usize) -> Env {
         tokio::spawn(async move {
             let _ = run_register_server(
                 a,
-                b,
-                c,
-                d,
-                e,
-                f,
-                ttl,
+                std::sync::Arc::new(xmsg::http::AppState {
+                    sessions_dirs: vec![],
+                    agy_config: b,
+                    agy_store: c,
+                    pi_store: d,
+                    pi_notify_tx: f,
+                    svc_store: xmsg::svc::new_svc_store(),
+                    svc_notify_tx: tokio::sync::broadcast::channel(16).0,
+                    node_name: xmsg::node::local_node_name(),
+                    max_body: 65536,
+                    request_counter: std::sync::atomic::AtomicU64::new(1),
+                    db: e,
+                    notify_tx: tokio::sync::broadcast::channel(16).0,
+                    reply_ttl: ttl,
+                    idempotency_ttl: std::time::Duration::from_secs(86400),
+                    long_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
+                    fed_state: None,
+                }),
                 uid,
-                xmsg::svc::new_svc_store(),
                 std::collections::HashMap::new(),
-                tokio::sync::broadcast::channel(16).0,
-                None,
             )
             .await;
         });
@@ -237,7 +246,6 @@ fn msg(db: &Arc<Mutex<rusqlite::Connection>>, id: &str, sid: &str, h: &str) {
             recipient_harness: h.into(),
             return_harness: None,
             return_session_id: None,
-            push_replies: false,
             thread_id: id.into(),
             return_host: None,
         },
@@ -279,18 +287,18 @@ async fn gate2_identity() {
     // Probe: reply to victim-claude MSG1 as registered pi -> must be rejected (not_recipient)
     let o = agent_call(
         &e.ag,
-        serde_json::json!({"action":"reply","messageId":"MSG1","text":"forged"}),
+        serde_json::json!({"action":"reply","message_id":"MSG1","text":"forged"}),
     )
     .await;
     let reply_err: serde_json::Value = serde_json::from_str(&o).unwrap();
     assert_eq!(reply_err["status"], "error");
-    assert_eq!(reply_err["error"], "not_recipient");
+    assert_eq!(reply_err["error"], "denied");
 
     // Control: reply to own pi MSG2 -> succeeds
     msg(&e.db, "MSG2", &pi_id, "pi");
     let o = agent_call(
         &e.ag,
-        serde_json::json!({"action":"reply","messageId":"MSG2","text":"legit"}),
+        serde_json::json!({"action":"reply","message_id":"MSG2","text":"legit"}),
     )
     .await;
     let reply_ok: serde_json::Value = serde_json::from_str(&o).unwrap();
@@ -301,17 +309,17 @@ async fn gate2_identity() {
     msg(&e.db, "MSG3", &pi_id, "claude");
     let o = agent_call(
         &e.ag,
-        serde_json::json!({"action":"reply","messageId":"MSG3","text":"x"}),
+        serde_json::json!({"action":"reply","message_id":"MSG3","text":"x"}),
     )
     .await;
     let reply_cross: serde_json::Value = serde_json::from_str(&o).unwrap();
     assert_eq!(reply_cross["status"], "error");
-    assert_eq!(reply_cross["error"], "not_recipient");
+    assert_eq!(reply_cross["error"], "denied");
 
     // ---- B3: send with hostile name (registered pi)
     let o = agent_call(
         &e.ag,
-        serde_json::json!({"action":"send","ref":"target","text":"hello"}),
+        serde_json::json!({"action":"send","to":"target","text":"hello"}),
     )
     .await;
     let send_resp: serde_json::Value = serde_json::from_str(&o).unwrap();
@@ -341,7 +349,7 @@ async fn gate2_identity() {
     .await;
     let o_pi = agent_call(
         &e.ag,
-        serde_json::json!({"action":"send","ref":"target","text":"from pi"}),
+        serde_json::json!({"action":"send","to":"target","text":"from pi"}),
     )
     .await;
     drop(w);
@@ -368,19 +376,25 @@ async fn gate2_identity() {
 
     let o_cl = agent_call(
         &e.ag,
-        serde_json::json!({"action":"send","ref":"target","text":"from claude"}),
+        serde_json::json!({"action":"send","to":"target","text":"from claude"}),
     )
     .await;
     fs::remove_file(e.sessions.join("me.json")).unwrap();
 
-    let pi_from = serde_json::from_str::<serde_json::Value>(&o_pi).unwrap()["delivery"]["fromName"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let cl_from = serde_json::from_str::<serde_json::Value>(&o_cl).unwrap()["delivery"]["fromName"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    // The label each send was delivered under, as stored with the message.
+    let from_of = |o: &str| {
+        let id = serde_json::from_str::<serde_json::Value>(o).unwrap()["message_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("send ok: {o}"))
+            .to_string();
+        let db = e.db.lock().unwrap();
+        xmsg::storage::get_message(&db, &id)
+            .unwrap()
+            .unwrap()
+            .from_name
+    };
+    let pi_from = from_of(&o_pi);
+    let cl_from = from_of(&o_cl);
 
     // A12: the harness is not shown; the attested id disambiguates the two.
     let pi_id = pi_from
@@ -401,7 +415,7 @@ async fn gate2_identity() {
     let a = call_on(
         &mut w,
         &mut r,
-        &serde_json::json!({"action":"reply","messageId":"nope","text":"x"}),
+        &serde_json::json!({"action":"reply","message_id":"nope","text":"x"}),
     )
     .await;
     assert!(!a.is_empty() && a != "<EOF>");
@@ -410,7 +424,7 @@ async fn gate2_identity() {
     let b = call_on(
         &mut w,
         &mut r,
-        &serde_json::json!({"action":"reply","messageId":"nope","text":"x"}),
+        &serde_json::json!({"action":"reply","message_id":"nope","text":"x"}),
     )
     .await;
     assert_eq!(
@@ -476,7 +490,7 @@ async fn gate2_bounds() {
 
     // 1. Control: valid small frame gets response
     let resp = agent_call(&e.ag, serde_json::json!({"action":"nope"})).await;
-    assert!(resp.contains("not_recipient") || resp.contains("error"));
+    assert!(resp.contains("denied") || resp.contains("error"));
 
     // 2. Oversize frame exceeding max_frame returns clean JSON error
     let mut over = vec![b'a'; max_frame + 10];
@@ -500,7 +514,7 @@ async fn gate2_bounds() {
 
     // 4. Minor 2: Valid payload with JSON escaping up to max_body * 6 succeeds
     let txt = "\u{1}".repeat(mb);
-    let mut f = serde_json::json!({"action":"send","ref":"target","text":txt})
+    let mut f = serde_json::json!({"action":"send","to":"target","text":txt})
         .to_string()
         .into_bytes();
     f.push(b'\n');

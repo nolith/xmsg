@@ -20,9 +20,9 @@ use xmsg::fed::{
     PeerConfig, PeersMap, RateLimiter,
 };
 use xmsg::http::{build_router, AppState};
-use xmsg::inbox::DeliveryResponse;
 use xmsg::pi::new_pi_store;
 use xmsg::storage::{self, MessageRecord, ReplyRecord};
+use xmsg::surface::SendResult as DeliveryResponse;
 use xmsg::svc::new_svc_store;
 
 fn get_free_port() -> u16 {
@@ -352,10 +352,10 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
 
     // Send request with body claiming an impostor principal
     let client = reqwest::Client::new();
-    let send_url = format!("http://{leaf_http_addr}/v1/sessions/agent-alice@target-node/messages");
+    let send_url = format!("http://{leaf_http_addr}/v1/messages");
     let resp = client
         .post(&send_url)
-        .json(&serde_json::json!({
+        .json(&serde_json::json!({"to": "agent-alice@target-node",
             "from": "claude:impostor",
             "text": "matrix alert",
             "idempotency_key": "idemp-leaf-1"
@@ -366,6 +366,12 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
 
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let delivery: DeliveryResponse = resp.json().await.unwrap();
+    let delivery = {
+        let db = leaf_db.lock().unwrap();
+        storage::get_message(&db, &delivery.message_id)
+            .unwrap()
+            .expect("the leaf records the message it sent")
+    };
 
     // Oracle 2 assertion: delivery from_name must be attributed to the service matrix
     // (A12: `matrix@<node>`), NOT claude:impostor
@@ -383,9 +389,9 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
     // Oracle 2 assertion: idempotency record must be scoped to svc:matrix in SQLite
     {
         let db = leaf_db.lock().unwrap();
-        let record = storage::get_idempotency_record(&db, "svc:matrix", "idemp-leaf-1", 86400)
+        let record = storage::get_idempotency_record(&db, "matrix", "idemp-leaf-1", 86400)
             .unwrap()
-            .expect("Oracle 2 violation: idempotency record must be stored under principal 'svc:matrix'");
+            .expect("Oracle 2 violation: idempotency record must be stored under the service name 'matrix'");
         assert_eq!(record.body, "matrix alert");
 
         let bad_record =
@@ -628,10 +634,10 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
 
     // 1. Leaf sends message to agent-bob@target-node (asks for push: envelope.push_replies=true)
     let client = reqwest::Client::new();
-    let send_url = format!("http://{leaf_http_addr}/v1/sessions/agent-bob@target-node/messages");
+    let send_url = format!("http://{leaf_http_addr}/v1/messages");
     let resp = client
         .post(&send_url)
-        .json(&serde_json::json!({
+        .json(&serde_json::json!({"to": "agent-bob@target-node",
             "text": "ping from matrix leaf"
         }))
         .send()
@@ -641,16 +647,6 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let delivery: DeliveryResponse = resp.json().await.unwrap();
     let msg_id = delivery.message_id;
-
-    // Cell 3a: Verify target node's fed.rs:892 normalized push_replies to false for leaf peer
-    let stored_msg = {
-        let db = node_b_db.lock().unwrap();
-        storage::get_message(&db, &msg_id).unwrap().unwrap()
-    };
-    assert!(
-        !stored_msg.push_replies,
-        "Oracle 3 cell 3a violation: target node fed.rs:892 must normalize push_replies to false for leaf peer"
-    );
 
     // Cell 3b: Verify reply-side guard in agent.rs:540
     // Even if a message in target node's DB has push_replies=true and return_host is a leaf peer,
@@ -669,7 +665,6 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
             return_harness: Some("svc".to_string()),
             return_session_id: Some("matrix".to_string()),
             return_host: Some("leaf-node".to_string()),
-            push_replies: true,
             thread_id: push_msg_id.clone(),
         };
         storage::insert_message(&db, &pre_record).unwrap();
@@ -696,8 +691,8 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
             .get("reply")
             .and_then(|r| r.get("pushOutcome"))
             .and_then(|s| s.as_str()),
-        Some("disabled"),
-        "Oracle 3 cell 3b violation: agent.rs:540 must set pushOutcome=disabled for leaf peer"
+        Some("stored"),
+        "Oracle 3 cell 3b violation: a reply to a leaf origin is stored for its pull, never pushed"
     );
     assert_eq!(
         node_b_fed_state.outbound_replies_pushed.load(Ordering::SeqCst),

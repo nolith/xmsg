@@ -23,6 +23,10 @@ pub enum AppError {
     #[error("not found: no live session matches '{0}'")]
     NotFound(String),
 
+    /// A `not_found` whose detail is already a sentence, such as a peer's answer.
+    #[error("not found: {0}")]
+    NotFoundDetail(String),
+
     #[error("ambiguous session ref: matches {0}")]
     Ambiguous(String),
 
@@ -40,6 +44,9 @@ pub enum AppError {
 
     #[error("inbox write timed out after 5s")]
     InboxTimeout,
+
+    #[error("denied: {0}")]
+    Denied(String),
 
     #[error("not recipient: {0}")]
     NotRecipient(String),
@@ -72,65 +79,96 @@ pub enum AppError {
     RateLimited(String),
 }
 
+impl AppError {
+    /// The wire code and HTTP status, one vocabulary on every surface (A13): the
+    /// addressing errors `not_found`, `ambiguous`, `denied`, `gone`, and the transport
+    /// errors. `unknown_peer` and `unregistered` fold into `not_found`; a refusal by a
+    /// peer's rights, a reply by a non-recipient and a forward the hub refuses are `denied`.
+    pub fn code(&self) -> (StatusCode, &'static str) {
+        match self {
+            AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
+            AppError::BadSender(_) => (StatusCode::BAD_REQUEST, "bad_sender"),
+            AppError::NotFound(_)
+            | AppError::NotFoundDetail(_)
+            | AppError::UnknownPeer(_)
+            | AppError::Unregistered(_) => (StatusCode::NOT_FOUND, "not_found"),
+            AppError::Ambiguous(_) => (StatusCode::CONFLICT, "ambiguous"),
+            AppError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            AppError::Gone { .. } => (StatusCode::GONE, "gone"),
+            AppError::PayloadTooLarge { .. } => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
+            }
+            AppError::InboxUnavailable(_) => (StatusCode::BAD_GATEWAY, "inbox_unavailable"),
+            AppError::InboxTimeout => (StatusCode::GATEWAY_TIMEOUT, "inbox_timeout"),
+            AppError::Denied(_)
+            | AppError::NotRecipient(_)
+            | AppError::OpDenied(_)
+            | AppError::PeerRejected(_)
+            | AppError::NoForward(_) => (StatusCode::FORBIDDEN, "denied"),
+            AppError::CredentialsStale(_) => (StatusCode::SERVICE_UNAVAILABLE, "credentials_stale"),
+            AppError::ServiceUnavailable(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
+            }
+            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            AppError::InsecureSocketDir(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "insecure_socket_dir")
+            }
+            AppError::PeerUnreachable(_) => (StatusCode::SERVICE_UNAVAILABLE, "peer_unreachable"),
+            AppError::RateLimited(_) => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        }
+    }
+
+    /// The human-readable detail that goes with the code.
+    pub fn detail(&self) -> String {
+        match self {
+            AppError::NotFound(r) => format!("no live recipient matches '{r}'"),
+            AppError::UnknownPeer(n) => format!("unknown node '{n}'"),
+            AppError::Unregistered(pid) => format!("process {pid} has no attested agent session"),
+            AppError::Gone { session_id, pid } => {
+                format!("session {session_id} process {pid} exited")
+            }
+            AppError::PayloadTooLarge { size, limit } => {
+                format!("body {size} exceeds limit {limit}")
+            }
+            AppError::InboxTimeout => "inbox write timed out after 5s".to_string(),
+            AppError::BadRequest(d)
+            | AppError::NotFoundDetail(d)
+            | AppError::BadSender(d)
+            | AppError::Ambiguous(d)
+            | AppError::Conflict(d)
+            | AppError::InboxUnavailable(d)
+            | AppError::Denied(d)
+            | AppError::NotRecipient(d)
+            | AppError::OpDenied(d)
+            | AppError::PeerRejected(d)
+            | AppError::NoForward(d)
+            | AppError::CredentialsStale(d)
+            | AppError::ServiceUnavailable(d)
+            | AppError::Internal(d)
+            | AppError::InsecureSocketDir(d)
+            | AppError::PeerUnreachable(d)
+            | AppError::RateLimited(d) => d.clone(),
+        }
+    }
+
+    /// A socket frame's error reply, `{status: error, error, detail}`.
+    pub fn frame(&self) -> serde_json::Value {
+        serde_json::json!({
+            "status": "error",
+            "error": self.code().1,
+            "detail": self.detail(),
+        })
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, error_code, detail) = match self {
-            AppError::BadRequest(d) => (StatusCode::BAD_REQUEST, "bad_request", d),
-            AppError::BadSender(d) => (StatusCode::BAD_REQUEST, "bad_sender", d),
-            AppError::NotFound(r) => (
-                StatusCode::NOT_FOUND,
-                "not_found",
-                format!("no live session matches '{r}'"),
-            ),
-            AppError::Ambiguous(d) => (StatusCode::CONFLICT, "ambiguous", d),
-            AppError::Conflict(d) => (StatusCode::CONFLICT, "conflict", d),
-            AppError::Gone { session_id, pid } => (
-                StatusCode::GONE,
-                "gone",
-                format!("session {session_id} process {pid} exited"),
-            ),
-            AppError::Unregistered(pid) => (
-                StatusCode::BAD_REQUEST,
-                "unregistered",
-                format!("process {pid} has no attested agent session"),
-            ),
-            AppError::PayloadTooLarge { size, limit } => (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "payload_too_large",
-                format!("body {size} exceeds limit {limit}"),
-            ),
-            AppError::InboxUnavailable(d) => (StatusCode::BAD_GATEWAY, "inbox_unavailable", d),
-            AppError::InboxTimeout => (
-                StatusCode::GATEWAY_TIMEOUT,
-                "inbox_timeout",
-                "inbox write timed out after 5s".to_string(),
-            ),
-            AppError::NotRecipient(d) => (StatusCode::FORBIDDEN, "not_recipient", d),
-            AppError::CredentialsStale(d) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "credentials_stale", d)
-            }
-            AppError::ServiceUnavailable(d) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", d)
-            }
-            AppError::Internal(d) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", d),
-            AppError::InsecureSocketDir(d) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "insecure_socket_dir", d)
-            }
-            AppError::UnknownPeer(d) => (StatusCode::BAD_REQUEST, "unknown_peer", d),
-            AppError::NoForward(d) => (StatusCode::BAD_REQUEST, "no_forward", d),
-            AppError::OpDenied(d) => (StatusCode::FORBIDDEN, "op_denied", d),
-            AppError::PeerRejected(d) => (StatusCode::FORBIDDEN, "peer_rejected", d),
-            AppError::PeerUnreachable(d) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "peer_unreachable", d)
-            }
-            AppError::RateLimited(d) => (StatusCode::TOO_MANY_REQUESTS, "rate_limited", d),
-        };
-
+        let (status, error_code) = self.code();
         (
             status,
             Json(ErrorResponse {
                 error: error_code,
-                detail,
+                detail: self.detail(),
             }),
         )
             .into_response()

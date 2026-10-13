@@ -142,11 +142,8 @@ async fn received_from_name(node: &Node) -> String {
 async fn test_anonymous_label_keeps_long_node_name_whole() {
     let node = start("cap-caller").await;
     let res = reqwest::Client::new()
-        .post(format!(
-            "{}/v1/sessions/cap-session/messages",
-            node.base_url
-        ))
-        .json(&serde_json::json!({ "from": "a".repeat(200), "text": "hi" }))
+        .post(format!("{}/v1/messages", node.base_url))
+        .json(&serde_json::json!({"to": "cap-session",  "from": "a".repeat(200), "text": "hi" }))
         .send()
         .await
         .unwrap();
@@ -172,7 +169,7 @@ async fn test_attested_label_keeps_long_node_name_whole() {
     let node = start(&caller_name).await;
     let stream = UnixStream::connect(&node.agent_sock).await.unwrap();
     let (r, mut w) = stream.into_split();
-    let frame = serde_json::json!({ "action": "send", "ref": "cap-session", "text": "hi" });
+    let frame = serde_json::json!({ "action": "send", "to": "cap-session", "text": "hi" });
     w.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
     let mut line = String::new();
     BufReader::new(r).read_line(&mut line).await.unwrap();

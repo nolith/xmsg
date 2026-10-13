@@ -97,7 +97,7 @@ async fn send_via_agent_sock(agent_sock: &Path, target_ref: &str, text: &str) ->
 
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": target_ref,
+        "to": target_ref,
         "text": text,
     });
     writer
@@ -360,26 +360,28 @@ async fn create_leaf_test_node(
     });
 
     let r_sock = reg_sock.clone();
-    let r_proc = proc_root.clone();
-    let r_store = svc_store.clone();
-    let r_db = db.clone();
-    let r_notify = svc_notify_tx.clone();
     let r_p = leaf_principal.to_string();
-    let r_fs = fed_state.clone();
+    let r_state = Arc::new(xmsg::http::AppState {
+        sessions_dirs: vec![sessions_dir.clone()],
+        agy_config: agy_config.clone(),
+        agy_store: agy_store.clone(),
+        pi_store: pi_store.clone(),
+        pi_notify_tx: pi_notify_tx.clone(),
+        svc_store: svc_store.clone(),
+        svc_notify_tx: svc_notify_tx.clone(),
+        node_name: name.to_string(),
+        max_body: 65536,
+        request_counter: AtomicU64::new(1),
+        db: db.clone(),
+        notify_tx: notify_tx.clone(),
+        reply_ttl: Duration::from_secs(3600),
+        idempotency_ttl: Duration::from_secs(3600),
+        long_poll_semaphore: Arc::new(tokio::sync::Semaphore::new(128)),
+        fed_state: Some(fed_state.clone()),
+    });
 
     tokio::spawn(async move {
-        let _ = run_leaf_register_server(
-            r_sock,
-            r_proc,
-            r_store,
-            my_uid,
-            r_db,
-            r_notify,
-            Duration::from_secs(3600),
-            r_p,
-            Some(r_fs),
-        )
-        .await;
+        let _ = run_leaf_register_server(r_sock, r_state, my_uid, r_p).await;
     });
 
     for peer_name in peers_arc.keys() {
@@ -462,11 +464,10 @@ async fn test_oracle_1_end_to_end_leaf_svc() {
         create_claude_session_fixture(&hub.proc_root, &hub.sessions_dir, "sess-alice", "alice");
 
     // 1. Send from hub to svc:guard@leaf via agent.sock
-    let resp =
-        send_via_agent_sock(&hub.agent_sock, "svc:guard@leaf", "Task request for guard").await;
+    let resp = send_via_agent_sock(&hub.agent_sock, "guard@leaf", "Task request for guard").await;
     assert_eq!(resp["status"], "ok", "Send should succeed: {resp}");
-    assert_eq!(resp["delivery"]["outcome"], "queued");
-    let msg_id = resp["delivery"]["messageId"].as_str().unwrap().to_string();
+    assert_eq!(resp["outcome"], "queued");
+    let msg_id = resp["message_id"].as_str().unwrap().to_string();
 
     // Verify hub queued it in peer_mailbox
     {
@@ -490,7 +491,12 @@ async fn test_oracle_1_end_to_end_leaf_svc() {
 
     let reg_resp = read_json_line(&mut reader).await;
     assert_eq!(reg_resp["status"], "ok");
-    assert_eq!(reg_resp["sessionId"], "guard");
+    assert!(
+        reg_resp["address"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("guard@")),
+        "{reg_resp}"
+    );
 
     // Poll message from leaf
     let poll_frame = serde_json::json!({
@@ -606,6 +612,7 @@ async fn test_oracle_2_redelivery_unacked_message() {
 
     // 1. Send from hub to svc:guard@leaf
     let send_body = serde_json::json!({
+        "to": "guard@leaf",
         "from": "alice",
         "text": "Unacked task",
     })
@@ -613,22 +620,14 @@ async fn test_oracle_2_redelivery_unacked_message() {
 
     let (status, resp_body) = tokio::task::spawn_blocking({
         let http_sock = hub.http_sock.clone();
-        move || {
-            http_request_unix(
-                &http_sock,
-                "POST",
-                "/v1/sessions/svc:guard@leaf/messages",
-                Some(&send_body),
-            )
-            .unwrap()
-        }
+        move || http_request_unix(&http_sock, "POST", "/v1/messages", Some(&send_body)).unwrap()
     })
     .await
     .unwrap();
 
     assert_eq!(status, StatusCode::ACCEPTED);
     let resp: Value = serde_json::from_str(&resp_body).unwrap();
-    let msg_id = resp["messageId"].as_str().unwrap().to_string();
+    let msg_id = resp["message_id"].as_str().unwrap().to_string();
 
     // 2. Connect daemon, register and poll without acking
     {
@@ -769,7 +768,12 @@ async fn test_oracle_3_leaf_admission_refuses_non_leaf_principal() {
         resp2["status"], "ok",
         "Registering matching leaf principal must succeed"
     );
-    assert_eq!(resp2["sessionId"], "guard");
+    assert!(
+        resp2["address"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("guard@")),
+        "{resp2}"
+    );
 }
 
 // =============================================================================
@@ -837,20 +841,16 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
     let (status1, resp1) = tokio::task::spawn_blocking({
         let http_sock = hub.http_sock.clone();
         move || {
-            let body = serde_json::json!({ "from": "alice", "text": "M1 for leaf1" }).to_string();
-            http_request_unix(
-                &http_sock,
-                "POST",
-                "/v1/sessions/svc:guard@leaf1/messages",
-                Some(&body),
-            )
-            .unwrap()
+            let body =
+                serde_json::json!({ "to": "guard@leaf1", "from": "alice", "text": "M1 for leaf1" })
+                    .to_string();
+            http_request_unix(&http_sock, "POST", "/v1/messages", Some(&body)).unwrap()
         }
     })
     .await
     .unwrap();
     assert_eq!(status1, StatusCode::ACCEPTED);
-    let msg1_id = serde_json::from_str::<Value>(&resp1).unwrap()["messageId"]
+    let msg1_id = serde_json::from_str::<Value>(&resp1).unwrap()["message_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -859,20 +859,16 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
     let (status2, resp2) = tokio::task::spawn_blocking({
         let http_sock = hub.http_sock.clone();
         move || {
-            let body = serde_json::json!({ "from": "alice", "text": "M2 for leaf2" }).to_string();
-            http_request_unix(
-                &http_sock,
-                "POST",
-                "/v1/sessions/svc:guard@leaf2/messages",
-                Some(&body),
-            )
-            .unwrap()
+            let body =
+                serde_json::json!({ "to": "guard@leaf2", "from": "alice", "text": "M2 for leaf2" })
+                    .to_string();
+            http_request_unix(&http_sock, "POST", "/v1/messages", Some(&body)).unwrap()
         }
     })
     .await
     .unwrap();
     assert_eq!(status2, StatusCode::ACCEPTED);
-    let msg2_id = serde_json::from_str::<Value>(&resp2).unwrap()["messageId"]
+    let msg2_id = serde_json::from_str::<Value>(&resp2).unwrap()["message_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -944,7 +940,7 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
     // Leaf 1 attempts to ack M2 (meant for Leaf2): must return 404 NotFound
     let ack_cross = xmsg::fed::ack_federated_inbox(&leaf1_fed_state, "hub", &msg2_id).await;
     match ack_cross {
-        Err(AppError::NotFound(_)) => {}
+        Err(e) if e.code().1 == "not_found" => {}
         other => panic!("Acking another peer's mailbox id must return NotFound, got: {other:?}"),
     }
 
@@ -1031,14 +1027,10 @@ async fn test_oracle_5_targets_filter_on_queue_path() {
     let (status_disallowed, resp_disallowed) = tokio::task::spawn_blocking({
         let http_sock = hub.http_sock.clone();
         move || {
-            let body = serde_json::json!({ "from": "alice", "text": "Disallowed" }).to_string();
-            http_request_unix(
-                &http_sock,
-                "POST",
-                "/v1/sessions/svc:other@leaf/messages",
-                Some(&body),
-            )
-            .unwrap()
+            let body =
+                serde_json::json!({ "to": "other@leaf", "from": "alice", "text": "Disallowed" })
+                    .to_string();
+            http_request_unix(&http_sock, "POST", "/v1/messages", Some(&body)).unwrap()
         }
     })
     .await
@@ -1064,14 +1056,10 @@ async fn test_oracle_5_targets_filter_on_queue_path() {
     let (status_allowed, resp_allowed) = tokio::task::spawn_blocking({
         let http_sock = hub.http_sock.clone();
         move || {
-            let body = serde_json::json!({ "from": "alice", "text": "Allowed" }).to_string();
-            http_request_unix(
-                &http_sock,
-                "POST",
-                "/v1/sessions/svc:guard@leaf/messages",
-                Some(&body),
-            )
-            .unwrap()
+            let body =
+                serde_json::json!({ "to": "guard@leaf", "from": "alice", "text": "Allowed" })
+                    .to_string();
+            http_request_unix(&http_sock, "POST", "/v1/messages", Some(&body)).unwrap()
         }
     })
     .await
@@ -1145,14 +1133,10 @@ async fn test_oracle_6_delivered_frame_carries_principal_badge() {
         create_claude_session_fixture(&hub.proc_root, &hub.sessions_dir, "sess-alice", "alice");
 
     // Send from hub via agent.sock
-    let resp = send_via_agent_sock(
-        &hub.agent_sock,
-        "svc:guard@leaf",
-        "Message with principal test",
-    )
-    .await;
+    let resp =
+        send_via_agent_sock(&hub.agent_sock, "guard@leaf", "Message with principal test").await;
     assert_eq!(resp["status"], "ok", "Send should succeed: {resp}");
-    assert_eq!(resp["delivery"]["outcome"], "queued");
+    assert_eq!(resp["outcome"], "queued");
 
     // Connect svc daemon and poll
     let (mut reader, mut writer) = connect_svc(&leaf.reg_sock).await;
@@ -1172,13 +1156,14 @@ async fn test_oracle_6_delivered_frame_carries_principal_badge() {
     let deliver_resp = read_json_line(&mut reader).await;
     assert_eq!(deliver_resp["action"], "deliver");
 
-    // Invariant: origin must carry kind: fed, host: hub, and principal: claude:alice
+    // Invariant: the one origin shape (A12): the sender's instance ID, the node that
+    // attests it (the hub, where alice sent from) and her own label
     let origin = &deliver_resp["origin"];
-    assert_eq!(origin["kind"], "fed");
-    assert_eq!(origin["host"], "hub");
+    assert_eq!(origin["id"], "sess-alice", "{origin}");
+    assert_eq!(origin["node"], "hub", "{origin}");
     assert_eq!(
-        origin["principal"], "claude:alice",
-        "Delivered origin must carry sender's badge in principal field"
+        origin["label"], "alice",
+        "Delivered origin must carry the sender's label apart from its id: {origin}"
     );
 }
 
@@ -1299,10 +1284,10 @@ async fn test_oracle_8_misaddressed_message_does_not_stall_inbox() {
     assert_eq!(reg_resp["status"], "ok");
 
     // 2. Hub session sends misaddressed message to svc:other@leaf
-    let resp1 = send_via_agent_sock(&hub.agent_sock, "svc:other@leaf", "Task for other").await;
+    let resp1 = send_via_agent_sock(&hub.agent_sock, "other@leaf", "Task for other").await;
     assert_eq!(resp1["status"], "ok");
-    assert_eq!(resp1["delivery"]["outcome"], "queued");
-    let msg1_id = resp1["delivery"]["messageId"].as_str().unwrap().to_string();
+    assert_eq!(resp1["outcome"], "queued");
+    let msg1_id = resp1["message_id"].as_str().unwrap().to_string();
 
     // Verify Claude session on hub receives not_found reply for msg1
     let mut got_not_found_reply = false;
@@ -1313,7 +1298,7 @@ async fn test_oracle_8_misaddressed_message_does_not_stall_inbox() {
             .find(|l| l.contains(&format!("reply to message_id={msg1_id}")))
         {
             assert!(line.contains("not_found"));
-            assert!(line.contains("svc:other is not served by this leaf"));
+            assert!(line.contains("other is not served by this leaf"));
             got_not_found_reply = true;
             break;
         }
@@ -1325,10 +1310,10 @@ async fn test_oracle_8_misaddressed_message_does_not_stall_inbox() {
     );
 
     // 3. Hub session sends valid message to svc:guard@leaf
-    let resp2 = send_via_agent_sock(&hub.agent_sock, "svc:guard@leaf", "Task for guard").await;
+    let resp2 = send_via_agent_sock(&hub.agent_sock, "guard@leaf", "Task for guard").await;
     assert_eq!(resp2["status"], "ok");
-    assert_eq!(resp2["delivery"]["outcome"], "queued");
-    let msg2_id = resp2["delivery"]["messageId"].as_str().unwrap().to_string();
+    assert_eq!(resp2["outcome"], "queued");
+    let msg2_id = resp2["message_id"].as_str().unwrap().to_string();
 
     // 4. Svc daemon on leaf polls: must receive msg2 within bounded test deadline!
     let poll_res = tokio::time::timeout(Duration::from_secs(3), async {
@@ -1417,10 +1402,9 @@ async fn test_oracle_9_storage_error_does_not_ack_and_recovers() {
     }
 
     // 2. Hub queues a message for svc:guard@leaf
-    let resp =
-        send_via_agent_sock(&hub.agent_sock, "svc:guard@leaf", "Message during failure").await;
+    let resp = send_via_agent_sock(&hub.agent_sock, "guard@leaf", "Message during failure").await;
     assert_eq!(resp["status"], "ok");
-    let msg_id = resp["delivery"]["messageId"].as_str().unwrap().to_string();
+    let msg_id = resp["message_id"].as_str().unwrap().to_string();
 
     // 3. Wait 400ms: leaf task will try to store, fail, back off, and MUST NOT ack hub
     tokio::time::sleep(Duration::from_millis(400)).await;

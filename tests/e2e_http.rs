@@ -221,62 +221,60 @@ async fn test_e2e_healthz_200() {
 }
 
 #[tokio::test]
-async fn test_e2e_sessions_list_and_query_200() {
+async fn test_e2e_recipients_list_and_query_200() {
     let harness = start_harness(65536).await;
     let client = reqwest::Client::new();
+    let get = |q: &'static str| {
+        let url = format!("{}/v1/recipients{q}", harness.base_url);
+        let client = client.clone();
+        async move { client.get(url).send().await.unwrap() }
+    };
 
     // Unfiltered list returns all live sessions (my-worker, dead-sock-worker, twin1, twin2)
-    let res = client
-        .get(format!("{}/v1/sessions", harness.base_url))
-        .send()
-        .await
-        .unwrap();
+    let res = get("").await;
     assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let sessions: Vec<serde_json::Value> = res.json().await.unwrap();
+    let entries: Vec<serde_json::Value> = res.json().await.unwrap();
     assert_eq!(
-        sessions.len(),
+        entries.len(),
         4,
         "Dead sessions filtered out, 4 live remain"
     );
+    assert!(entries
+        .iter()
+        .all(|e| e["kind"] == "instance" && e["status"] == "live" && e["node"] == "test-host"));
 
-    // Filter by cwd
-    let res = client
-        .get(format!(
-            "{}/v1/sessions?cwd=/workspace/project-a",
-            harness.base_url
-        ))
-        .send()
-        .await
-        .unwrap();
-    let filtered: Vec<serde_json::Value> = res.json().await.unwrap();
+    // Filter by name (a label)
+    let filtered: Vec<serde_json::Value> = get("?name=my-worker").await.json().await.unwrap();
     assert_eq!(filtered.len(), 1);
-    assert_eq!(filtered[0]["sessionId"], "live-session-1234");
+    assert_eq!(filtered[0]["address"], "live-session-1234@test-host");
+    assert_eq!(filtered[0]["label"], "my-worker");
 
-    // Filter by status
-    let res = client
-        .get(format!("{}/v1/sessions?status=busy", harness.base_url))
-        .send()
-        .await
-        .unwrap();
-    let filtered_status: Vec<serde_json::Value> = res.json().await.unwrap();
-    assert_eq!(filtered_status.len(), 1);
-    assert_eq!(filtered_status[0]["sessionId"], "dead-sock-session");
+    // Filter by kind
+    let services: Vec<serde_json::Value> = get("?kind=service").await.json().await.unwrap();
+    assert!(services.is_empty());
+    let instances: Vec<serde_json::Value> = get("?kind=instance").await.json().await.unwrap();
+    assert_eq!(instances.len(), 4);
+    assert_eq!(
+        get("?kind=other").await.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
 }
 
 #[tokio::test]
-async fn test_e2e_get_session_by_ref_200() {
+async fn test_e2e_recipient_by_name_200() {
     let harness = start_harness(65536).await;
     let client = reqwest::Client::new();
 
     let res = client
-        .get(format!("{}/v1/sessions/my-worker", harness.base_url))
+        .get(format!("{}/v1/recipients?name=my-worker", harness.base_url))
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let s_val: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(s_val["sessionId"], "live-session-1234");
-    assert!(s_val.get("messagingSocketPath").is_none());
+    let entries: Vec<serde_json::Value> = res.json().await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["address"], "live-session-1234@test-host");
+    assert!(entries[0].get("messagingSocketPath").is_none());
 }
 
 #[tokio::test]
@@ -285,22 +283,20 @@ async fn test_e2e_post_message_accepted_202() {
     let client = reqwest::Client::new();
 
     let post_body = serde_json::json!({
+        "to": "my-worker",
         "from": "claude",
         "text": "hello from test"
     });
     let res = client
-        .post(format!(
-            "{}/v1/sessions/my-worker/messages",
-            harness.base_url
-        ))
+        .post(format!("{}/v1/messages", harness.base_url))
         .json(&post_body)
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::ACCEPTED);
     let deliv: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(deliv["sessionId"], "live-session-1234");
-    assert_eq!(deliv["fromName"], "claude · anon@test-host");
+    assert_eq!(deliv["address"], "live-session-1234@test-host");
+    assert_eq!(deliv["outcome"], "delivered");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     let lines = harness.received_lines.lock().await;
@@ -323,14 +319,12 @@ async fn test_e2e_post_message_dead_session_gone_410() {
     let client = reqwest::Client::new();
 
     let post_body = serde_json::json!({
+        "to": "dead-worker",
         "from": "claude",
         "text": "ping"
     });
     let res = client
-        .post(format!(
-            "{}/v1/sessions/dead-worker/messages",
-            harness.base_url
-        ))
+        .post(format!("{}/v1/messages", harness.base_url))
         .json(&post_body)
         .send()
         .await
@@ -346,14 +340,12 @@ async fn test_e2e_post_message_unknown_session_not_found_404() {
     let client = reqwest::Client::new();
 
     let post_body = serde_json::json!({
+        "to": "unknown-ref-xyz",
         "from": "claude",
         "text": "ping"
     });
     let res = client
-        .post(format!(
-            "{}/v1/sessions/unknown-ref-xyz/messages",
-            harness.base_url
-        ))
+        .post(format!("{}/v1/messages", harness.base_url))
         .json(&post_body)
         .send()
         .await
@@ -369,14 +361,12 @@ async fn test_e2e_post_message_ambiguous_conflict_409() {
     let client = reqwest::Client::new();
 
     let post_body = serde_json::json!({
+        "to": "twin-worker",
         "from": "claude",
         "text": "ping"
     });
     let res = client
-        .post(format!(
-            "{}/v1/sessions/twin-worker/messages",
-            harness.base_url
-        ))
+        .post(format!("{}/v1/messages", harness.base_url))
         .json(&post_body)
         .send()
         .await
@@ -392,15 +382,13 @@ async fn test_e2e_post_message_unknown_field_bad_request_400() {
     let client = reqwest::Client::new();
 
     let bad_field_body = serde_json::json!({
+        "to": "my-worker",
         "from": "claude",
         "text": "hi",
         "unknown_extra": 123
     });
     let res = client
-        .post(format!(
-            "{}/v1/sessions/my-worker/messages",
-            harness.base_url
-        ))
+        .post(format!("{}/v1/messages", harness.base_url))
         .json(&bad_field_body)
         .send()
         .await
@@ -416,14 +404,12 @@ async fn test_e2e_post_message_empty_text_bad_request_400() {
     let client = reqwest::Client::new();
 
     let empty_text_body = serde_json::json!({
+        "to": "my-worker",
         "from": "claude",
         "text": ""
     });
     let res = client
-        .post(format!(
-            "{}/v1/sessions/my-worker/messages",
-            harness.base_url
-        ))
+        .post(format!("{}/v1/messages", harness.base_url))
         .json(&empty_text_body)
         .send()
         .await
@@ -439,14 +425,12 @@ async fn test_e2e_post_message_invalid_sender_bad_sender_400() {
     let client = reqwest::Client::new();
 
     let bad_sender_body = serde_json::json!({
+        "to": "my-worker",
         "from": "   \"\" <> \t  ",
         "text": "valid text"
     });
     let res = client
-        .post(format!(
-            "{}/v1/sessions/my-worker/messages",
-            harness.base_url
-        ))
+        .post(format!("{}/v1/messages", harness.base_url))
         .json(&bad_sender_body)
         .send()
         .await
@@ -463,14 +447,12 @@ async fn test_e2e_post_message_body_too_large_413() {
 
     let huge_text = "a".repeat(500);
     let huge_body = serde_json::json!({
+        "to": "my-worker",
         "from": "claude",
         "text": huge_text
     });
     let res = client
-        .post(format!(
-            "{}/v1/sessions/my-worker/messages",
-            harness.base_url
-        ))
+        .post(format!("{}/v1/messages", harness.base_url))
         .json(&huge_body)
         .send()
         .await
@@ -486,14 +468,12 @@ async fn test_e2e_post_message_inbox_unavailable_502() {
     let client = reqwest::Client::new();
 
     let post_body = serde_json::json!({
+        "to": "dead-sock-worker",
         "from": "claude",
         "text": "hi"
     });
     let res = client
-        .post(format!(
-            "{}/v1/sessions/dead-sock-worker/messages",
-            harness.base_url
-        ))
+        .post(format!("{}/v1/messages", harness.base_url))
         .json(&post_body)
         .send()
         .await
@@ -510,11 +490,8 @@ async fn test_e2e_post_message_reserved_session_prefix_400() {
 
     // Red Demo 2 / C1: HTTP POST with from containing ':' or '/' returns 400 Bad Request (bad_sender)
     let res = client
-        .post(format!(
-            "{}/v1/sessions/my-worker/messages",
-            harness.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", harness.base_url))
+        .json(&serde_json::json!({"to": "my-worker",
             "from": "session:evil",
             "text": "spoofed session prefix"
         }))
@@ -528,11 +505,8 @@ async fn test_e2e_post_message_reserved_session_prefix_400() {
 
     // Also with session/
     let res = client
-        .post(format!(
-            "{}/v1/sessions/my-worker/messages",
-            harness.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", harness.base_url))
+        .json(&serde_json::json!({"to": "my-worker",
             "from": "session/evil",
             "text": "spoofed session slash prefix"
         }))
@@ -589,11 +563,8 @@ async fn test_e2e_post_message_pi_queue_full_503() {
 
     // The 101st message over HTTP must return 503 Service Unavailable
     let res = client
-        .post(format!(
-            "{}/v1/sessions/pi-worker/messages",
-            harness.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", harness.base_url))
+        .json(&serde_json::json!({"to": "pi-worker",
             "from": "alice",
             "text": "exceeding queue capacity"
         }))

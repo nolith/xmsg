@@ -398,7 +398,7 @@ async fn test_oracle_3_unacked_message_persists_across_sigterm_restart() {
     let mut send_reader = BufReader::new(send_reader);
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": "svc:worker",
+        "to": "worker",
         "text": "critical-payload-survives-sigterm"
     });
     send_writer
@@ -406,8 +406,8 @@ async fn test_oracle_3_unacked_message_persists_across_sigterm_restart() {
         .await
         .unwrap();
     let send_resp = read_json_line(&mut send_reader).await;
-    assert_eq!(send_resp["delivery"]["outcome"], "delivered");
-    let sent_msg_id = send_resp["delivery"]["messageId"]
+    assert_eq!(send_resp["outcome"], "delivered");
+    let sent_msg_id = send_resp["message_id"]
         .as_str()
         .expect("messageId")
         .to_string();

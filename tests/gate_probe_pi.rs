@@ -173,17 +173,26 @@ async fn setup_gate_harness() -> GateHarness {
     tokio::spawn(async move {
         let _ = run_register_server(
             reg_sock,
-            reg_config,
-            reg_store,
-            reg_pi_store,
-            reg_db,
-            reg_pi_notify,
-            Duration::from_secs(3600),
+            std::sync::Arc::new(xmsg::http::AppState {
+                sessions_dirs: vec![],
+                agy_config: reg_config,
+                agy_store: reg_store,
+                pi_store: reg_pi_store,
+                pi_notify_tx: reg_pi_notify,
+                svc_store: xmsg::svc::new_svc_store(),
+                svc_notify_tx: tokio::sync::broadcast::channel(16).0,
+                node_name: xmsg::node::local_node_name(),
+                max_body: 65536,
+                request_counter: std::sync::atomic::AtomicU64::new(1),
+                db: reg_db,
+                notify_tx: tokio::sync::broadcast::channel(16).0,
+                reply_ttl: Duration::from_secs(3600),
+                idempotency_ttl: std::time::Duration::from_secs(86400),
+                long_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
+                fed_state: None,
+            }),
             my_uid,
-            xmsg::svc::new_svc_store(),
             std::collections::HashMap::new(),
-            tokio::sync::broadcast::channel(16).0,
-            None,
         )
         .await;
     });
@@ -277,7 +286,6 @@ async fn test_gate_probe_b2_pi_registration_and_cross_harness_reply_isolation() 
         recipient_harness: "claude".to_string(),
         return_harness: None,
         return_session_id: None,
-        push_replies: false,
         thread_id: "msg-b2-001".to_string(),
         return_host: None,
     };
@@ -295,7 +303,7 @@ async fn test_gate_probe_b2_pi_registration_and_cross_harness_reply_isolation() 
 
     let reply_payload = serde_json::json!({
         "action": "reply",
-        "messageId": "msg-b2-001",
+        "message_id": "msg-b2-001",
         "text": "Forged reply from attacker"
     });
     ag_writer
@@ -308,7 +316,7 @@ async fn test_gate_probe_b2_pi_registration_and_cross_harness_reply_isolation() 
     let reply_resp: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(reply_resp["status"], "error");
     assert_eq!(
-        reply_resp["error"], "not_recipient",
+        reply_resp["error"], "denied",
         "Cross-harness reply must be forbidden with not_recipient"
     );
 }
@@ -348,7 +356,7 @@ async fn test_gate_probe_b3_attested_name_sanitization_and_envelope_integrity() 
 
     let send_payload = serde_json::json!({
         "action": "send",
-        "ref": "victim-claude",
+        "to": "victim-claude",
         "text": "Payload testing envelope breakout resistance"
     });
     ag_writer
@@ -362,7 +370,14 @@ async fn test_gate_probe_b3_attested_name_sanitization_and_envelope_integrity() 
     assert_eq!(send_resp["status"], "ok");
 
     // Check delivery fromName cap: the attested prefix whole, the name part <= 64 chars
-    let from_name = send_resp["delivery"]["fromName"].as_str().unwrap();
+    let from_name = {
+        let db = harness.db.lock().unwrap();
+        xmsg::storage::get_message(&db, send_resp["message_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap()
+            .from_name
+    };
+    let from_name = from_name.as_str();
     let name_part = from_name
         .split(" · ")
         .next()

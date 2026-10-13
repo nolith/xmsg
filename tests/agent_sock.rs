@@ -354,7 +354,6 @@ async fn test_agent_sock_reply_and_send_flow() {
         recipient_harness: "claude".to_string(),
         return_harness: None,
         return_session_id: None,
-        push_replies: false,
         thread_id: "msg-001".to_string(),
         return_host: None,
     };
@@ -366,7 +365,7 @@ async fn test_agent_sock_reply_and_send_flow() {
     // 2. Reply to msg-001 from sess-caller-123
     let reply_req = serde_json::json!({
         "action": "reply",
-        "messageId": "msg-001",
+        "message_id": "msg-001",
         "text": "Attested reply over agent.sock"
     });
     writer
@@ -380,7 +379,7 @@ async fn test_agent_sock_reply_and_send_flow() {
     assert_eq!(resp["status"], "ok");
     assert_eq!(resp["reply"]["messageId"], "msg-001");
     assert_eq!(resp["reply"]["text"], "Attested reply over agent.sock");
-    assert_eq!(resp["reply"]["sessionRef"], "sess-caller-123");
+    assert_eq!(resp["reply"]["replierSessionId"], "sess-caller-123");
 
     // 3. Insert a message addressed to a different session (sess-other-999)
     let other_msg_record = xmsg::storage::MessageRecord {
@@ -393,7 +392,6 @@ async fn test_agent_sock_reply_and_send_flow() {
         recipient_harness: "claude".to_string(),
         return_harness: None,
         return_session_id: None,
-        push_replies: false,
         thread_id: "msg-002".to_string(),
         return_host: None,
     };
@@ -405,7 +403,7 @@ async fn test_agent_sock_reply_and_send_flow() {
     // 4. Try to reply to msg-002 -> not_recipient error
     let imposter_req = serde_json::json!({
         "action": "reply",
-        "messageId": "msg-002",
+        "message_id": "msg-002",
         "text": "Imposter reply attempt"
     });
     writer
@@ -417,12 +415,12 @@ async fn test_agent_sock_reply_and_send_flow() {
     reader.read_line(&mut line).await.unwrap();
     let err_resp: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(err_resp["status"], "error");
-    assert_eq!(err_resp["error"], "not_recipient");
+    assert_eq!(err_resp["error"], "denied");
 
     // 5. Send message over agent.sock (targeting sess-caller-123)
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": "sender-session",
+        "to": "sender-session",
         "text": "Hello self over agent.sock"
     });
     writer
@@ -434,8 +432,12 @@ async fn test_agent_sock_reply_and_send_flow() {
     reader.read_line(&mut line).await.unwrap();
     let send_resp: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(send_resp["status"], "ok");
-    assert_eq!(
-        send_resp["delivery"]["fromName"],
-        "sender-session · sess-caller-123@test-host"
-    );
+    assert_eq!(send_resp["address"], "sess-caller-123@test-host");
+    let sent = {
+        let db_lock = db.lock().unwrap();
+        xmsg::storage::get_message(&db_lock, send_resp["message_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(sent.from_name, "sender-session · sess-caller-123@test-host");
 }

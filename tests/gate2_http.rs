@@ -136,8 +136,8 @@ async fn start_harness(max_body: usize) -> TestHarness {
 
 async fn post_from(base: &str, from: &str) -> (reqwest::StatusCode, serde_json::Value) {
     let res = reqwest::Client::new()
-        .post(format!("{base}/v1/sessions/my-worker/messages"))
-        .json(&serde_json::json!({"from": from, "text": "probe"}))
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({"to": "my-worker", "from": from, "text": "probe"}))
         .send()
         .await
         .unwrap();
@@ -152,7 +152,15 @@ async fn gate2_http_prefix() {
     // 1. Control arm: legitimate ASCII sender
     let (st, v) = post_from(&h.base_url, "claude").await;
     assert_eq!(st, reqwest::StatusCode::ACCEPTED);
-    assert_eq!(v["fromName"], "claude · anon@test-host");
+    assert_eq!(v["address"], "live-session-1234@test-host");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let lines = h._received_lines.lock().await.clone();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("from-name=\\\"claude · anon@test-host\\\"")),
+        "delivered under the anonymous label: {lines:?}"
+    );
 
     // 2. B1 arms: reserved prefix variations and bypasses
     for from in [

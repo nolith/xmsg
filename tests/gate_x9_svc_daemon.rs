@@ -111,17 +111,26 @@ async fn setup_harness(service_name: &str) -> SvcTestHarness {
     tokio::spawn(async move {
         let _ = run_register_server(
             reg_sock,
-            reg_config,
-            reg_store,
-            reg_pi_store,
-            reg_db,
-            reg_pi_notify,
-            Duration::from_secs(3600),
+            std::sync::Arc::new(xmsg::http::AppState {
+                sessions_dirs: vec![],
+                agy_config: reg_config,
+                agy_store: reg_store,
+                pi_store: reg_pi_store,
+                pi_notify_tx: reg_pi_notify,
+                svc_store: reg_svc_store,
+                svc_notify_tx: reg_svc_notify,
+                node_name: xmsg::node::local_node_name(),
+                max_body: 65536,
+                request_counter: std::sync::atomic::AtomicU64::new(1),
+                db: reg_db,
+                notify_tx: tokio::sync::broadcast::channel(16).0,
+                reply_ttl: Duration::from_secs(3600),
+                idempotency_ttl: std::time::Duration::from_secs(86400),
+                long_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
+                fed_state: None,
+            }),
             my_uid,
-            reg_svc_store,
             reg_trusted_svc,
-            reg_svc_notify,
-            None,
         )
         .await;
     });
@@ -200,8 +209,8 @@ async fn read_json_line(reader: &mut BufReader<OwnedReadHalf>) -> Value {
 
 /// Oracle 1: A trusted executable with matching UID registers successfully and is addressable.
 /// - Registers on register.sock as svc:<name>.
-/// - Addressable in GET /v1/sessions as harness "svc" and status "idle".
-/// - Addressable via both svc:<name> and <name> on GET /v1/sessions/:ref.
+/// - Listed in GET /v1/recipients as a live service, addressed `name@node`.
+/// - Addressable by its bare name only; `svc:<name>` names nothing (A11).
 /// - Inbound message to svc:<name> is accepted and queued as delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_oracle_1_trusted_exe_registered_and_addressable() {
@@ -226,17 +235,19 @@ async fn test_oracle_1_trusted_exe_registered_and_addressable() {
         "Registration with trusted exe must succeed: {:?}",
         reg_resp
     );
-    assert_eq!(
-        reg_resp.get("sessionId").and_then(|s| s.as_str()),
-        Some("dispatcher")
+    assert!(
+        reg_resp["address"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("dispatcher@")),
+        "{reg_resp}"
     );
 
     let client = reqwest::Client::new();
     let base_url = format!("http://127.0.0.1:{}", harness.http_port);
 
-    // 2. Query /v1/sessions: must list dispatcher
+    // 2. Query /v1/recipients: must list dispatcher as a live service
     let sessions_resp: Value = client
-        .get(format!("{base_url}/v1/sessions"))
+        .get(format!("{base_url}/v1/recipients"))
         .send()
         .await
         .unwrap()
@@ -244,54 +255,45 @@ async fn test_oracle_1_trusted_exe_registered_and_addressable() {
         .await
         .unwrap();
 
-    let sessions = sessions_resp.as_array().expect("sessions list");
+    let sessions = sessions_resp.as_array().expect("recipients list");
+    let node = "test-host";
     let svc_session = sessions
         .iter()
-        .find(|s| s.get("sessionId").and_then(|v| v.as_str()) == Some("dispatcher"))
-        .expect("dispatcher session must be present in /v1/sessions");
-
-    assert_eq!(
-        svc_session.get("harness").and_then(|v| v.as_str()),
-        Some("svc")
-    );
-    assert_eq!(
-        svc_session.get("status").and_then(|v| v.as_str()),
-        Some("idle")
-    );
-    assert_eq!(
-        svc_session.get("kind").and_then(|v| v.as_str()),
-        Some("daemon")
-    );
-    assert_eq!(
-        svc_session.get("registered").and_then(|v| v.as_bool()),
-        Some(true)
+        .find(|s| s["address"] == format!("dispatcher@{node}"))
+        .expect("dispatcher must be present in /v1/recipients");
+    assert_eq!(svc_session["kind"], "service");
+    assert_eq!(svc_session["status"], "live");
+    assert!(
+        svc_session.get("label").is_none(),
+        "a service shows no label"
     );
 
-    // 3. Addressable as svc:dispatcher on /v1/sessions/:ref
-    let get_prefixed = client
-        .get(format!("{base_url}/v1/sessions/svc:dispatcher"))
+    // 3. Kind prefixes are gone (A11): `svc:dispatcher` names nothing
+    let prefixed = client
+        .post(format!("{base_url}/v1/messages"))
+        .json(&serde_json::json!({ "to": "svc:dispatcher", "from": "user", "text": "x" }))
         .send()
         .await
         .unwrap();
-    assert_eq!(get_prefixed.status(), StatusCode::OK);
-    let session_val: Value = get_prefixed.json().await.unwrap();
-    assert_eq!(
-        session_val.get("sessionId").and_then(|v| v.as_str()),
-        Some("dispatcher")
-    );
+    assert_eq!(prefixed.status(), StatusCode::NOT_FOUND);
 
-    // 4. Addressable as plain name (dispatcher) on /v1/sessions/:ref
-    let get_unprefixed = client
-        .get(format!("{base_url}/v1/sessions/dispatcher"))
+    // 4. Filtered by name and kind
+    let by_name: Value = client
+        .get(format!(
+            "{base_url}/v1/recipients?name=dispatcher&kind=service"
+        ))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    assert_eq!(get_unprefixed.status(), StatusCode::OK);
+    assert_eq!(by_name.as_array().map(Vec::len), Some(1), "{by_name}");
 
     // 5. Send message to svc:dispatcher via HTTP
     let send_resp = client
-        .post(format!("{base_url}/v1/sessions/svc:dispatcher/messages"))
-        .json(&serde_json::json!({
+        .post(format!("{base_url}/v1/messages"))
+        .json(&serde_json::json!({"to": "dispatcher",
             "from": "user",
             "text": "ping dispatcher"
         }))
@@ -306,8 +308,8 @@ async fn test_oracle_1_trusted_exe_registered_and_addressable() {
         Some("delivered")
     );
     assert_eq!(
-        send_val.get("sessionId").and_then(|v| v.as_str()),
-        Some("dispatcher")
+        send_val.get("address").and_then(|v| v.as_str()),
+        Some(format!("dispatcher@{node}").as_str())
     );
 }
 
@@ -349,7 +351,8 @@ async fn test_oracle_2_untrusted_exe_refused() {
     let client = reqwest::Client::new();
     let base_url = format!("http://127.0.0.1:{}", harness.http_port);
     let get_resp = client
-        .get(format!("{base_url}/v1/sessions/svc:dispatcher"))
+        .post(format!("{base_url}/v1/messages"))
+        .json(&serde_json::json!({ "to": "dispatcher", "from": "user", "text": "x" }))
         .send()
         .await
         .unwrap();
@@ -385,8 +388,8 @@ async fn test_oracle_3_message_delivered_once_in_order() {
     // 2. Send 3 sequential messages
     for i in 1..=3 {
         let resp = client
-            .post(format!("{base_url}/v1/sessions/svc:order-test/messages"))
-            .json(&serde_json::json!({
+            .post(format!("{base_url}/v1/messages"))
+            .json(&serde_json::json!({"to": "order-test",
                 "from": "sender",
                 "text": format!("payload-{i}")
             }))
@@ -466,8 +469,8 @@ async fn test_oracle_4_cursor_advances_only_on_explicit_ack() {
     let client = reqwest::Client::new();
     let base_url = format!("http://127.0.0.1:{}", harness.http_port);
     let send_resp = client
-        .post(format!("{base_url}/v1/sessions/svc:cursor-test/messages"))
-        .json(&serde_json::json!({
+        .post(format!("{base_url}/v1/messages"))
+        .json(&serde_json::json!({"to": "cursor-test",
             "from": "coordinator",
             "text": "critical-task-payload"
         }))
@@ -657,8 +660,10 @@ async fn test_oracle_5_second_live_registration_refused() {
         "Registration after first daemon dies MUST succeed: {:?}",
         reg_resp2
     );
-    assert_eq!(
-        reg_resp2.get("sessionId").and_then(|s| s.as_str()),
-        Some("singleton-svc")
+    assert!(
+        reg_resp2["address"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("singleton-svc@")),
+        "{reg_resp2}"
     );
 }

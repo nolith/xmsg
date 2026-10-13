@@ -343,13 +343,10 @@ async fn wait_line(rx: &Arc<Mutex<Vec<String>>>) -> Option<String> {
 
 /// An anonymous HTTP send from `ci`, over the node's TCP listener: (status, body).
 async fn http_send(node: &Node, r: &str, text: &str) -> (u16, String) {
-    let url = format!(
-        "http://127.0.0.1:{}/v1/sessions/{}/messages",
-        node.http_port, r
-    );
+    let url = format!("http://127.0.0.1:{}/v1/messages", node.http_port);
     let resp = reqwest::Client::new()
         .post(url)
-        .json(&json!({ "from": "ci", "text": text }))
+        .json(&json!({ "to": r, "from": "ci", "text": text }))
         .timeout(Duration::from_secs(15))
         .send()
         .await
@@ -491,7 +488,7 @@ async fn test_oracle_1_ca_names_in_received_origins() {
 
         let (mut sr, mut sw) = register_svc(&r, "fed-worker").await;
         for (s, text) in [(&s1, "from bitstream"), (&s2, "from the pod")] {
-            let (status, body) = http_send(s, "svc:fed-worker@sini.cortex", text).await;
+            let (status, body) = http_send(s, "fed-worker@sini.cortex", text).await;
             assert_eq!(status, 202, "send to sini.cortex: {body}");
         }
         let mut origins = Vec::new();
@@ -500,7 +497,7 @@ async fn test_oracle_1_ca_names_in_received_origins() {
             assert_eq!(d["action"], "deliver", "{d}");
             origins.push((
                 d["text"].as_str().unwrap().to_string(),
-                d["origin"]["host"].as_str().unwrap_or_default().to_string(),
+                d["origin"]["node"].as_str().unwrap_or_default().to_string(),
             ));
         }
         origins.sort();
@@ -567,6 +564,7 @@ async fn test_oracle_2_ca_entry_keyed_by_other_name_refused() {
 // Mutant M3: put the nickname on the wire (the hub's forward mark) => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
     run_with_port_retry(|| async {
         let l_creds = pinned_creds("laptop-host");
@@ -896,7 +894,7 @@ async fn test_oracle_7_filters_match_names_and_ids() {
         let (mut sr, mut sw) = register_svc(&r, "genie-guard").await;
         let impostor = claude_session(&r.sessions_dir, "sess-impostor", "genie-guard");
 
-        let (status, body) = http_send(&s, "svc:genie-guard@r", "to the service").await;
+        let (status, body) = http_send(&s, "genie-guard@r", "to the service").await;
         assert_eq!(status, 202, "the service is admitted: {body}");
         let d = svc_poll(&mut sr, &mut sw).await;
         assert_eq!(d["text"], "to the service", "{d}");
@@ -966,6 +964,7 @@ async fn test_oracle_8_no_hand_assigned_name() {
 // Mutant M7c: strip every retired kind prefix from the ref => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_7b_hub_targets_refuse_harness_kind_refs() {
     run_with_port_retry(|| async {
         let a_creds = pinned_creds("a");

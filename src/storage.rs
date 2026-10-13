@@ -17,8 +17,6 @@ pub struct MessageRecord {
     pub return_harness: Option<String>,
     #[serde(default)]
     pub return_session_id: Option<String>,
-    #[serde(default = "default_true")]
-    pub push_replies: bool,
     #[serde(default)]
     pub thread_id: String,
     #[serde(default)]
@@ -27,10 +25,6 @@ pub struct MessageRecord {
 
 fn default_recipient_harness() -> String {
     "claude".to_string()
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,19 +67,79 @@ pub struct AgyPendingMessage {
     pub delivered_at: Option<i64>,
 }
 
+/// Where a message came from, one shape for every sender (A12): an instance's `id` or a
+/// service's name, the `node` that attests it, and the sender's own `label`. An anonymous
+/// sender has neither `id` nor `service`; its `label` is its unattested `from`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum SvcOrigin {
-    #[serde(rename = "local", rename_all = "camelCase")]
-    Local { harness: String, session_id: String },
-    #[serde(rename = "fed", rename_all = "camelCase")]
-    Fed {
-        host: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        principal: Option<String>,
-    },
-    #[serde(rename = "anonymous")]
-    Anonymous,
+#[serde(deny_unknown_fields)]
+pub struct Origin {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    pub node: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl Origin {
+    pub fn instance(id: &str, node: &str, label: Option<&str>) -> Origin {
+        Origin {
+            id: Some(id.to_string()),
+            service: None,
+            node: node.to_string(),
+            label: label.map(str::to_string),
+        }
+    }
+
+    pub fn service(name: &str, node: &str) -> Origin {
+        Origin {
+            id: None,
+            service: Some(name.to_string()),
+            node: node.to_string(),
+            label: None,
+        }
+    }
+
+    pub fn anonymous(from: &str, node: &str) -> Origin {
+        Origin {
+            id: None,
+            service: None,
+            node: node.to_string(),
+            label: Some(from.to_string()),
+        }
+    }
+
+    /// A12's one render, with `node` shown as `shown_node` (a reader's nickname for it):
+    /// `name@node` for a service, `label · id@node` for an instance, and
+    /// `<from> · anon@node` for an anonymous sender.
+    pub fn render(&self, shown_node: &str) -> String {
+        match (&self.service, &self.id) {
+            (Some(name), _) => crate::inbox::sender_label(shown_node, "svc", name, None),
+            (None, Some(id)) => {
+                crate::inbox::sender_label(shown_node, "", id, self.label.as_deref())
+            }
+            (None, None) => {
+                let from = self
+                    .label
+                    .as_deref()
+                    .and_then(crate::inbox::clean_label)
+                    .unwrap_or_default();
+                format!("{from} · anon@{shown_node}")
+            }
+        }
+    }
+
+    /// The sender's attested key: its instance ID or service name, `None` when anonymous.
+    pub fn key(&self) -> Option<&str> {
+        self.service.as_deref().or(self.id.as_deref())
+    }
+}
+
+fn origin_from_sql(s: String) -> Result<Origin> {
+    serde_json::from_str(&s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,7 +153,10 @@ pub struct SvcPendingMessage {
     pub text: String,
     pub envelope: String,
     pub delivered_at: Option<i64>,
-    pub origin: SvcOrigin,
+    pub origin: Origin,
+    /// The message this one answers, when it is a pushed reply (A10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,7 +182,7 @@ pub fn now_epoch_secs() -> i64 {
 
 /// Schema N: the first schema that records its version (`PRAGMA user_version`).
 /// Neither the deployed `ee1b6ca` nor any build before it set one, so they read 0.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The tables that hold message state. A database below schema N has them in an
 /// older shape, and the migration drops them with their rows (limited release).
@@ -154,7 +211,6 @@ const SCHEMA_N: &str = r#"
             recipient_harness TEXT NOT NULL DEFAULT 'claude',
             return_harness TEXT,
             return_session_id TEXT,
-            push_replies INTEGER NOT NULL DEFAULT 1,
             thread_id TEXT NOT NULL DEFAULT '',
             return_host TEXT NOT NULL DEFAULT ''
         );
@@ -209,7 +265,8 @@ const SCHEMA_N: &str = r#"
             text TEXT NOT NULL,
             envelope TEXT NOT NULL,
             delivered_at INTEGER,
-            origin TEXT NOT NULL DEFAULT '{"kind":"anonymous"}'
+            origin TEXT NOT NULL,
+            in_reply_to TEXT
         );
 
         CREATE TABLE IF NOT EXISTS idempotency_keys (
@@ -307,7 +364,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
 
 pub fn insert_message(conn: &Connection, msg: &MessageRecord) -> Result<()> {
     conn.execute(
-        "INSERT INTO messages (id, created_at, session_id, from_name, bytes, outcome, recipient_harness, return_harness, return_session_id, push_replies, thread_id, return_host) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO messages (id, created_at, session_id, from_name, bytes, outcome, recipient_harness, return_harness, return_session_id, thread_id, return_host) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             msg.id,
             msg.created_at,
@@ -318,7 +375,6 @@ pub fn insert_message(conn: &Connection, msg: &MessageRecord) -> Result<()> {
             msg.recipient_harness,
             msg.return_harness,
             msg.return_session_id,
-            if msg.push_replies { 1i64 } else { 0i64 },
             msg.thread_id,
             msg.return_host.as_deref().unwrap_or(""),
         ],
@@ -328,14 +384,13 @@ pub fn insert_message(conn: &Connection, msg: &MessageRecord) -> Result<()> {
 
 pub fn get_message(conn: &Connection, id: &str) -> Result<Option<MessageRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT id, created_at, session_id, from_name, bytes, outcome, recipient_harness, return_harness, return_session_id, push_replies, thread_id, return_host FROM messages WHERE id = ?1",
+        "SELECT id, created_at, session_id, from_name, bytes, outcome, recipient_harness, return_harness, return_session_id, thread_id, return_host FROM messages WHERE id = ?1",
     )?;
     let mut rows = stmt.query(params![id])?;
 
     if let Some(row) = rows.next()? {
         let bytes_i64: i64 = row.get(4)?;
-        let push_replies_i64: i64 = row.get(9)?;
-        let ret_host: String = row.get(11)?;
+        let ret_host: String = row.get(10)?;
         let return_host = if ret_host.is_empty() {
             None
         } else {
@@ -351,8 +406,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<MessageRecord>>
             recipient_harness: row.get(6)?,
             return_harness: row.get(7)?,
             return_session_id: row.get(8)?,
-            push_replies: push_replies_i64 != 0,
-            thread_id: row.get(10)?,
+            thread_id: row.get(9)?,
             return_host,
         }))
     } else {
@@ -406,6 +460,14 @@ pub fn update_outbound_outcome(conn: &Connection, id: &str, outcome: &str) -> Re
     conn.execute(
         "UPDATE outbound SET outcome = ?1 WHERE id = ?2",
         params![outcome, id],
+    )?;
+    Ok(())
+}
+
+pub fn update_outbound_target(conn: &Connection, id: &str, target_ref: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE outbound SET target_ref = ?1 WHERE id = ?2",
+        params![target_ref, id],
     )?;
     Ok(())
 }
@@ -694,9 +756,9 @@ pub fn insert_svc_message(conn: &Connection, msg: &SvcPendingMessage) -> Result<
         return Ok(false);
     }
     let origin_json = serde_json::to_string(&msg.origin)
-        .unwrap_or_else(|_| "{\"kind\":\"anonymous\"}".to_string());
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     conn.execute(
-        "INSERT INTO svc_pending_messages (id, session_id, created_at, from_name, bytes, text, envelope, delivered_at, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO svc_pending_messages (id, session_id, created_at, from_name, bytes, text, envelope, delivered_at, origin, in_reply_to) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             msg.id,
             msg.session_id,
@@ -707,6 +769,7 @@ pub fn insert_svc_message(conn: &Connection, msg: &SvcPendingMessage) -> Result<
             msg.envelope,
             msg.delivered_at,
             origin_json,
+            msg.in_reply_to,
         ],
     )?;
     Ok(true)
@@ -716,20 +779,14 @@ pub fn get_next_pending_svc_message(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Option<SvcPendingMessage>> {
-    let alt_session_id = if let Some(stripped) = session_id.strip_prefix("svc:") {
-        stripped.to_string()
-    } else {
-        format!("svc:{session_id}")
-    };
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, created_at, from_name, bytes, text, envelope, delivered_at, origin FROM svc_pending_messages WHERE (session_id = ?1 OR session_id = ?2) AND delivered_at IS NULL ORDER BY created_at ASC, rowid ASC LIMIT 1",
+        "SELECT id, session_id, created_at, from_name, bytes, text, envelope, delivered_at, origin, in_reply_to FROM svc_pending_messages WHERE session_id = ?1 AND delivered_at IS NULL ORDER BY created_at ASC, rowid ASC LIMIT 1",
     )?;
-    let mut rows = stmt.query(params![session_id, alt_session_id])?;
+    let mut rows = stmt.query(params![session_id])?;
 
     if let Some(row) = rows.next()? {
         let bytes_i64: i64 = row.get(4)?;
-        let origin_str: String = row.get(8)?;
-        let origin: SvcOrigin = serde_json::from_str(&origin_str).unwrap_or(SvcOrigin::Anonymous);
+        let origin = origin_from_sql(row.get(8)?)?;
         Ok(Some(SvcPendingMessage {
             id: row.get(0)?,
             session_id: row.get(1)?,
@@ -740,6 +797,7 @@ pub fn get_next_pending_svc_message(
             envelope: row.get(6)?,
             delivered_at: row.get(7)?,
             origin,
+            in_reply_to: row.get(9)?,
         }))
     } else {
         Ok(None)
@@ -747,15 +805,10 @@ pub fn get_next_pending_svc_message(
 }
 
 pub fn ack_svc_message(conn: &Connection, session_id: &str, message_id: &str) -> Result<bool> {
-    let alt_session_id = if let Some(stripped) = session_id.strip_prefix("svc:") {
-        stripped.to_string()
-    } else {
-        format!("svc:{session_id}")
-    };
     let now = now_epoch_secs();
     let count = conn.execute(
-        "UPDATE svc_pending_messages SET delivered_at = ?1 WHERE id = ?2 AND (session_id = ?3 OR session_id = ?4) AND delivered_at IS NULL",
-        params![now, message_id, session_id, alt_session_id],
+        "UPDATE svc_pending_messages SET delivered_at = ?1 WHERE id = ?2 AND session_id = ?3 AND delivered_at IS NULL",
+        params![now, message_id, session_id],
     )?;
     Ok(count > 0)
 }
@@ -840,12 +893,12 @@ pub struct PeerMailboxMessage {
     pub bytes: usize,
     pub body: String,
     pub envelope: String,
-    pub origin: SvcOrigin,
+    pub origin: Origin,
 }
 
 pub fn insert_peer_mailbox(conn: &Connection, msg: &PeerMailboxMessage) -> Result<bool> {
     let origin_json = serde_json::to_string(&msg.origin)
-        .unwrap_or_else(|_| "{\"kind\":\"anonymous\"}".to_string());
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     conn.execute(
         "INSERT INTO peer_mailbox (id, peer, target_ref, created_at, from_name, bytes, body, envelope, origin)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -878,8 +931,7 @@ pub fn get_next_peer_mailbox_message(
     let mut rows = stmt.query(params![peer])?;
     if let Some(row) = rows.next()? {
         let bytes_i64: i64 = row.get(5)?;
-        let origin_str: String = row.get(8)?;
-        let origin: SvcOrigin = serde_json::from_str(&origin_str).unwrap_or(SvcOrigin::Anonymous);
+        let origin = origin_from_sql(row.get(8)?)?;
         Ok(Some(PeerMailboxMessage {
             id: row.get(0)?,
             peer: row.get(1)?,

@@ -283,7 +283,6 @@ fn claude_message(id: &str, session_id: &str) -> xmsg::storage::MessageRecord {
         recipient_harness: "claude".to_string(),
         return_harness: None,
         return_session_id: None,
-        push_replies: false,
         thread_id: id.to_string(),
         return_host: None,
     }
@@ -354,6 +353,23 @@ async fn fork_fixture(conv: &str) -> ForkFixture {
 // Mutant M1a: re-order by procStart on every scan => RED
 // Mutant M1b: memory-only claim table (CREATE TEMP TABLE) => RED
 // =============================================================================
+/// The claim table's view of the live Claude sessions, `{sessionId: <address>, pid}` per
+/// process: what `list` showed before A13 dropped the pid from its entries (the claim
+/// order is per process, so these oracles key on it).
+async fn claims_listing(state: &AppState) -> Vec<serde_json::Value> {
+    xmsg::claim::sync_claims(
+        &state.db,
+        &state.agy_config.proc_root,
+        &state.sessions_dirs,
+        &state.node_name,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(claim, entry)| serde_json::json!({ "sessionId": claim.address(), "pid": entry.pid }))
+    .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_oracle_1_order_and_persistence_across_restart() {
     let tmp = tempdir().unwrap();
@@ -381,15 +397,8 @@ async fn test_oracle_1_order_and_persistence_across_restart() {
     )
     .await;
 
-    let client = reqwest::Client::new();
-
     // Scan 1: P1 is observed first, receives plain conv_id (suffix 1)
-    let resp1 = client
-        .get(format!("{}/v1/sessions", server1.base_url))
-        .send()
-        .await
-        .unwrap();
-    let s1: Vec<serde_json::Value> = resp1.json().await.unwrap();
+    let s1: Vec<serde_json::Value> = claims_listing(&server1.state).await;
     assert_eq!(s1.len(), 1);
     assert_eq!(s1[0]["sessionId"], conv_id);
 
@@ -398,12 +407,7 @@ async fn test_oracle_1_order_and_persistence_across_restart() {
     write_claude_session_file(&sessions_dir, 1002, conv_id, "second", "100", &sock2);
 
     // Scan 2: P1 must KEEP plain conv_id; P2 must receive X~2 despite starting earlier
-    let resp2 = client
-        .get(format!("{}/v1/sessions", server1.base_url))
-        .send()
-        .await
-        .unwrap();
-    let s2: Vec<serde_json::Value> = resp2.json().await.unwrap();
+    let s2: Vec<serde_json::Value> = claims_listing(&server1.state).await;
     assert_eq!(s2.len(), 2);
     let p1_entry = s2.iter().find(|s| s["pid"] == 1001).unwrap();
     let p2_entry = s2.iter().find(|s| s["pid"] == 1002).unwrap();
@@ -430,12 +434,7 @@ async fn test_oracle_1_order_and_persistence_across_restart() {
     .await;
 
     // Scan on restarted server: persistence preserves claims
-    let resp3 = client
-        .get(format!("{}/v1/sessions", server2.base_url))
-        .send()
-        .await
-        .unwrap();
-    let s3: Vec<serde_json::Value> = resp3.json().await.unwrap();
+    let s3: Vec<serde_json::Value> = claims_listing(&server2.state).await;
     assert_eq!(s3.len(), 2);
     let p1_after = s3.iter().find(|s| s["pid"] == 1001).unwrap();
     let p2_after = s3.iter().find(|s| s["pid"] == 1002).unwrap();
@@ -706,15 +705,7 @@ async fn test_oracle_5_fork_identity_attribution_and_routing() {
         db_path.clone(),
     )
     .await;
-    let client = reqwest::Client::new();
-    let s1: Vec<serde_json::Value> = client
-        .get(format!("{}/v1/sessions", server.base_url))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let s1: Vec<serde_json::Value> = claims_listing(&server.state).await;
     assert_eq!(s1.len(), 1);
     assert_eq!(s1[0]["sessionId"], conv_id);
 
@@ -730,14 +721,7 @@ async fn test_oracle_5_fork_identity_attribution_and_routing() {
         &my_start,
         &listener_p2.sock_path,
     );
-    let s2: Vec<serde_json::Value> = client
-        .get(format!("{}/v1/sessions", server.base_url))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let s2: Vec<serde_json::Value> = claims_listing(&server.state).await;
     let p2_entry = s2.iter().find(|s| s["pid"] == my_pid).expect("P2 listed");
     assert_eq!(p2_entry["sessionId"], fork_addr);
 
@@ -745,11 +729,11 @@ async fn test_oracle_5_fork_identity_attribution_and_routing() {
     //    reply to it is routed back to.
     let sent = agent_request(
         &server.agent_sock,
-        serde_json::json!({"action": "send", "ref": conv_id, "text": "hello from the fork"}),
+        serde_json::json!({"action": "send", "to": conv_id, "text": "hello from the fork"}),
     )
     .await;
     assert_eq!(sent["status"], "ok", "send from P2 failed: {sent}");
-    let sent_id = sent["delivery"]["messageId"]
+    let sent_id = sent["message_id"]
         .as_str()
         .unwrap_or_else(|| panic!("no messageId in {sent}"));
     let record = xmsg::storage::get_message(&server.state.db.lock().unwrap(), sent_id)
@@ -781,7 +765,7 @@ async fn test_oracle_5_fork_identity_attribution_and_routing() {
     }
     let allowed = agent_request(
         &server.agent_sock,
-        serde_json::json!({"action": "reply", "messageId": "msg-fork-002", "text": "reply as the fork"}),
+        serde_json::json!({"action": "reply", "message_id": "msg-fork-002", "text": "reply as the fork"}),
     )
     .await;
     assert_eq!(
@@ -790,11 +774,11 @@ async fn test_oracle_5_fork_identity_attribution_and_routing() {
     );
     let denied = agent_request(
         &server.agent_sock,
-        serde_json::json!({"action": "reply", "messageId": "msg-plain-001", "text": "reply as the fork"}),
+        serde_json::json!({"action": "reply", "message_id": "msg-plain-001", "text": "reply as the fork"}),
     )
     .await;
     assert_eq!(
-        denied["error"], "not_recipient",
+        denied["error"], "denied",
         "P2 MUST be denied a reply to a message addressed to plain X: {denied}"
     );
 
@@ -1119,8 +1103,8 @@ async fn test_oracle_6d_fork_notice_on_send_without_list() {
     .await;
 
     let res = reqwest::Client::new()
-        .post(format!("{}/v1/sessions/{conv}/messages", server.base_url))
-        .json(&serde_json::json!({"from": "tester", "text": "hello X"}))
+        .post(format!("{}/v1/messages", server.base_url))
+        .json(&serde_json::json!({"to": conv, "from": "tester", "text": "hello X"}))
         .send()
         .await
         .unwrap();
@@ -1219,17 +1203,19 @@ async fn test_oracle_7_agy_conversation_uuid_across_restart() {
         .expect("agy 7777 MUST be registered under conversation UUID C");
     assert_eq!(before.session_key, conv_uuid, "Session key MUST be C");
     assert_eq!(before.conversation_id, conv_uuid);
-    let addressed: serde_json::Value = reqwest::Client::new()
-        .get(format!("{}/v1/sessions/{conv_uuid}", server.base_url))
+    let listed: Vec<serde_json::Value> = reqwest::Client::new()
+        .get(format!("{}/v1/recipients", server.base_url))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(
-        addressed["sessionId"], conv_uuid,
-        "agy MUST be addressed as C"
+    assert!(
+        listed
+            .iter()
+            .any(|r| r["address"] == format!("{conv_uuid}@{}", server.state.node_name)),
+        "agy MUST be addressed as C: {listed:?}"
     );
 
     // 2. A message addressed to C is received before the restart.
@@ -1261,7 +1247,7 @@ async fn test_oracle_7_agy_conversation_uuid_across_restart() {
     );
     let reply = agent_request(
         &server.agent_sock,
-        serde_json::json!({"action": "reply", "messageId": "msg-before-restart-1", "text": "reply after restart"}),
+        serde_json::json!({"action": "reply", "message_id": "msg-before-restart-1", "text": "reply after restart"}),
     )
     .await;
     drop(mcp2);
@@ -1293,6 +1279,7 @@ async fn test_oracle_8_pi_server_minted_uuid_v4() {
     setup_mock_proc(&proc_root, 5555, "100");
 
     let req = xmsg::pi::PiRegisterRequest {
+        harness: None,
         session_id: Some("asserted-custom-pi-id-z".to_string()),
         session_name: Some("pi-worker".to_string()),
         cwd: Some("/workspace".to_string()),
@@ -1349,6 +1336,7 @@ async fn test_oracle_8_pi_server_minted_uuid_v4() {
     // Second registration on a new process must mint a DIFFERENT UUID
     setup_mock_proc(&proc_root, 6666, "200");
     let req2 = xmsg::pi::PiRegisterRequest {
+        harness: None,
         session_id: Some("asserted-custom-pi-id-z".to_string()),
         session_name: Some("pi-worker".to_string()),
         cwd: Some("/workspace".to_string()),
@@ -1450,6 +1438,7 @@ async fn test_oracle_9_service_name_validation_refusals() {
         "550e8400-e29b-41d4-a716-446655440000",
         "worker.dot",
         "worker~tilde",
+        "svc:worker",
     ];
 
     let mut trusted = std::collections::HashMap::new();
@@ -1462,6 +1451,7 @@ async fn test_oracle_9_service_name_validation_refusals() {
         let reader = tokio::io::BufReader::new(tokio::io::empty());
 
         let req = xmsg::svc::SvcRegisterRequest {
+            harness: None,
             name: bad_name.to_string(),
             cwd: None,
         };
@@ -1469,18 +1459,33 @@ async fn test_oracle_9_service_name_validation_refusals() {
         let res = xmsg::svc::handle_svc_connection(
             reader,
             server_write,
-            proc_root.clone(),
-            svc_store.clone(),
+            std::sync::Arc::new(xmsg::http::AppState {
+                sessions_dirs: vec![],
+                agy_config: xmsg::agy::AgyConfig {
+                    proc_root: proc_root.clone(),
+                    ..Default::default()
+                },
+                agy_store: xmsg::agy::new_agy_store(),
+                pi_store: xmsg::pi::new_pi_store(),
+                pi_notify_tx: tokio::sync::broadcast::channel(16).0,
+                svc_store: svc_store.clone(),
+                svc_notify_tx: svc_notify_tx.clone(),
+                node_name: "test-node".to_string(),
+                max_body: 65536,
+                request_counter: std::sync::atomic::AtomicU64::new(1),
+                db: db.clone(),
+                notify_tx: tokio::sync::broadcast::channel(16).0,
+                reply_ttl: Duration::from_secs(60),
+                idempotency_ttl: Duration::from_secs(60),
+                long_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+                fed_state: None,
+            }),
             &trusted,
             my_uid,
             my_uid,
             9991,
             req,
-            db.clone(),
-            svc_notify_tx.clone(),
-            Duration::from_secs(60),
             false,
-            None,
             None,
         )
         .await;

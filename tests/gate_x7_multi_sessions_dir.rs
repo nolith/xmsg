@@ -201,25 +201,22 @@ async fn test_oracle_1_multi_dir_listed_and_deliverable() {
     let client = reqwest::Client::new();
 
     let list_res = client
-        .get(format!("{}/v1/sessions", server.base_url))
+        .get(format!("{}/v1/recipients", server.base_url))
         .send()
         .await
-        .expect("send get /v1/sessions");
+        .expect("send get /v1/recipients");
     assert_eq!(list_res.status(), 200);
     let sessions_array: Vec<serde_json::Value> = list_res.json().await.unwrap();
     assert_eq!(
         sessions_array.len(),
         2,
-        "HTTP /v1/sessions must return both sessions"
+        "HTTP /v1/recipients must return both sessions"
     );
 
     // 3. Deliverability to session in dir_a
     let post_a = client
-        .post(format!(
-            "{}/v1/sessions/sess-alpha-001/messages",
-            server.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", server.base_url))
+        .json(&serde_json::json!({"to": "sess-alpha-001",
             "from": "claude",
             "text": "Hello Alpha"
         }))
@@ -237,11 +234,8 @@ async fn test_oracle_1_multi_dir_listed_and_deliverable() {
 
     // 4. Deliverability to session in dir_b
     let post_b = client
-        .post(format!(
-            "{}/v1/sessions/sess-beta-002/messages",
-            server.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", server.base_url))
+        .json(&serde_json::json!({"to": "sess-beta-002",
             "from": "claude",
             "text": "Hello Beta"
         }))
@@ -381,37 +375,34 @@ async fn test_oracle_3_duplicate_session_across_dirs_assigned_suffixes_and_route
     let client = reqwest::Client::new();
 
     let list_res = client
-        .get(format!("{}/v1/sessions", server.base_url))
+        .get(format!("{}/v1/recipients", server.base_url))
         .send()
         .await
         .unwrap();
     let returned_sessions: Vec<serde_json::Value> = list_res.json().await.unwrap();
     let returned_ids: Vec<&str> = returned_sessions
         .iter()
-        .filter_map(|s| s["sessionId"].as_str())
+        .filter_map(|s| s["address"].as_str()?.strip_suffix("@test-host"))
         .collect();
 
     let fork_id = format!("{duplicate_id}~2");
     assert!(
         returned_ids.contains(&duplicate_id),
-        "HTTP /v1/sessions must return plain session ID for first process"
+        "HTTP /v1/recipients must return plain session ID for first process"
     );
     assert!(
         returned_ids.contains(&fork_id.as_str()),
-        "HTTP /v1/sessions must return fork session ID (~2) for second process"
+        "HTTP /v1/recipients must return fork session ID (~2) for second process"
     );
     assert!(
         returned_ids.contains(&unique_id),
-        "HTTP /v1/sessions must return unique session ID"
+        "HTTP /v1/recipients must return unique session ID"
     );
 
     // 2. Delivery to plain duplicate session reaches first process (202)
     let post_plain = client
-        .post(format!(
-            "{}/v1/sessions/{duplicate_id}/messages",
-            server.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", server.base_url))
+        .json(&serde_json::json!({"to": duplicate_id,
             "from": "claude",
             "text": "Message to plain duplicate"
         }))
@@ -426,11 +417,8 @@ async fn test_oracle_3_duplicate_session_across_dirs_assigned_suffixes_and_route
 
     // 3. Delivery to fork duplicate session reaches second process (202)
     let post_fork = client
-        .post(format!(
-            "{}/v1/sessions/{fork_id}/messages",
-            server.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", server.base_url))
+        .json(&serde_json::json!({"to": fork_id,
             "from": "claude",
             "text": "Message to fork duplicate"
         }))
@@ -445,11 +433,8 @@ async fn test_oracle_3_duplicate_session_across_dirs_assigned_suffixes_and_route
 
     // 4. Delivery to unique session must succeed 202
     let post_unique = client
-        .post(format!(
-            "{}/v1/sessions/{unique_id}/messages",
-            server.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", server.base_url))
+        .json(&serde_json::json!({"to": unique_id,
             "from": "claude",
             "text": "Message to unique"
         }))

@@ -62,9 +62,8 @@ async fn send_via_agent_sock(agent_sock: &Path, target_ref: &str, text: &str) ->
 
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": target_ref,
+        "to": target_ref,
         "text": text,
-        "push_replies": true,
     });
     writer
         .write_all(format!("{send_req}\n").as_bytes())
@@ -260,31 +259,10 @@ async fn create_full_test_node(
     });
 
     let r_sock = register_sock.clone();
-    let r_cfg = agy_config.clone();
-    let r_ast = agy_store.clone();
-    let r_pst = pi_store.clone();
-    let r_db = db.clone();
-    let r_pi_not = pi_notify_tx.clone();
-    let r_sst = svc_store.clone();
-    let r_svc_not = svc_notify_tx.clone();
-    let reg_fed_state = Some(fed_state.clone());
 
+    let r_state_xa3 = app_state.clone();
     tokio::spawn(async move {
-        let _ = run_register_server(
-            r_sock,
-            r_cfg,
-            r_ast,
-            r_pst,
-            r_db,
-            r_pi_not,
-            Duration::from_secs(3600),
-            my_uid,
-            r_sst,
-            trusted_svc_exes,
-            r_svc_not,
-            reg_fed_state,
-        )
-        .await;
+        let _ = run_register_server(r_sock, r_state_xa3, my_uid, trusted_svc_exes).await;
     });
 
     for _ in 0..50 {
@@ -486,21 +464,23 @@ async fn test_oracle_1_full_node_svc_federated_reply() {
 
     let reg_resp = read_json_line(&mut reader_b).await;
     assert_eq!(reg_resp["status"], "ok");
-    assert_eq!(reg_resp["sessionId"], "guard");
+    assert!(
+        reg_resp["address"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("guard@")),
+        "{reg_resp}"
+    );
 
     // 2. Node A sends to svc:guard@node_b
     let send_resp = send_via_agent_sock(
         &node_a.agent_sock,
-        "svc:guard@node_b",
+        "guard@node_b",
         "Review request from A to guard",
     )
     .await;
     assert_eq!(send_resp["status"], "ok");
-    assert_eq!(send_resp["delivery"]["outcome"], "delivered");
-    let msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert_eq!(send_resp["outcome"], "delivered");
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // 3. On B, guard polls the message
     let poll_frame = serde_json::json!({
@@ -530,7 +510,7 @@ async fn test_oracle_1_full_node_svc_federated_reply() {
 
     let reply_resp = read_json_line(&mut reader_b).await;
     assert_eq!(reply_resp["status"], "ok");
-    assert!(reply_resp["messageId"].is_string());
+    assert!(reply_resp["messageId"].is_string(), "{reply_resp}");
 
     // 5. Node A receives the reply from svc:guard
     let mut got_reply = false;
@@ -575,20 +555,18 @@ async fn test_oracle_2_local_svc_reply_records_pushed() {
 
     let reg_resp = read_json_line(&mut reader).await;
     assert_eq!(reg_resp["status"], "ok");
-    assert_eq!(reg_resp["sessionId"], "guard");
+    assert!(
+        reg_resp["address"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("guard@")),
+        "{reg_resp}"
+    );
 
     // 2. Send local message to svc:guard (non-federated, no @host)
-    let send_resp = send_via_agent_sock(
-        &node.agent_sock,
-        "svc:guard",
-        "Local task request for guard",
-    )
-    .await;
+    let send_resp =
+        send_via_agent_sock(&node.agent_sock, "guard", "Local task request for guard").await;
     assert_eq!(send_resp["status"], "ok");
-    let msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // 3. Guard polls message
     let poll_frame = serde_json::json!({
@@ -618,7 +596,7 @@ async fn test_oracle_2_local_svc_reply_records_pushed() {
 
     let reply_resp = read_json_line(&mut reader).await;
     assert_eq!(reply_resp["status"], "ok");
-    assert!(reply_resp["messageId"].is_string());
+    assert!(reply_resp["messageId"].is_string(), "{reply_resp}");
 
     // 5. Verify DB: reply is recorded with outcome "pushed"
     let conn = node.db.lock().unwrap();

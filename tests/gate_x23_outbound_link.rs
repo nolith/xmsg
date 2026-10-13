@@ -58,9 +58,8 @@ async fn send_via_agent_sock(agent_sock: &Path, target_ref: &str, text: &str) ->
 
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": target_ref,
+        "to": target_ref,
         "text": text,
-        "push_replies": true,
     });
     writer
         .write_all(format!("{send_req}\n").as_bytes())
@@ -79,7 +78,7 @@ async fn reply_via_agent_sock(agent_sock: &Path, message_id: &str, text: &str) -
 
     let reply_req = serde_json::json!({
         "action": "reply",
-        "messageId": message_id,
+        "message_id": message_id,
         "text": text,
     });
     writer
@@ -421,11 +420,8 @@ async fn test_oracle_1_inbound_over_outbound_link() {
     let send_resp =
         send_via_agent_sock(&hub.agent_sock, "sess-bob@client", "hello bob from hub").await;
     assert_eq!(send_resp["status"], "ok");
-    assert_eq!(send_resp["delivery"]["outcome"], "queued");
-    let msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert_eq!(send_resp["outcome"], "queued");
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // 2. Client's pull loop pulls from hub and delivers to Bob
     let mut got_message = false;
@@ -499,11 +495,8 @@ async fn test_oracle_2_outbound_send_from_undialable_node() {
     let send_resp =
         send_via_agent_sock(&client.agent_sock, "sess-alice@hub", "hello alice from bob").await;
     assert_eq!(send_resp["status"], "ok");
-    assert_eq!(send_resp["delivery"]["outcome"], "delivered");
-    let msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert_eq!(send_resp["outcome"], "delivered");
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // 2. Alice on hub receives message
     let mut got_message = false;
@@ -585,21 +578,19 @@ async fn test_oracle_3_svc_over_outbound_link() {
         .unwrap();
     let reg_resp = read_json_line(&mut reader).await;
     assert_eq!(reg_resp["status"], "ok");
-    assert_eq!(reg_resp["sessionId"], "guard");
+    assert!(
+        reg_resp["address"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("guard@")),
+        "{reg_resp}"
+    );
 
     // 2. Alice on hub sends to svc:guard@client
-    let send_resp = send_via_agent_sock(
-        &hub.agent_sock,
-        "svc:guard@client",
-        "audit request from hub",
-    )
-    .await;
+    let send_resp =
+        send_via_agent_sock(&hub.agent_sock, "guard@client", "audit request from hub").await;
     assert_eq!(send_resp["status"], "ok");
-    assert_eq!(send_resp["delivery"]["outcome"], "queued");
-    let msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert_eq!(send_resp["outcome"], "queued");
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // 3. Service guard on client polls and receives message
     let poll_frame = serde_json::json!({
@@ -797,11 +788,8 @@ async fn test_oracle_5_unknown_ref_acked_and_error_reply() {
     // 1. Alice on hub sends to unresolvable ref nosuch@client
     let send_resp = send_via_agent_sock(&hub.agent_sock, "nosuch@client", "hello nobody").await;
     assert_eq!(send_resp["status"], "ok");
-    assert_eq!(send_resp["delivery"]["outcome"], "queued");
-    let msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert_eq!(send_resp["outcome"], "queued");
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // 2. Client pull loop fetches message, fails resolution, posts not_found error reply to hub, and acks
     let mut got_error_reply = false;

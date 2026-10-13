@@ -221,7 +221,6 @@ fn make_envelope(target: &str, body: &str) -> FedEnvelope {
             r#ref: target.to_string(),
         },
         body: body.to_string(),
-        push_replies: false,
         thread_id: format!("thr-{}", ulid::Ulid::new()),
         created_at: 1000,
         forwarded: None,
@@ -292,7 +291,7 @@ async fn test_oracle_1_ca_peer_accepted_and_delivered() {
 
     let node_a = create_test_node("client-a", a_peers, cert_a, Vec::new(), key_a).await;
 
-    let envelope = make_envelope("claude:sess-target", "hello ca federation");
+    let envelope = make_envelope("sess-target", "hello ca federation");
     let res = send_federated_message(&node_a.fed_state, "server-b", &envelope).await;
     assert!(res.is_ok(), "Expected send to succeed, got: {res:?}");
 
@@ -370,7 +369,7 @@ async fn test_oracle_2_different_ca_refused() {
 
     let node_a = create_test_node("client-a", a_peers, cert_a, Vec::new(), key_a).await;
 
-    let envelope = make_envelope("claude:sess-target", "untrusted CA send");
+    let envelope = make_envelope("sess-target", "untrusted CA send");
     let res = send_federated_message(&node_a.fed_state, "server-b", &envelope).await;
     assert!(
         res.is_err(),
@@ -464,7 +463,7 @@ async fn test_oracle_3_uri_not_in_identities_refused() {
 
     let node_a = create_test_node("client-a", a_peers, cert_a, Vec::new(), key_a).await;
 
-    let envelope = make_envelope("claude:sess-target", "wrong URI send");
+    let envelope = make_envelope("sess-target", "wrong URI send");
     let res = send_federated_message(&node_a.fed_state, "server-b", &envelope).await;
     assert!(
         res.is_err(),
@@ -580,7 +579,7 @@ async fn test_oracle_4_expired_and_not_yet_valid_refused() {
         expired_key,
     )
     .await;
-    let envelope = make_envelope("claude:sess-target", "expired cert");
+    let envelope = make_envelope("sess-target", "expired cert");
     let res_expired = send_federated_message(&expired_node.fed_state, "server-b", &envelope).await;
     assert!(
         res_expired.is_err(),
@@ -724,7 +723,7 @@ async fn test_oracle_5_zero_and_two_uri_sans_refused() {
     // Test zero URI SANs
     let zero_node =
         create_test_node("client-a", a_peers.clone(), zero_cert, Vec::new(), zero_key).await;
-    let envelope = make_envelope("claude:sess-target", "zero SANs");
+    let envelope = make_envelope("sess-target", "zero SANs");
     let res_zero = send_federated_message(&zero_node.fed_state, "server-b", &envelope).await;
     assert!(res_zero.is_err(), "Expected 0 URI SANs to fail handshake");
     match res_zero.unwrap_err() {
@@ -912,7 +911,7 @@ async fn test_oracle_6_prefix_wildcard_matching() {
         key_match,
     )
     .await;
-    let envelope = make_envelope("claude:sess-target", "prefix match");
+    let envelope = make_envelope("sess-target", "prefix match");
     let res = send_federated_message(&node_match.fed_state, "server-b", &envelope).await;
     assert!(
         res.is_ok(),
@@ -1067,7 +1066,7 @@ async fn test_oracle_7_overlapping_ca_peers_refused() {
 
     let node_a = create_test_node("client-a", a_peers, cert_a, Vec::new(), key_a).await;
 
-    let envelope = make_envelope("claude:sess-target", "overlap test");
+    let envelope = make_envelope("sess-target", "overlap test");
     let res = send_federated_message(&node_a.fed_state, "server-b", &envelope).await;
     assert!(
         res.is_err(),
@@ -1161,7 +1160,7 @@ async fn test_oracle_8_outbound_wrong_uri_fails() {
 
     let node_a = create_test_node("client-a", a_peers, cert_a, Vec::new(), key_a).await;
 
-    let envelope = make_envelope("claude:sess-target", "outbound wrong URI");
+    let envelope = make_envelope("sess-target", "outbound wrong URI");
     let res = send_federated_message(&node_a.fed_state, "server-b", &envelope).await;
     assert!(
         res.is_err(),
@@ -1249,7 +1248,7 @@ async fn test_oracle_8b_outbound_different_ca_fails() {
 
     let node_a = create_test_node("client-a", a_peers, cert_a, Vec::new(), key_a).await;
 
-    let envelope = make_envelope("claude:sess-target", "outbound wrong CA test");
+    let envelope = make_envelope("sess-target", "outbound wrong CA test");
     let res = send_federated_message(&node_a.fed_state, "server-b", &envelope).await;
     assert!(
         res.is_err(),
@@ -1340,7 +1339,7 @@ async fn test_oracle_9_ca_peer_policy_targets_enforced() {
     let node_a = create_test_node("client-a", a_peers, cert_a, Vec::new(), key_a).await;
 
     // 1. Send to allowed target -> succeeds
-    let env_allowed = make_envelope("claude:allowed-target", "msg to allowed");
+    let env_allowed = make_envelope("allowed-target", "msg to allowed");
     let res_allowed = send_federated_message(&node_a.fed_state, "server-b", &env_allowed).await;
     assert!(
         res_allowed.is_ok(),
@@ -1348,7 +1347,7 @@ async fn test_oracle_9_ca_peer_policy_targets_enforced() {
     );
 
     // 2. Send to denied target -> rejected by policy
-    let env_denied = make_envelope("claude:denied-target", "msg to denied");
+    let env_denied = make_envelope("denied-target", "msg to denied");
     let res_denied = send_federated_message(&node_a.fed_state, "server-b", &env_denied).await;
     assert!(
         res_denied.is_err(),
@@ -1713,7 +1712,7 @@ async fn test_oracle_12_outbound_only_pin_and_ca_double_match_refused() {
 
     let node_a = create_test_node("client-a", a_peers, cert_a, Vec::new(), key_a).await;
 
-    let envelope = make_envelope("claude:sess-target", "double match test");
+    let envelope = make_envelope("sess-target", "double match test");
     let res = send_federated_message(&node_a.fed_state, "server-b", &envelope).await;
     assert!(
         res.is_err(),

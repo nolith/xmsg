@@ -294,10 +294,14 @@ async fn test_mcp_initialize_and_tools_list() {
     let tools = list_resp["result"]["tools"]
         .as_array()
         .expect("tools array");
-    assert_eq!(tools.len(), 3, "Exactly 3 tools listed: list, send, reply");
+    assert_eq!(
+        tools.len(),
+        4,
+        "Exactly 4 tools listed: list, send, reply, replies"
+    );
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(tool_names, vec!["list", "send", "reply"]);
+    assert_eq!(tool_names, vec!["list", "send", "reply", "replies"]);
 
     // Invariant: None of the tools may have requiresUserInteraction set
     for t in tools {
@@ -308,7 +312,7 @@ async fn test_mcp_initialize_and_tools_list() {
         );
     }
 
-    // Invariant: send tool schema must require ref and text, and forbid from
+    // Invariant: send tool schema must require to and text, and forbid from
     let send_tool = tools.iter().find(|t| t["name"] == "send").unwrap();
     let schema = &send_tool["inputSchema"];
     assert!(
@@ -321,7 +325,7 @@ async fn test_mcp_initialize_and_tools_list() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(required, vec!["ref", "text"]);
+    assert_eq!(required, vec!["to", "text"]);
 }
 
 #[tokio::test]
@@ -336,7 +340,7 @@ async fn test_mcp_send_rejects_from_argument() {
         "params": {
             "name": "send",
             "arguments": {
-                "ref": "target-agent",
+                "to": "target-agent",
                 "text": "Hello with spoofed from",
                 "from": "spoofed-identity"
             }
@@ -387,7 +391,7 @@ async fn test_mcp_send_and_reply_with_derived_caller() {
         "params": {
             "name": "send",
             "arguments": {
-                "ref": "target-agent",
+                "to": "target-agent",
                 "text": "Please report status on milestone 2"
             }
         }
@@ -401,12 +405,9 @@ async fn test_mcp_send_and_reply_with_derived_caller() {
     assert_eq!(result["isError"], false);
     let resp_text = result["content"][0]["text"].as_str().unwrap();
     let delivery_json: serde_json::Value = serde_json::from_str(resp_text).unwrap();
-    let message_id = delivery_json["messageId"].as_str().unwrap();
-    assert_eq!(delivery_json["sessionId"], "sess-target-5000");
-    assert_eq!(
-        delivery_json["fromName"],
-        "calling-orchestrator · sess-caller-6000@test-host"
-    );
+    let message_id = delivery_json["message_id"].as_str().unwrap();
+    assert_eq!(delivery_json["address"], "sess-target-5000@test-host");
+    assert_eq!(delivery_json["outcome"], "delivered");
 
     // Check socket delivery to target-agent
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -494,8 +495,8 @@ async fn test_mcp_list_sessions() {
     let sessions_str = result["content"][0]["text"].as_str().unwrap();
     let sessions: Vec<serde_json::Value> = serde_json::from_str(sessions_str).unwrap();
     assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0]["sessionId"], "sess-target-5000");
-    assert_eq!(sessions[0]["name"], "target-agent");
+    assert_eq!(sessions[0]["address"], "sess-target-5000@test-host");
+    assert_eq!(sessions[0]["label"], "target-agent");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -507,6 +508,8 @@ async fn test_shipped_binary_mcp_initialize_and_tool_call() {
     let binary_path = env!("CARGO_BIN_EXE_xmsg");
     let mut child = std::process::Command::new(binary_path)
         .arg("mcp")
+        // Never the host's own http.sock: list goes to this harness's --xmsg-url.
+        .env("XMSG_HTTP_SOCK", "/nonexistent/xmsg-test/http.sock")
         .arg("--sessions-dir")
         .arg(&harness.sessions_dir)
         .arg("--xmsg-url")

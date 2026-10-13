@@ -329,17 +329,14 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "send",
-            "ref": "sess-claude-b",
+            "to": "sess-claude-b",
             "text": "Hello Bob from Alice",
         }),
     )
     .await;
 
     assert_eq!(send_resp["status"], "ok");
-    let orig_msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let orig_msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // Verify Session B received initial message on sock_b
     let line_b = tokio::time::timeout(Duration::from_secs(2), session_b.rx.recv())
@@ -357,7 +354,6 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         let rec = storage::get_message(&db, &orig_msg_id).unwrap().unwrap();
         assert_eq!(rec.return_harness.as_deref(), Some("claude"));
         assert_eq!(rec.return_session_id.as_deref(), Some("sess-claude-a"));
-        assert!(rec.push_replies);
     }
 
     // 2. Act as Session B to reply to Session A
@@ -372,7 +368,7 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "reply",
-            "messageId": orig_msg_id,
+            "message_id": orig_msg_id,
             "text": "Hi Alice, loud and clear!",
         }),
     )
@@ -411,7 +407,6 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
             pushed_rec.return_session_id.as_deref(),
             Some("sess-claude-b")
         );
-        assert!(pushed_rec.push_replies);
         assert_eq!(pushed_rec.thread_id, orig_msg_id);
     }
 
@@ -427,7 +422,7 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "reply",
-            "messageId": pushed_msg_id,
+            "message_id": pushed_msg_id,
             "text": "Great, conversation complete.",
         }),
     )
@@ -466,12 +461,13 @@ async fn test_u8_anonymous_http_no_push() {
         "bob",
     );
 
-    // 1. Anonymous HTTP POST /v1/sessions/{ref}/messages
+    // 1. Anonymous HTTP POST /v1/messages
     let client = reqwest::Client::new();
-    let post_url = format!("{}/v1/sessions/sess-claude-b/messages", env.http_url);
+    let post_url = format!("{}/v1/messages", env.http_url);
     let post_resp = client
         .post(&post_url)
         .json(&serde_json::json!({
+            "to": "sess-claude-b",
             "from": "anon-client",
             "text": "Hello from anonymous HTTP client"
         }))
@@ -481,7 +477,7 @@ async fn test_u8_anonymous_http_no_push() {
 
     assert_eq!(post_resp.status(), reqwest::StatusCode::ACCEPTED);
     let deliv: serde_json::Value = post_resp.json().await.unwrap();
-    let anon_msg_id = deliv["messageId"].as_str().unwrap().to_string();
+    let anon_msg_id = deliv["message_id"].as_str().unwrap().to_string();
 
     // Verify DB stored no return address and push_replies = false
     {
@@ -489,7 +485,6 @@ async fn test_u8_anonymous_http_no_push() {
         let rec = storage::get_message(&db, &anon_msg_id).unwrap().unwrap();
         assert_eq!(rec.return_harness, None);
         assert_eq!(rec.return_session_id, None);
-        assert!(!rec.push_replies);
     }
 
     // 2. Act as Session B to reply over agent.sock
@@ -504,7 +499,7 @@ async fn test_u8_anonymous_http_no_push() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "reply",
-            "messageId": anon_msg_id,
+            "message_id": anon_msg_id,
             "text": "Reply to anonymous",
         }),
     )
@@ -570,7 +565,7 @@ async fn test_u8_strict_rejection_of_return_address_overrides() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "send",
-            "ref": "sess-claude-b",
+            "to": "sess-claude-b",
             "text": "Attempt spoofing return address",
             "return_to": "evil-session",
             "return_harness": "claude",
@@ -579,12 +574,29 @@ async fn test_u8_strict_rejection_of_return_address_overrides() {
         }),
     )
     .await;
+    // The frame is refused outright (plan §6 D3), naming every injected field.
+    assert_eq!(send_resp["error"], "bad_request", "{send_resp}");
+    let detail = send_resp["detail"].as_str().unwrap();
+    for field in [
+        "return_to",
+        "return_harness",
+        "return_session_id",
+        "returnAddress",
+    ] {
+        assert!(detail.contains(&format!("`{field}`")), "{detail}");
+    }
+    let send_resp = agent_rpc(
+        &env.agent_sock,
+        &serde_json::json!({
+            "action": "send",
+            "to": "sess-claude-b",
+            "text": "Attempt spoofing return address",
+        }),
+    )
+    .await;
 
     assert_eq!(send_resp["status"], "ok");
-    let msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // Verify stored record derives return address ONLY from kernel-attested caller
     {
@@ -607,7 +619,7 @@ async fn test_u8_strict_rejection_of_return_address_overrides() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "reply",
-            "messageId": msg_id,
+            "message_id": msg_id,
             "text": "Replying to original sender",
         }),
     )
@@ -632,7 +644,7 @@ async fn test_u8_strict_rejection_of_return_address_overrides() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_u8_push_opt_out_disabled() {
+async fn test_u8_no_opt_out_session_sender_pushed_and_stored() {
     let env = setup_test_env().await;
 
     let mut session_a = spawn_live_session(
@@ -662,23 +674,18 @@ async fn test_u8_push_opt_out_disabled() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "send",
-            "ref": "sess-claude-b",
-            "text": "Poll-only request, do not push replies",
-            "push_replies": false
+            "to": "sess-claude-b",
+            "text": "Poll-only request, do not push replies"
         }),
     )
     .await;
 
     assert_eq!(send_resp["status"], "ok");
-    let msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     {
         let db = env.db.lock().unwrap();
         let rec = storage::get_message(&db, &msg_id).unwrap().unwrap();
-        assert!(!rec.push_replies);
         assert_eq!(rec.return_session_id.as_deref(), Some("sess-claude-a"));
     }
 
@@ -694,29 +701,27 @@ async fn test_u8_push_opt_out_disabled() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "reply",
-            "messageId": msg_id,
+            "message_id": msg_id,
             "text": "Here is the poll-only answer",
         }),
     )
     .await;
 
     assert_eq!(reply_resp["status"], "ok");
-    assert_eq!(reply_resp["reply"]["pushOutcome"], "disabled");
-    assert!(reply_resp["reply"]["pushedMessageId"].is_null());
-
-    // Verify Session A inbox received nothing
-    let recvd = tokio::time::timeout(Duration::from_millis(100), session_a.rx.recv()).await;
-    assert!(
-        recvd.is_err(),
-        "no push must be delivered when push_replies is false"
-    );
-
-    // Verify stored reply has push_outcome = "disabled"
+    // A10: there is no opt-out; a sender with an inbox is pushed, and the reply is also
+    // stored for `replies`.
+    assert_eq!(reply_resp["reply"]["pushOutcome"], "pushed");
+    assert!(reply_resp["reply"]["pushedMessageId"].is_string());
+    let line_a = tokio::time::timeout(Duration::from_secs(2), session_a.rx.recv())
+        .await
+        .expect("the reply is pushed to the session that sent")
+        .unwrap();
+    assert!(line_a.contains("Here is the poll-only answer"));
     {
         let db = env.db.lock().unwrap();
         let replies = storage::get_all_replies(&db, &msg_id).unwrap();
         assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].push_outcome.as_deref(), Some("disabled"));
+        assert_eq!(replies[0].push_outcome.as_deref(), Some("pushed"));
     }
 }
 
@@ -751,16 +756,13 @@ async fn test_u8_sender_gone_handling() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "send",
-            "ref": "sess-claude-b",
+            "to": "sess-claude-b",
             "text": "I will disappear before you reply",
         }),
     )
     .await;
     assert_eq!(send_resp["status"], "ok");
-    let msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // Now Session A terminates: kill child and remove session file
     let _ = session_a.child.kill();
@@ -780,7 +782,7 @@ async fn test_u8_sender_gone_handling() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "reply",
-            "messageId": msg_id,
+            "message_id": msg_id,
             "text": "Are you still there?",
         }),
     )
@@ -853,16 +855,13 @@ async fn test_u8_cross_harness_push() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "send",
-            "ref": "sess-claude-b",
+            "to": "sess-claude-b",
             "text": "Hello Claude from Pi",
         }),
     )
     .await;
     assert_eq!(send_resp["status"], "ok");
-    let pi_msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let pi_msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // Claude receives on sock_b
     let line_b = tokio::time::timeout(Duration::from_secs(2), session_b.rx.recv())
@@ -884,7 +883,7 @@ async fn test_u8_cross_harness_push() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "reply",
-            "messageId": pi_msg_id,
+            "message_id": pi_msg_id,
             "text": "Hello Pi from Claude Bob",
         }),
     )
@@ -986,17 +985,14 @@ async fn test_u8_cross_harness_claude_to_agy() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "send",
-            "ref": conv_id,
+            "to": conv_id,
             "text": "Hello Antigravity from Claude",
         }),
     )
     .await;
 
     assert_eq!(send_resp["status"], "ok");
-    let msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // Act as Agy holder PID
     act_as_session(&env.proc_root, env.my_pid, &env.my_proc_start, agy_pid);
@@ -1006,7 +1002,7 @@ async fn test_u8_cross_harness_claude_to_agy() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "reply",
-            "messageId": msg_id,
+            "message_id": msg_id,
             "text": "Hello Claude from Antigravity",
         }),
     )

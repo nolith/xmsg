@@ -11,9 +11,13 @@ use crate::error::AppError;
 use crate::registry::{Session, SessionsQuery};
 use crate::storage::{self, now_epoch_secs};
 
+/// A pi registration frame on `register.sock`. Unknown fields are refused (plan §6 D3);
+/// `harness` is the multiplexer's tag.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PiRegisterRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
     #[serde(default, alias = "session_id")]
     pub session_id: Option<String>,
     #[serde(alias = "session_name")]
@@ -264,6 +268,21 @@ pub async fn handle_pi_connection<
         };
 
         let action = cmd.get("action").and_then(|a| a.as_str()).unwrap_or("");
+        // Every frame refuses a field it does not know (plan §6 D3).
+        let known: &[&str] = match action {
+            "poll" => &["action", "sessionId", "waitSecs"],
+            "ack" => &["action", "messageId"],
+            _ => &["action"],
+        };
+        if let Some(field) = cmd
+            .as_object()
+            .and_then(|o| o.keys().find(|k| !known.contains(&k.as_str())))
+        {
+            let err = AppError::BadRequest(format!("unknown field `{field}` in '{action}' frame"))
+                .frame();
+            writer.write_all(format!("{err}\n").as_bytes()).await?;
+            continue;
+        }
 
         match action {
             "poll" => {

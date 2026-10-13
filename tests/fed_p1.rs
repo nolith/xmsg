@@ -294,9 +294,8 @@ async fn test_oracle_1_attested_cross_host_send() {
 
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": format!("sess-b@{}", node_b.name),
+        "to": format!("sess-b@{}", node_b.name),
         "text": "Hello federated world from A",
-        "push_replies": true,
     });
     writer
         .write_all(format!("{send_req}\n").as_bytes())
@@ -307,7 +306,7 @@ async fn test_oracle_1_attested_cross_host_send() {
     reader.read_line(&mut line).await.unwrap();
     let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(resp["status"], "ok");
-    assert_eq!(resp["delivery"]["outcome"], "delivered");
+    assert_eq!(resp["outcome"], "delivered");
 
     // Wait for delivery to sess-b's inbox
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -385,9 +384,8 @@ async fn test_oracle_2_reply_pushed_back_and_recorded() {
 
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": format!("sess-b@{}", node_b.name),
+        "to": format!("sess-b@{}", node_b.name),
         "text": "Question from A",
-        "push_replies": true,
     });
     writer_a
         .write_all(format!("{send_req}\n").as_bytes())
@@ -397,7 +395,7 @@ async fn test_oracle_2_reply_pushed_back_and_recorded() {
     let mut line = String::new();
     reader_a.read_line(&mut line).await.unwrap();
     let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
-    let message_id = resp["delivery"]["messageId"].as_str().unwrap().to_string();
+    let message_id = resp["message_id"].as_str().unwrap().to_string();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -408,7 +406,7 @@ async fn test_oracle_2_reply_pushed_back_and_recorded() {
 
     let reply_req = serde_json::json!({
         "action": "reply",
-        "messageId": message_id,
+        "message_id": message_id,
         "text": "Answer from B",
     });
     writer_b
@@ -513,7 +511,6 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
             r#ref: "sess-b".to_string(),
         },
         body: "Payload inside CIDR".to_string(),
-        push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -601,7 +598,6 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
             r#ref: "sess-b".to_string(),
         },
         body: "Payload outside CIDR".to_string(),
-        push_replies: false,
         thread_id: "t2".to_string(),
         created_at: 2000,
         forwarded: None,
@@ -651,7 +647,8 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
 
     let res2 = send_federated_message(&fed_state_a2, "host-b", &envelope2).await;
     match res2 {
-        Err(xmsg::error::AppError::PeerRejected(detail)) => {
+        Err(ref e) if e.code().1 == "denied" => {
+            let detail = e.detail();
             assert!(
                 detail.contains("not allowed by peer 'from' CIDR rules") || detail.contains("CIDR")
             );
@@ -702,7 +699,6 @@ async fn test_oracle_2_from_absent_pin_only_accepted() {
             r#ref: "sess-b".to_string(),
         },
         body: "Pin-only authenticated message".to_string(),
-        push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -834,7 +830,6 @@ async fn test_oracle_4_reply_route_source_check() {
                 return_harness: Some("claude".to_string()),
                 return_session_id: Some("sess-a".to_string()),
                 return_host: None,
-                push_replies: true,
                 thread_id: "th1".to_string(),
             },
         )
@@ -898,7 +893,8 @@ async fn test_oracle_4_reply_route_source_check() {
 
     let res = send_federated_reply(&fed_state_b, "host-a", &reply).await;
     match res {
-        Err(xmsg::error::AppError::PeerRejected(detail)) => {
+        Err(ref e) if e.code().1 == "denied" => {
+            let detail = e.detail();
             assert!(
                 detail.contains("not allowed by peer 'from' CIDR rules") || detail.contains("CIDR")
             );
@@ -990,7 +986,6 @@ async fn test_oracle_5_host_field_in_body_rejected() {
         },
         "to": { "ref": "sess-b" },
         "body": "test",
-        "push_replies": false,
         "thread_id": "t1",
         "created_at": 1000
     });
@@ -1047,7 +1042,6 @@ async fn test_oracle_6_anonymous_from_with_colon_gives_400() {
             r#ref: "sess-b".to_string(),
         },
         body: "test body".to_string(),
-        push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -1185,7 +1179,6 @@ async fn test_oracle_7_root_harness_rejected_and_badge_spoof_sanitized() {
             r#ref: "sess-b".to_string(),
         },
         body: "test".to_string(),
-        push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -1209,7 +1202,6 @@ async fn test_oracle_7_root_harness_rejected_and_badge_spoof_sanitized() {
             r#ref: "sess-b".to_string(),
         },
         body: "spoof attempt".to_string(),
-        push_replies: false,
         thread_id: "t2".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -1305,7 +1297,6 @@ async fn test_n4_attested_name_ascii_only_u0387() {
             r#ref: "sess-b".to_string(),
         },
         body: "homoglyph spoof attempt".to_string(),
-        push_replies: false,
         thread_id: "t-u0387".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -1398,7 +1389,6 @@ async fn test_oracle_8_no_forward_rejected() {
             r#ref: "user@host-c".to_string(),
         },
         body: "forward me".to_string(),
-        push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -1406,7 +1396,7 @@ async fn test_oracle_8_no_forward_rejected() {
 
     let res = send_federated_message(&fed_state_a, "host-b", &env).await;
     match res {
-        Err(xmsg::error::AppError::NoForward(_)) => {}
+        Err(ref e) if e.code().1 == "denied" => {}
         other => panic!("Expected NoForward error, got {other:?}"),
     }
 }
@@ -1494,7 +1484,7 @@ async fn test_oracle_9_forged_reply_id_gives_403() {
 
     let res = send_federated_reply(&fed_state_b, "host-a", &forged_reply).await;
     match res {
-        Err(xmsg::error::AppError::NotRecipient(_)) => {}
+        Err(ref e) if e.code().1 == "denied" => {}
         other => panic!("Expected NotRecipient on forged reply, got {other:?}"),
     }
 
@@ -1515,7 +1505,6 @@ async fn test_oracle_9_forged_reply_id_gives_403() {
                 recipient_harness: "claude".to_string(),
                 return_harness: Some("claude".to_string()),
                 return_session_id: Some("sess-a".to_string()),
-                push_replies: true,
                 thread_id: msg_c_id.clone(),
                 return_host: Some("host-a".to_string()),
             },
@@ -1538,7 +1527,7 @@ async fn test_oracle_9_forged_reply_id_gives_403() {
 
     let res_cross = send_federated_reply(&fed_state_b, "host-a", &cross_peer_reply).await;
     match res_cross {
-        Err(xmsg::error::AppError::NotRecipient(_)) => {}
+        Err(ref e) if e.code().1 == "denied" => {}
         other => panic!("Expected NotRecipient on cross-peer reply, got {other:?}"),
     }
 
@@ -1631,7 +1620,6 @@ async fn test_oracle_10_duplicate_id_delivered_once() {
             r#ref: "sess-b".to_string(),
         },
         body: "deliver once only".to_string(),
-        push_replies: false,
         thread_id: dup_id.clone(),
         created_at: 1000,
         forwarded: None,
@@ -1742,7 +1730,6 @@ async fn test_oracle_11_rate_limit_429() {
                 r#ref: "sess-b".to_string(),
             },
             body: "flood".to_string(),
-            push_replies: false,
             thread_id: "t".to_string(),
             created_at: 1000,
             forwarded: None,
@@ -1765,7 +1752,6 @@ async fn test_oracle_11_rate_limit_429() {
             r#ref: "sess-b".to_string(),
         },
         body: "flood 21".to_string(),
-        push_replies: false,
         thread_id: "t".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -1923,7 +1909,6 @@ async fn test_amendment_a_peer_without_send_gets_403_op_denied() {
             r#ref: "sess-b".to_string(),
         },
         body: "unauthorized send".to_string(),
-        push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -2004,9 +1989,8 @@ async fn test_amendment_c_unknown_peer_opens_no_socket() {
 
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": unknown_ref,
+        "to": unknown_ref,
         "text": "test unknown peer",
-        "push_replies": false,
     });
     writer
         .write_all(format!("{send_req}\n").as_bytes())
@@ -2018,23 +2002,20 @@ async fn test_amendment_c_unknown_peer_opens_no_socket() {
     let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
 
     assert_eq!(resp["status"], "error");
-    assert_eq!(resp["error"], "unknown_peer");
+    assert_eq!(resp["error"], "not_found");
 
     // Also verify via HTTP API
     let client = reqwest::Client::new();
-    let http_url = format!(
-        "http://{}/v1/sessions/{unknown_ref}/messages",
-        node_a.http_addr
-    );
+    let http_url = format!("http://{}/v1/messages", node_a.http_addr);
     let http_resp = client
         .post(&http_url)
-        .json(&serde_json::json!({ "from": "caller", "text": "test unknown peer" }))
+        .json(&serde_json::json!({"to": unknown_ref,  "from": "caller", "text": "test unknown peer" }))
         .send()
         .await
         .unwrap();
-    assert_eq!(http_resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(http_resp.status(), StatusCode::NOT_FOUND);
     let err_body: serde_json::Value = http_resp.json().await.unwrap();
-    assert_eq!(err_body["error"], "unknown_peer");
+    assert_eq!(err_body["error"], "not_found");
 
     // Assert stand-in listener accepted 0 connections
     assert_eq!(
@@ -2135,9 +2116,8 @@ exit 0
 
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": format!("{}@{}", conv_id, node_b.name),
+        "to": format!("{}@{}", conv_id, node_b.name),
         "text": "federated message to credential-less agy",
-        "push_replies": false,
     });
     writer
         .write_all(format!("{send_req}\n").as_bytes())
@@ -2150,7 +2130,7 @@ exit 0
 
     assert_eq!(resp["status"], "ok");
     assert_eq!(
-        resp["delivery"]["outcome"], "queued",
+        resp["outcome"], "queued",
         "federated message to credential-less agy session must be queued"
     );
 
@@ -2276,7 +2256,7 @@ fn make_client_fed_state(
 // =============================================================================
 
 #[tokio::test]
-async fn test_f2_anon_origin_reply_refused() {
+async fn test_f2_anon_origin_reply_stored() {
     let (cert_b, key_b, pin_b) = generate_self_signed_ed25519("host-b").unwrap();
 
     let node_a = create_test_node(
@@ -2315,7 +2295,6 @@ async fn test_f2_anon_origin_reply_refused() {
                 recipient_harness: "claude".to_string(),
                 return_harness: None,
                 return_session_id: None,
-                push_replies: false,
                 thread_id: anon_msg_id.clone(),
                 return_host: Some("host-a".to_string()),
             },
@@ -2348,14 +2327,21 @@ async fn test_f2_anon_origin_reply_refused() {
         created_at: 1000,
     };
 
+    // A10/A-2: a reply that came back is always stored at the origin; a sender with no
+    // inbox here (anonymous, or a kind this node cannot push to) is not pushed, and
+    // reads it with `replies`.
+    let in_reply_to = reply.in_reply_to.clone();
     let res = send_federated_reply(&fed_state_b, "host-a", &reply).await;
-    assert!(matches!(res, Err(xmsg::error::AppError::NotRecipient(_))));
+    assert!(res.is_ok(), "{res:?}");
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(node_a.inbox_rx.lock().unwrap().len(), 0);
+    let stored = storage::get_all_replies(&node_a.db.lock().unwrap(), &in_reply_to).unwrap();
+    assert_eq!(stored.len(), 1, "the reply is stored for `replies`");
+    assert_ne!(stored[0].push_outcome.as_deref(), Some("pushed"));
 }
 
 #[tokio::test]
-async fn test_f2_push_replies_false_refused() {
+async fn test_f2_session_sender_always_pushed() {
     let (cert_b, key_b, pin_b) = generate_self_signed_ed25519("host-b").unwrap();
 
     let node_a = create_test_node(
@@ -2393,7 +2379,6 @@ async fn test_f2_push_replies_false_refused() {
                 recipient_harness: "claude".to_string(),
                 return_harness: Some("claude".to_string()),
                 return_session_id: Some("sess-a".to_string()),
-                push_replies: false,
                 thread_id: msg_id.clone(),
                 return_host: Some("host-a".to_string()),
             },
@@ -2426,14 +2411,22 @@ async fn test_f2_push_replies_false_refused() {
         created_at: 1000,
     };
 
+    // A10/A-2: a reply that came back is always stored at the origin; a sender with no
+    // inbox here (anonymous, or a kind this node cannot push to) is not pushed, and
+    // reads it with `replies`.
+    let in_reply_to = reply.in_reply_to.clone();
     let res = send_federated_reply(&fed_state_b, "host-a", &reply).await;
-    assert!(matches!(res, Err(xmsg::error::AppError::NotRecipient(_))));
+    assert!(res.is_ok(), "{res:?}");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(node_a.inbox_rx.lock().unwrap().len(), 0);
+    // The flag is gone (A10): a sender with an inbox is always pushed, and stored too.
+    assert_eq!(node_a.inbox_rx.lock().unwrap().len(), 1);
+    let stored = storage::get_all_replies(&node_a.db.lock().unwrap(), &in_reply_to).unwrap();
+    assert_eq!(stored.len(), 1, "the reply is stored for `replies`");
+    assert_eq!(stored[0].push_outcome.as_deref(), Some("pushed"));
 }
 
 #[tokio::test]
-async fn test_f2_unknown_harness_refused() {
+async fn test_f2_unknown_harness_reply_stored() {
     let (cert_b, key_b, pin_b) = generate_self_signed_ed25519("host-b").unwrap();
 
     let node_a = create_test_node(
@@ -2471,7 +2464,6 @@ async fn test_f2_unknown_harness_refused() {
                 recipient_harness: "claude".to_string(),
                 return_harness: Some("matrix_bridge".to_string()),
                 return_session_id: Some("sess-a".to_string()),
-                push_replies: true,
                 thread_id: msg_id.clone(),
                 return_host: Some("host-a".to_string()),
             },
@@ -2504,10 +2496,17 @@ async fn test_f2_unknown_harness_refused() {
         created_at: 1000,
     };
 
+    // A10/A-2: a reply that came back is always stored at the origin; a sender with no
+    // inbox here (anonymous, or a kind this node cannot push to) is not pushed, and
+    // reads it with `replies`.
+    let in_reply_to = reply.in_reply_to.clone();
     let res = send_federated_reply(&fed_state_b, "host-a", &reply).await;
-    assert!(matches!(res, Err(xmsg::error::AppError::NotRecipient(_))));
+    assert!(res.is_ok(), "{res:?}");
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(node_a.inbox_rx.lock().unwrap().len(), 0);
+    let stored = storage::get_all_replies(&node_a.db.lock().unwrap(), &in_reply_to).unwrap();
+    assert_eq!(stored.len(), 1, "the reply is stored for `replies`");
+    assert_ne!(stored[0].push_outcome.as_deref(), Some("pushed"));
 }
 
 // =============================================================================
@@ -2560,11 +2559,8 @@ async fn test_f3_http_origin_federated_send() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!(
-            "http://{}/v1/sessions/sess-b@host-b/messages",
-            node_a.http_addr
-        ))
-        .json(&serde_json::json!({
+        .post(format!("http://{}/v1/messages", node_a.http_addr))
+        .json(&serde_json::json!({"to": "sess-b@host-b",
             "from": "script",
             "text": "anonymous hello"
         }))
@@ -2686,7 +2682,6 @@ async fn test_f4_one_way_link() {
             r#ref: "sess-b".to_string(),
         },
         body: "one-way message".to_string(),
-        push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -2766,7 +2761,6 @@ async fn test_f7_outbound_timeout_on_silent_peer() {
             r#ref: "sess-b".to_string(),
         },
         body: "test timeout".to_string(),
-        push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -2837,7 +2831,6 @@ async fn test_f8_verbatim_remote_outcome_relay_and_dedup() {
             r#ref: "nobody".to_string(),
         },
         body: "hello nobody".to_string(),
-        push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -2845,13 +2838,13 @@ async fn test_f8_verbatim_remote_outcome_relay_and_dedup() {
 
     let r1 = send_federated_message(&fed_state_a, "host-b", &env).await;
     assert!(
-        matches!(r1, Err(xmsg::error::AppError::NotFound(_))),
+        matches!(r1, Err(ref e) if e.code().1 == "not_found"),
         "Expected NotFound, got: {r1:?}"
     );
 
     let r2 = send_federated_message(&fed_state_a, "host-b", &env).await;
     assert!(
-        matches!(r2, Err(xmsg::error::AppError::NotFound(_))),
+        matches!(r2, Err(ref e) if e.code().1 == "not_found"),
         "Retry must still be NotFound, got: {r2:?}"
     );
 }
@@ -2909,7 +2902,6 @@ async fn test_f9_kind_qualified_principal_filter() {
                 r#ref: "sess-b".into(),
             },
             body: "ctl".into(),
-            push_replies: false,
             thread_id: "t1".into(),
             created_at: 1000,
             forwarded: None,
@@ -2932,7 +2924,6 @@ async fn test_f9_kind_qualified_principal_filter() {
                 r#ref: "sess-b".into(),
             },
             body: "anon genie".into(),
-            push_replies: false,
             thread_id: "t2".into(),
             created_at: 1000,
             forwarded: None,
@@ -2961,7 +2952,6 @@ async fn test_f9_kind_qualified_principal_filter() {
                 r#ref: "sess-b".into(),
             },
             body: "spoofing service matrix".into(),
-            push_replies: false,
             thread_id: "t3".into(),
             created_at: 1000,
             forwarded: None,
@@ -2984,7 +2974,6 @@ async fn test_f9_kind_qualified_principal_filter() {
                 r#ref: "sess-b".into(),
             },
             body: "real service matrix".into(),
-            push_replies: false,
             thread_id: "t4".into(),
             created_at: 1000,
             forwarded: None,
@@ -3040,7 +3029,6 @@ async fn test_f10_reply_deduplication_and_rate_limit() {
                 recipient_harness: "claude".to_string(),
                 return_harness: Some("claude".to_string()),
                 return_session_id: Some("sess-a".to_string()),
-                push_replies: true,
                 thread_id: msg_id.clone(),
                 return_host: Some("host-a".to_string()),
             },
@@ -3177,7 +3165,6 @@ async fn test_oracle_server_pin_verified() {
             r#ref: "sess-b".to_string(),
         },
         body: "test".to_string(),
-        push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -3188,7 +3175,7 @@ async fn test_oracle_server_pin_verified() {
 
     assert!(rg.is_ok(), "Matching server pin must succeed: {rg:?}");
     assert!(
-        matches!(rb, Err(xmsg::error::AppError::PeerRejected(_))),
+        matches!(rb, Err(ref e) if e.code().1 == "denied"),
         "Mismatched server pin must fail with PeerRejected, got: {rb:?}"
     );
 }
@@ -3235,7 +3222,6 @@ async fn test_oracle_reply_allow_check() {
                 recipient_harness: "claude".to_string(),
                 return_harness: Some("claude".to_string()),
                 return_session_id: Some("sess-a".to_string()),
-                push_replies: true,
                 thread_id: msg_id.clone(),
                 return_host: Some("host-a".to_string()),
             },
@@ -3293,7 +3279,6 @@ fn seed_origin(node: &TestNode, peer_name: &str) -> String {
             recipient_harness: "claude".to_string(),
             return_harness: Some("claude".to_string()),
             return_session_id: Some("sess-a".to_string()),
-            push_replies: true,
             thread_id: "th".to_string(),
             return_host: None,
         },
@@ -3370,7 +3355,7 @@ async fn test_n1_offsource_replay_known_reply_id_rejected() {
     )
     .await;
     assert!(
-        matches!(replay, Err(xmsg::error::AppError::PeerRejected(_))),
+        matches!(replay, Err(ref e) if e.code().1 == "denied"),
         "Off-source replay of known reply ID must return 403 PeerRejected, got: {replay:?}"
     );
 }
@@ -3486,7 +3471,7 @@ async fn test_n1_offsource_flood_leaves_legit_bucket_intact() {
         )
         .await;
         assert!(
-            matches!(r, Err(xmsg::error::AppError::PeerRejected(_))),
+            matches!(r, Err(ref e) if e.code().1 == "denied"),
             "Off-source request {i} must be PeerRejected, got: {r:?}"
         );
     }
@@ -3613,7 +3598,6 @@ async fn test_n3_unauthenticated_socket_bound_leaves_slot_for_peer() {
             r#ref: "sess-b".to_string(),
         },
         body: "hello".to_string(),
-        push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
         forwarded: None,
@@ -3751,7 +3735,6 @@ async fn test_n7_mf6_tcp_peer_address_source() {
             r#ref: "sess-b".to_string(),
         },
         body: "from-127-0-0-2".to_string(),
-        push_replies: false,
         thread_id: "t1".to_string(),
         created_at: 1000,
         forwarded: None,

@@ -24,7 +24,6 @@ use crate::storage::{self, MessageRecord};
 
 #[derive(Deserialize)]
 struct WireErrorResponse {
-    error: String,
     detail: String,
 }
 
@@ -1590,7 +1589,6 @@ pub struct FedEnvelope {
     pub principal: FedPrincipal,
     pub to: FedTarget,
     pub body: String,
-    pub push_replies: bool,
     pub thread_id: String,
     pub created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1627,6 +1625,23 @@ impl FedPrincipal {
         }
     }
 
+    /// The origin this principal gives a message sent from `node` (A12).
+    pub fn origin(&self, node: &str) -> storage::Origin {
+        match self {
+            FedPrincipal::Session {
+                session_id, name, ..
+            } => storage::Origin::instance(
+                session_id,
+                node,
+                inbox::clean_label(name)
+                    .filter(|l| l != session_id)
+                    .as_deref(),
+            ),
+            FedPrincipal::Service { name } => storage::Origin::service(name, node),
+            FedPrincipal::Anonymous { from } => storage::Origin::anonymous(from, node),
+        }
+    }
+
     pub fn badge(&self) -> String {
         match self {
             FedPrincipal::Session { harness, name, .. } if !name.is_empty() => {
@@ -1653,7 +1668,7 @@ impl FedPrincipal {
 #[serde(rename_all = "camelCase")]
 pub struct FedInboxMessage {
     pub id: String,
-    pub origin: storage::SvcOrigin,
+    pub origin: storage::Origin,
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
@@ -1832,139 +1847,6 @@ pub fn build_fed_router(fed_state: Arc<FedState>) -> Router {
         .with_state(fed_state)
 }
 
-pub(crate) async fn deliver_to_resolved_target(
-    fed_state: &FedState,
-    target: &crate::http::ResolvedTarget,
-    from_name: &str,
-    message_id: &str,
-    body: &str,
-    origin: storage::SvcOrigin,
-) -> Result<(String, String, &'static str), AppError> {
-    match target {
-        crate::http::ResolvedTarget::Claude(session, socket_path) => {
-            let body_with_footer = format!(
-                "{body}\n\n[xmsg] message_id={message_id} — reply with the xmsg reply tool"
-            );
-            match inbox::encode_transport_line(from_name, &body_with_footer) {
-                Ok(line) => inbox::deliver_to_socket(socket_path, &line).await.map(|_| {
-                    (
-                        session.session_id.clone(),
-                        "claude".to_string(),
-                        "delivered",
-                    )
-                }),
-                Err(e) => Err(e),
-            }
-        }
-        crate::http::ResolvedTarget::Agy(session) => {
-            let has_creds = {
-                let store_lock = fed_state.agy_store.read().unwrap();
-                store_lock
-                    .get(&session.session_id)
-                    .or_else(|| {
-                        store_lock.values().find(|info| {
-                            info.conversation_id == session.session_id
-                                || session.name.as_deref() == Some(&info.conversation_id)
-                        })
-                    })
-                    .map(|info| info.has_credentials())
-                    .unwrap_or(false)
-            };
-
-            if has_creds {
-                crate::agy::deliver_agy(
-                    &fed_state.agy_config,
-                    &fed_state.agy_store,
-                    session,
-                    from_name,
-                    message_id,
-                    body,
-                )
-                .await
-                .map(|_| (session.session_id.clone(), "agy".to_string(), "delivered"))
-            } else {
-                let envelope_text = format!(
-                    "[xmsg] from={from_name} message_id={message_id} — reply with the xmsg reply tool\n\n{body}"
-                );
-                let agy_msg = storage::AgyPendingMessage {
-                    id: message_id.to_string(),
-                    session_id: session.session_id.clone(),
-                    created_at: storage::now_epoch_secs(),
-                    from_name: from_name.to_string(),
-                    bytes: body.len(),
-                    text: body.to_string(),
-                    envelope: envelope_text,
-                    delivered_at: None,
-                };
-                let db = fed_state
-                    .db
-                    .lock()
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
-                storage::insert_agy_message(&db, &agy_msg)
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
-                Ok((session.session_id.clone(), "agy".to_string(), "queued"))
-            }
-        }
-        crate::http::ResolvedTarget::Pi(session) => {
-            let envelope_text = format!(
-                "[xmsg] from={from_name} message_id={message_id} — reply with the xmsg reply tool\n\n{body}"
-            );
-            let pi_msg = storage::PiPendingMessage {
-                id: message_id.to_string(),
-                session_id: session.session_id.clone(),
-                created_at: storage::now_epoch_secs(),
-                from_name: from_name.to_string(),
-                bytes: body.len(),
-                text: body.to_string(),
-                envelope: envelope_text,
-                delivered_at: None,
-            };
-            let db = fed_state
-                .db
-                .lock()
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            let inserted = storage::insert_pi_message(&db, &pi_msg)
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            if !inserted {
-                return Err(AppError::ServiceUnavailable(
-                    "pi session message queue is full".to_string(),
-                ));
-            }
-            let _ = fed_state.pi_notify_tx.send(session.session_id.clone());
-            Ok((session.session_id.clone(), "pi".to_string(), "delivered"))
-        }
-        crate::http::ResolvedTarget::Svc(session) => {
-            let envelope_text = format!(
-                "[xmsg] from={from_name} message_id={message_id} — reply with the xmsg reply tool\n\n{body}"
-            );
-            let svc_msg = storage::SvcPendingMessage {
-                id: message_id.to_string(),
-                session_id: session.session_id.clone(),
-                created_at: storage::now_epoch_secs(),
-                from_name: from_name.to_string(),
-                bytes: body.len(),
-                text: body.to_string(),
-                envelope: envelope_text,
-                delivered_at: None,
-                origin,
-            };
-            let db = fed_state
-                .db
-                .lock()
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            let inserted = storage::insert_svc_message(&db, &svc_msg)
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            if !inserted {
-                return Err(AppError::ServiceUnavailable(
-                    "svc session message queue is full".to_string(),
-                ));
-            }
-            let _ = fed_state.svc_notify_tx.send(session.session_id.clone());
-            Ok((session.session_id.clone(), "svc".to_string(), "delivered"))
-        }
-    }
-}
-
 async fn fed_send_message_handler(
     State(fed_state): State<Arc<FedState>>,
     Extension(peer): Extension<Arc<AuthenticatedPeer>>,
@@ -2112,7 +1994,6 @@ async fn fed_send_message_handler(
                 r#ref: target_ref.to_string(),
             },
             body: envelope.body.clone(),
-            push_replies: envelope.push_replies,
             thread_id: envelope.thread_id.clone(),
             created_at: envelope.created_at,
             forwarded: Some(FedForwarded {
@@ -2159,6 +2040,12 @@ async fn fed_send_message_handler(
                 .lock()
                 .map_err(|e| AppError::Internal(e.to_string()))?;
             let _ = storage::update_outbound_outcome(&db, &envelope.id, outcome);
+            // The resolved address, as the destination reported it.
+            let _ = storage::update_outbound_target(
+                &db,
+                &envelope.id,
+                &format!("{}@{dest}", delivery_resp.session_id),
+            );
             let fwd_msg_record = MessageRecord {
                 id: envelope.id.clone(),
                 created_at: envelope.created_at,
@@ -2170,7 +2057,6 @@ async fn fed_send_message_handler(
                 return_harness: None,
                 return_session_id: None,
                 return_host: Some(peer.name.clone()),
-                push_replies: envelope.push_replies,
                 thread_id: envelope.thread_id.clone(),
             };
             let _ = storage::insert_message(&db, &fwd_msg_record);
@@ -2258,14 +2144,9 @@ async fn fed_send_message_handler(
                     (sanitized, None, None)
                 }
             };
-            let push_replies = if peer_cfg.leaf {
-                false
-            } else {
-                envelope.push_replies
-            };
             let body_len = envelope.body.len();
             let outcome_str = match &err {
-                AppError::NotFound(_) => "not_found",
+                AppError::NotFound(_) | AppError::NotFoundDetail(_) => "not_found",
                 AppError::Ambiguous(_) => "ambiguous",
                 AppError::Gone { .. } => "gone",
                 _ => "failed",
@@ -2281,7 +2162,6 @@ async fn fed_send_message_handler(
                 return_harness,
                 return_session_id,
                 return_host: Some(peer.name.clone()),
-                push_replies,
                 thread_id: envelope.thread_id.clone(),
             };
             if let Ok(db) = fed_state.db.lock() {
@@ -2372,12 +2252,6 @@ async fn fed_send_message_handler(
         }
     }
 
-    let push_replies = if peer_cfg.leaf {
-        false
-    } else {
-        envelope.push_replies
-    };
-
     let (target_session_id, recipient_harness) = match &target {
         crate::http::ResolvedTarget::Claude(s, _) => (s.session_id.clone(), "claude".to_string()),
         crate::http::ResolvedTarget::Agy(s) => (s.session_id.clone(), "agy".to_string()),
@@ -2397,7 +2271,6 @@ async fn fed_send_message_handler(
         return_harness: return_harness.clone(),
         return_session_id: return_session_id.clone(),
         return_host: Some(peer.name.clone()),
-        push_replies,
         thread_id: envelope.thread_id.clone(),
     };
     {
@@ -2413,16 +2286,13 @@ async fn fed_send_message_handler(
     }
 
     // 8. Deliver to local target session
-    let deliver_res = deliver_to_resolved_target(
-        &fed_state,
+    let deliver_res = crate::surface::deliver(
+        &fed_state.local(),
         &target,
         &from_name,
         &envelope.id,
         &envelope.body,
-        storage::SvcOrigin::Fed {
-            host: origin_node.clone(),
-            principal: Some(effective_principal.badge()),
-        },
+        effective_principal.origin(origin_node),
     )
     .await;
 
@@ -2458,16 +2328,21 @@ async fn fed_send_message_handler(
     }
 }
 
+/// Stores a reply that came back from `peer_name` and pushes it to the local sender of
+/// `in_reply_to` (A10, A-2).
+#[allow(clippy::too_many_arguments)]
 pub async fn deliver_federated_reply_locally(
     fed_state: &FedState,
     peer_name: &str,
     in_reply_to: &str,
     reply_id: &str,
     replier_badge: &str,
+    replier_origin: storage::Origin,
     text: &str,
     ret_harness: &str,
     ret_session_id: &str,
 ) -> Result<&'static str, AppError> {
+    let _ = peer_name;
     // Check if reply already inserted (idempotency)
     let already_inserted = {
         let db = fed_state
@@ -2495,155 +2370,17 @@ pub async fn deliver_federated_reply_locally(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
-    let push_res = match ret_harness {
-        "claude" => {
-            match crate::claim::resolve_claude_session_and_deliver(
-                &fed_state.db,
-                &fed_state.agy_config.proc_root,
-                &fed_state.sessions_dir,
-                &fed_state.node_name,
-                ret_session_id,
-            )
-            .await
-            {
-                Ok((_session, socket_path)) => {
-                    if !socket_path.exists() {
-                        "sender_gone"
-                    } else {
-                        let body_with_header = format!(
-                            "[xmsg] reply to message_id={} — message_id={}; reply with the xmsg reply tool\n\n{}",
-                            in_reply_to, reply_id, text
-                        );
-                        match inbox::encode_transport_line(replier_badge, &body_with_header) {
-                            Ok(line) => match inbox::deliver_to_socket(&socket_path, &line).await {
-                                Ok(()) => "pushed",
-                                Err(_) => "push_failed",
-                            },
-                            Err(_) => "push_failed",
-                        }
-                    }
-                }
-                Err(_) => "sender_gone",
-            }
-        }
-        "agy" => {
-            let session_opt = crate::agy::resolve_agy_session(
-                &fed_state.agy_config,
-                &fed_state.agy_store,
-                ret_session_id,
-            )
-            .ok()
-            .flatten();
-            if let Some(session) = session_opt {
-                let envelope = format!(
-                    "[xmsg] reply to message_id={} — message_id={}; reply with the xmsg reply tool\n\n{}",
-                    in_reply_to, reply_id, text
-                );
-                match crate::agy::deliver_agy_envelope(
-                    &fed_state.agy_config,
-                    &fed_state.agy_store,
-                    &session,
-                    replier_badge,
-                    &envelope,
-                )
-                .await
-                {
-                    Ok(()) => "pushed",
-                    Err(AppError::Gone { .. }) | Err(AppError::CredentialsStale(_)) => {
-                        "sender_gone"
-                    }
-                    Err(_) => "push_failed",
-                }
-            } else {
-                "sender_gone"
-            }
-        }
-        "pi" => {
-            let session_opt = crate::pi::resolve_pi_session(
-                &fed_state.agy_config.proc_root,
-                &fed_state.pi_store,
-                ret_session_id,
-            )
-            .ok()
-            .flatten();
-            if let Some(session) = session_opt {
-                let envelope_text = format!(
-                    "[xmsg] reply to message_id={} from={} message_id={} — reply with the xmsg reply tool\n\n{}",
-                    in_reply_to, replier_badge, reply_id, text
-                );
-                let pi_msg = storage::PiPendingMessage {
-                    id: reply_id.to_string(),
-                    session_id: session.session_id.clone(),
-                    created_at: storage::now_epoch_secs(),
-                    from_name: replier_badge.to_string(),
-                    bytes: text.len(),
-                    text: text.to_string(),
-                    envelope: envelope_text,
-                    delivered_at: None,
-                };
-                if let Ok(db) = fed_state.db.lock() {
-                    let _ = storage::insert_pi_message(&db, &pi_msg);
-                    let _ = fed_state.pi_notify_tx.send(session.session_id.clone());
-                    "pushed"
-                } else {
-                    "push_failed"
-                }
-            } else {
-                "sender_gone"
-            }
-        }
-        "svc" => {
-            let session_opt = crate::svc::resolve_svc_session(
-                &fed_state.agy_config.proc_root,
-                &fed_state.svc_store,
-                ret_session_id,
-            )
-            .ok()
-            .flatten();
-            if let Some(session) = session_opt {
-                let envelope_text = format!(
-                    "[xmsg] reply to message_id={} from={} message_id={} — reply with the xmsg reply tool\n\n{}",
-                    in_reply_to, replier_badge, reply_id, text
-                );
-                let svc_msg = storage::SvcPendingMessage {
-                    id: reply_id.to_string(),
-                    session_id: session.session_id.clone(),
-                    created_at: storage::now_epoch_secs(),
-                    from_name: replier_badge.to_string(),
-                    bytes: text.len(),
-                    text: text.to_string(),
-                    envelope: envelope_text,
-                    delivered_at: None,
-                    origin: storage::SvcOrigin::Fed {
-                        host: fed_state
-                            .peers
-                            .canonical_name(peer_name)
-                            .unwrap_or(peer_name)
-                            .to_string(),
-                        principal: Some(replier_badge.to_string()),
-                    },
-                };
-                if let Ok(db) = fed_state.db.lock() {
-                    let inserted = storage::insert_svc_message(&db, &svc_msg).unwrap_or(false);
-                    if inserted {
-                        let _ = fed_state.svc_notify_tx.send(session.session_id.clone());
-                        "pushed"
-                    } else {
-                        "push_failed"
-                    }
-                } else {
-                    "push_failed"
-                }
-            } else {
-                "sender_gone"
-            }
-        }
-        _ => {
-            return Err(AppError::NotRecipient(format!(
-                "unknown recipient harness '{ret_harness}'"
-            )))
-        }
-    };
+    let push_res = crate::surface::push_reply(
+        &fed_state.local(),
+        ret_harness,
+        ret_session_id,
+        in_reply_to,
+        reply_id,
+        replier_badge,
+        replier_origin,
+        text,
+    )
+    .await;
 
     {
         let db = fed_state
@@ -2654,6 +2391,22 @@ pub async fn deliver_federated_reply_locally(
     }
     let _ = fed_state.notify_tx.send(in_reply_to.to_string());
     Ok(push_res)
+}
+
+/// The origin a federated replier gives its reply: a service by name, an instance by ID,
+/// attested by the node it came from.
+fn replier_origin(replier: &FedReplier, node: &str) -> storage::Origin {
+    if replier.harness == "svc" {
+        storage::Origin::service(&replier.session_id, node)
+    } else {
+        storage::Origin::instance(
+            &replier.session_id,
+            node,
+            inbox::clean_label(&replier.name)
+                .filter(|l| l != &replier.session_id)
+                .as_deref(),
+        )
+    }
 }
 
 async fn fed_reply_handler(
@@ -2769,7 +2522,7 @@ async fn fed_reply_handler(
                 peer.name.clone()
             };
 
-            let push_outcome = "disabled";
+            let push_outcome = "stored";
             {
                 let db = fed_state
                     .db
@@ -2798,7 +2551,8 @@ async fn fed_reply_handler(
         }
     }
 
-    // 4. Look up original message to get caller session
+    // 4. Every reply is stored; it is pushed when the original sender has an inbox (A10,
+    // A-2). A sender with none reads it with `replies`.
     let orig_msg = {
         let db = fed_state
             .db
@@ -2807,17 +2561,17 @@ async fn fed_reply_handler(
         storage::get_message(&db, &reply.in_reply_to)
             .map_err(|e| AppError::Internal(e.to_string()))?
     };
+    let _ = outbound;
 
-    let is_push_capable = match &orig_msg {
-        Some(m) => m.return_harness.is_some() && m.return_session_id.is_some() && m.push_replies,
-        None => false,
-    };
-
-    if is_push_capable {
-        let orig_msg = orig_msg.unwrap();
-        let ret_harness = orig_msg.return_harness.unwrap();
-        let ret_session_id = orig_msg.return_session_id.unwrap();
-
+    if let Some((ret_harness, ret_session_id)) = orig_msg
+        .as_ref()
+        .and_then(|m| Some((m.return_harness.clone()?, m.return_session_id.clone()?)))
+    {
+        let node = fed_state
+            .peers
+            .canonical_name(&peer.name)
+            .unwrap_or(&peer.name)
+            .to_string();
         let replier_badge = inbox::sender_label(
             &peer.name,
             &reply.replier.harness,
@@ -2831,69 +2585,56 @@ async fn fed_reply_handler(
             &reply.in_reply_to,
             &reply.id,
             &replier_badge,
+            replier_origin(&reply.replier, &node),
             &reply.text,
             &ret_harness,
             &ret_session_id,
         )
         .await?;
 
-        Ok((
+        return Ok((
             StatusCode::OK,
             Json(json!({
                 "push_outcome": push_res,
                 "message_id": reply.id,
             })),
         )
-            .into_response())
-    } else if peer_cfg.leaf
-        || (outbound.target_ref.contains('@')
-            && orig_msg
-                .as_ref()
-                .map(|m| {
-                    !m.push_replies && m.return_harness.is_some() && m.return_session_id.is_some()
-                })
-                .unwrap_or(false))
-    {
-        let replier_session_id = if !reply.replier.session_id.is_empty() {
-            reply.replier.session_id.clone()
-        } else if !reply.replier.name.is_empty() {
-            reply.replier.name.clone()
-        } else {
-            peer.name.clone()
-        };
-
-        let push_outcome = "disabled";
-        {
-            let db = fed_state
-                .db
-                .lock()
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            storage::insert_reply(
-                &db,
-                &reply.in_reply_to,
-                &replier_session_id,
-                &reply.text,
-                Some(push_outcome),
-                Some(&reply.id),
-            )
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        }
-        let _ = fed_state.notify_tx.send(reply.in_reply_to.clone());
-
-        Ok((
-            StatusCode::OK,
-            Json(json!({
-                "push_outcome": push_outcome,
-                "message_id": reply.id,
-            })),
-        )
-            .into_response())
-    } else {
-        return Err(AppError::NotRecipient(format!(
-            "in_reply_to '{}' has no push-capable local recipient",
-            reply.in_reply_to
-        )));
+            .into_response());
     }
+
+    let replier_session_id = if !reply.replier.session_id.is_empty() {
+        reply.replier.session_id.clone()
+    } else if !reply.replier.name.is_empty() {
+        reply.replier.name.clone()
+    } else {
+        peer.name.clone()
+    };
+    let push_outcome = "stored";
+    {
+        let db = fed_state
+            .db
+            .lock()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        storage::insert_reply(
+            &db,
+            &reply.in_reply_to,
+            &replier_session_id,
+            &reply.text,
+            Some(push_outcome),
+            Some(&reply.id),
+        )
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+    let _ = fed_state.notify_tx.send(reply.in_reply_to.clone());
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "push_outcome": push_outcome,
+            "message_id": reply.id,
+        })),
+    )
+        .into_response())
 }
 
 async fn fed_get_replies_handler(
@@ -3215,10 +2956,12 @@ pub fn queue_leaf_mailbox_message(
         }
     }
 
-    let origin = storage::SvcOrigin::Fed {
-        host: fed_state.node_name.clone(),
-        principal: Some(envelope.principal.badge()),
-    };
+    // The sender's node: this one, or the origin a forwarded envelope names.
+    let origin_node = envelope
+        .forwarded
+        .as_ref()
+        .map_or(fed_state.node_name.as_str(), |f| f.origin_peer.as_str());
+    let origin = envelope.principal.origin(origin_node);
 
     let envelope_json =
         serde_json::to_string(envelope).map_err(|e| AppError::Internal(e.to_string()))?;
@@ -3484,30 +3227,14 @@ pub async fn send_federated_message(
             let err_resp: Result<WireErrorResponse, _> = serde_json::from_slice(&body_bytes);
             if let Ok(err) = err_resp {
                 match status {
-                    StatusCode::NOT_FOUND => Err(AppError::NotFound(err.detail)),
+                    StatusCode::NOT_FOUND => Err(AppError::NotFoundDetail(err.detail)),
                     StatusCode::CONFLICT => Err(AppError::Ambiguous(err.detail)),
                     StatusCode::GONE => Err(AppError::Gone {
                         session_id: err.detail,
                         pid: 0,
                     }),
-                    StatusCode::FORBIDDEN => {
-                        if err.error == "op_denied" {
-                            Err(AppError::OpDenied(err.detail))
-                        } else if err.error == "peer_rejected" {
-                            Err(AppError::PeerRejected(err.detail))
-                        } else {
-                            Err(AppError::NotRecipient(err.detail))
-                        }
-                    }
-                    StatusCode::BAD_REQUEST => {
-                        if err.error == "no_forward" {
-                            Err(AppError::NoForward(err.detail))
-                        } else if err.error == "unknown_peer" {
-                            Err(AppError::UnknownPeer(err.detail))
-                        } else {
-                            Err(AppError::BadRequest(err.detail))
-                        }
-                    }
+                    StatusCode::FORBIDDEN => Err(AppError::OpDenied(err.detail)),
+                    StatusCode::BAD_REQUEST => Err(AppError::BadRequest(err.detail)),
                     StatusCode::TOO_MANY_REQUESTS => Err(AppError::RateLimited(err.detail)),
                     StatusCode::PAYLOAD_TOO_LARGE => Err(AppError::PayloadTooLarge {
                         size: 0,
@@ -3609,21 +3336,13 @@ pub async fn send_federated_reply(
             let err_resp: Result<WireErrorResponse, _> = serde_json::from_slice(&body_bytes);
             if let Ok(err) = err_resp {
                 match status {
-                    StatusCode::NOT_FOUND => Err(AppError::NotFound(err.detail)),
+                    StatusCode::NOT_FOUND => Err(AppError::NotFoundDetail(err.detail)),
                     StatusCode::CONFLICT => Err(AppError::Ambiguous(err.detail)),
                     StatusCode::GONE => Err(AppError::Gone {
                         session_id: err.detail,
                         pid: 0,
                     }),
-                    StatusCode::FORBIDDEN => {
-                        if err.error == "op_denied" {
-                            Err(AppError::OpDenied(err.detail))
-                        } else if err.error == "peer_rejected" {
-                            Err(AppError::PeerRejected(err.detail))
-                        } else {
-                            Err(AppError::NotRecipient(err.detail))
-                        }
-                    }
+                    StatusCode::FORBIDDEN => Err(AppError::OpDenied(err.detail)),
                     StatusCode::BAD_REQUEST => Err(AppError::BadRequest(err.detail)),
                     StatusCode::TOO_MANY_REQUESTS => Err(AppError::RateLimited(err.detail)),
                     StatusCode::PAYLOAD_TOO_LARGE => Err(AppError::PayloadTooLarge {
@@ -3723,7 +3442,7 @@ pub async fn poll_federated_replies(
             let err_resp: Result<WireErrorResponse, _> = serde_json::from_slice(&body_bytes);
             if let Ok(err) = err_resp {
                 match status {
-                    StatusCode::NOT_FOUND => Err(AppError::NotFound(err.detail)),
+                    StatusCode::NOT_FOUND => Err(AppError::NotFoundDetail(err.detail)),
                     StatusCode::FORBIDDEN => Err(AppError::OpDenied(err.detail)),
                     _ => Err(AppError::ServiceUnavailable(err.detail)),
                 }
@@ -3815,7 +3534,7 @@ pub async fn get_federated_inbox(
             let err_resp: Result<WireErrorResponse, _> = serde_json::from_slice(&body_bytes);
             if let Ok(err) = err_resp {
                 match status {
-                    StatusCode::NOT_FOUND => Err(AppError::NotFound(err.detail)),
+                    StatusCode::NOT_FOUND => Err(AppError::NotFoundDetail(err.detail)),
                     StatusCode::FORBIDDEN => Err(AppError::OpDenied(err.detail)),
                     _ => Err(AppError::ServiceUnavailable(err.detail)),
                 }
@@ -3903,7 +3622,7 @@ pub async fn ack_federated_inbox(
             let err_resp: Result<WireErrorResponse, _> = serde_json::from_slice(&body_bytes);
             if let Ok(err) = err_resp {
                 match status {
-                    StatusCode::NOT_FOUND => Err(AppError::NotFound(err.detail)),
+                    StatusCode::NOT_FOUND => Err(AppError::NotFoundDetail(err.detail)),
                     StatusCode::FORBIDDEN => Err(AppError::OpDenied(err.detail)),
                     _ => Err(AppError::ServiceUnavailable(err.detail)),
                 }
@@ -3966,22 +3685,25 @@ pub fn spawn_outbound_reply_poller(
                                     None,
                                 );
 
-                                match deliver_federated_reply_locally(
+                                let node = fed_state
+                                    .peers
+                                    .canonical_name(&peer_name)
+                                    .unwrap_or(&peer_name)
+                                    .to_string();
+                                if let Ok("sender_gone") = deliver_federated_reply_locally(
                                     &fed_state,
                                     &peer_name,
                                     &message_id,
                                     &reply_id,
                                     &replier_badge,
+                                    storage::Origin::instance(&r.replier_session_id, &node, None),
                                     &r.text,
                                     &ret_harness,
                                     &ret_session_id,
                                 )
                                 .await
                                 {
-                                    Ok("sender_gone") => {
-                                        should_stop = true;
-                                    }
-                                    _ => {}
+                                    should_stop = true;
                                 }
                             }
                         }
@@ -4043,27 +3765,18 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
                 }
 
                 let target_ref = msg.to.as_deref().unwrap_or("");
-                let ret_host = match &msg.origin {
-                    storage::SvcOrigin::Fed { host, .. } => host.clone(),
-                    _ => peer_name.clone(),
-                };
-                let from_name = match &msg.origin {
-                    storage::SvcOrigin::Fed { host, principal } => {
-                        let host = fed_state.peers.display_name(host);
-                        match principal {
-                            Some(p) => format!("xmsg@{host} · {p}"),
-                            None => format!("xmsg@{host}"),
-                        }
-                    }
-                    _ => format!("xmsg@{peer_name}"),
-                };
+                // A12: one render, from the origin the hub attests.
+                let ret_host = peer_name.clone();
+                let from_name = msg
+                    .origin
+                    .render(fed_state.peers.display_name(&msg.origin.node));
 
                 let resolved = resolve_target_session_fed(&fed_state, target_ref).await;
 
                 match resolved {
                     Ok(target) => {
-                        let deliver_res = deliver_to_resolved_target(
-                            &fed_state,
+                        let deliver_res = crate::surface::deliver(
+                            &fed_state.local(),
                             &target,
                             &from_name,
                             &msg.id,
@@ -4074,11 +3787,15 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
 
                         let (target_session_id, recipient_harness, outcome_str) = match deliver_res
                         {
-                            Ok((sess_id, harness, outcome)) => (sess_id, harness, outcome),
+                            Ok((sess_id, harness, outcome)) => {
+                                (sess_id, harness.to_string(), outcome)
+                            }
                             Err(e) => {
                                 let outcome = match &e {
                                     AppError::Gone { .. } => "gone",
-                                    AppError::NotFound(_) => "not_found",
+                                    AppError::NotFound(_) | AppError::NotFoundDetail(_) => {
+                                        "not_found"
+                                    }
                                     AppError::Ambiguous(_) => "ambiguous",
                                     _ => "failed",
                                 };
@@ -4086,17 +3803,21 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
                             }
                         };
 
-                        let (return_harness, return_session_id) = match &msg.origin {
-                            storage::SvcOrigin::Fed {
-                                principal: Some(p), ..
-                            } => {
-                                if let Some((h, s)) = p.split_once(':') {
-                                    (Some(h.to_string()), Some(s.to_string()))
-                                } else {
-                                    (Some("claude".to_string()), Some(p.clone()))
-                                }
-                            }
-                            _ => (None, None),
+                        // A sender with an inbox gets its reply pushed back through the
+                        // hub; an anonymous one reads it with `replies` (A10).
+                        let (return_harness, return_session_id) = match msg.origin.key() {
+                            Some(key) => (
+                                Some(
+                                    if msg.origin.service.is_some() {
+                                        "svc"
+                                    } else {
+                                        "fed"
+                                    }
+                                    .to_string(),
+                                ),
+                                Some(key.to_string()),
+                            ),
+                            None => (None, None),
                         };
 
                         let msg_record = storage::MessageRecord {
@@ -4109,7 +3830,6 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
                             recipient_harness,
                             return_harness,
                             return_session_id,
-                            push_replies: true,
                             thread_id: msg.id.clone(),
                             return_host: Some(ret_host.clone()),
                         };
@@ -4182,7 +3902,6 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
                             recipient_harness: "system".to_string(),
                             return_harness: None,
                             return_session_id: None,
-                            push_replies: false,
                             thread_id: msg.id.clone(),
                             return_host: Some(ret_host.clone()),
                         };
@@ -4308,16 +4027,8 @@ pub async fn list_federated_sessions(
             if let Ok(err) = err_resp {
                 let detail = format!("peer '{peer_name}': {}", err.detail);
                 match status {
-                    StatusCode::NOT_FOUND => Err(AppError::NotFound(detail)),
-                    StatusCode::FORBIDDEN => {
-                        if err.error == "op_denied" {
-                            Err(AppError::OpDenied(detail))
-                        } else if err.error == "peer_rejected" {
-                            Err(AppError::PeerRejected(detail))
-                        } else {
-                            Err(AppError::OpDenied(detail))
-                        }
-                    }
+                    StatusCode::NOT_FOUND => Err(AppError::NotFoundDetail(detail)),
+                    StatusCode::FORBIDDEN => Err(AppError::OpDenied(detail)),
                     StatusCode::TOO_MANY_REQUESTS => Err(AppError::RateLimited(detail)),
                     StatusCode::BAD_REQUEST => Err(AppError::BadRequest(detail)),
                     StatusCode::CONFLICT => Err(AppError::Ambiguous(detail)),

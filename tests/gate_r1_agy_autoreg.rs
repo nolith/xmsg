@@ -104,17 +104,26 @@ async fn oracle_1_hook_credential_less_and_credentialed_and_malformed() {
     tokio::spawn(async move {
         let _ = run_register_server(
             reg_sock_clone,
-            agy_config,
-            store_clone,
-            pi_store,
-            db_clone,
-            pi_tx,
-            Duration::from_secs(60),
+            std::sync::Arc::new(xmsg::http::AppState {
+                sessions_dirs: vec![],
+                agy_config,
+                agy_store: store_clone,
+                pi_store,
+                pi_notify_tx: pi_tx,
+                svc_store: xmsg::svc::new_svc_store(),
+                svc_notify_tx: tokio::sync::broadcast::channel(16).0,
+                node_name: xmsg::node::local_node_name(),
+                max_body: 65536,
+                request_counter: std::sync::atomic::AtomicU64::new(1),
+                db: db_clone,
+                notify_tx: tokio::sync::broadcast::channel(16).0,
+                reply_ttl: Duration::from_secs(60),
+                idempotency_ttl: std::time::Duration::from_secs(86400),
+                long_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
+                fed_state: None,
+            }),
             my_uid,
-            xmsg::svc::new_svc_store(),
             std::collections::HashMap::new(),
-            tokio::sync::broadcast::channel(16).0,
-            None,
         )
         .await;
     });
@@ -388,8 +397,8 @@ exit 0
 
     // 1. Send Message 1
     let resp1 = client
-        .post(format!("{base_url}/v1/sessions/{conv_id}/messages"))
-        .json(&serde_json::json!({
+        .post(format!("{base_url}/v1/messages"))
+        .json(&serde_json::json!({"to": conv_id,
             "from": "test-sender",
             "text": "first message payload"
         }))
@@ -406,8 +415,8 @@ exit 0
 
     // 2. Send Message 2
     let resp2 = client
-        .post(format!("{base_url}/v1/sessions/{conv_id}/messages"))
-        .json(&serde_json::json!({
+        .post(format!("{base_url}/v1/messages"))
+        .json(&serde_json::json!({"to": conv_id,
             "from": "test-sender",
             "text": "second message payload"
         }))
@@ -553,63 +562,26 @@ async fn oracle_3_live_unattested_pid_returns_unregistered_without_exited() {
     let client = reqwest::Client::new();
     let live_pid = std::process::id();
 
-    // 1. GET /v1/sessions/{live_pid}
-    let get_resp = client
-        .get(format!("{base_url}/v1/sessions/{live_pid}"))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(
-        get_resp.status(),
-        reqwest::StatusCode::BAD_REQUEST,
-        "live unattested pid must return 400 Bad Request"
-    );
-
-    let get_str = get_resp.text().await.unwrap();
-    let get_json: Value = serde_json::from_str(&get_str).expect("valid JSON response");
-
-    assert_eq!(
-        get_json["error"], "unregistered",
-        "error code must be 'unregistered'"
-    );
-    assert_eq!(
-        get_json["detail"],
-        format!("process {live_pid} has no attested agent session")
-    );
-    assert!(
-        !get_str.to_lowercase().contains("exited"),
-        "the old 'exited' text must appear nowhere in response: {get_str}"
-    );
-
-    // 2. POST /v1/sessions/{live_pid}/messages
+    // A pid is not a ref (XA3: pid refs are dropped from the grammar); a live process's
+    // pid is a name nothing carries, so it is `not_found`, never `exited`.
     let post_resp = client
-        .post(format!("{base_url}/v1/sessions/{live_pid}/messages"))
+        .post(format!("{base_url}/v1/messages"))
         .json(&serde_json::json!({
+            "to": live_pid.to_string(),
             "from": "someone",
             "text": "hello to unattested process"
         }))
         .send()
         .await
         .unwrap();
-
     assert_eq!(
         post_resp.status(),
-        reqwest::StatusCode::BAD_REQUEST,
-        "send to live unattested pid must return 400 Bad Request"
+        reqwest::StatusCode::NOT_FOUND,
+        "a pid resolves to nothing"
     );
-
     let post_str = post_resp.text().await.unwrap();
     let post_json: Value = serde_json::from_str(&post_str).expect("valid JSON response");
-
-    assert_eq!(
-        post_json["error"], "unregistered",
-        "error code must be 'unregistered'"
-    );
-    assert_eq!(
-        post_json["detail"],
-        format!("process {live_pid} has no attested agent session")
-    );
+    assert_eq!(post_json["error"], "not_found", "{post_str}");
     assert!(
         !post_str.to_lowercase().contains("exited"),
         "the old 'exited' text must appear nowhere in send error response: {post_str}"

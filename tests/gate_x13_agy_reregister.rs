@@ -46,6 +46,7 @@ fn setup_mock_process(
 
 struct RunningServer {
     base_url: String,
+    state: Arc<AppState>,
     agent_sock: PathBuf,
     #[allow(dead_code)]
     db: Arc<Mutex<rusqlite::Connection>>,
@@ -54,6 +55,19 @@ struct RunningServer {
 }
 
 impl RunningServer {
+    /// The agy sessions this server holds, as `list_agy_sessions` reports them: the
+    /// registration state `list` no longer shows (A13 lists address, kind, label, status).
+    fn agy_listing(&self) -> Vec<Value> {
+        xmsg::agy::list_agy_sessions(
+            &self.state.agy_config,
+            &self.state.agy_store,
+            &xmsg::registry::SessionsQuery::default(),
+        )
+        .into_iter()
+        .map(|s| serde_json::to_value(s).unwrap())
+        .collect()
+    }
+
     async fn stop(self) {
         self.agent_task.abort();
         self.http_task.abort();
@@ -131,6 +145,7 @@ async fn start_test_server(
 
     RunningServer {
         base_url,
+        state: state.clone(),
         agent_sock,
         db,
         agent_task,
@@ -224,12 +239,7 @@ async fn oracle_1_restart_preserves_agy_addressability_and_queues() {
     // 3. Verify stage-1 registration on Server 1
     let mut registered_s1 = false;
     for _ in 0..50 {
-        let resp = client
-            .get(format!("{}/v1/sessions", server1.base_url))
-            .send()
-            .await
-            .unwrap();
-        let sessions: Vec<Value> = resp.json().await.unwrap();
+        let sessions = server1.agy_listing();
         if sessions.iter().any(|s| {
             s["sessionId"] == expected_session_key
                 && s["registered"] == false
@@ -266,12 +276,7 @@ async fn oracle_1_restart_preserves_agy_addressability_and_queues() {
     // 5. Within bounded time, xmsg mcp child reconnects and re-registers stage 1
     let mut registered_s2 = false;
     for _ in 0..60 {
-        let resp = client
-            .get(format!("{}/v1/sessions", server2.base_url))
-            .send()
-            .await
-            .unwrap();
-        let sessions: Vec<Value> = resp.json().await.unwrap();
+        let sessions = server2.agy_listing();
         if sessions.iter().any(|s| {
             s["sessionId"] == expected_session_key
                 && s["registered"] == false
@@ -289,11 +294,8 @@ async fn oracle_1_restart_preserves_agy_addressability_and_queues() {
 
     // 6. Send a message to the re-registered session: outcome must be 'queued', not 'sender_gone'
     let post_resp = client
-        .post(format!(
-            "{}/v1/sessions/{conv_id}/messages",
-            server2.base_url
-        ))
-        .json(&serde_json::json!({
+        .post(format!("{}/v1/messages", server2.base_url))
+        .json(&serde_json::json!({"to": conv_id,
             "from": "test-orchestrator",
             "text": "Task payload after restart"
         }))
@@ -389,12 +391,7 @@ async fn oracle_2_restarted_server_does_not_list_exited_agy_child() {
     // Verify stage-1 registration on Server 1
     let mut registered_s1 = false;
     for _ in 0..50 {
-        let resp = client
-            .get(format!("{}/v1/sessions", server1.base_url))
-            .send()
-            .await
-            .unwrap();
-        let sessions: Vec<Value> = resp.json().await.unwrap();
+        let sessions = server1.agy_listing();
         if sessions
             .iter()
             .any(|s| s["sessionId"] == expected_session_key && s["status"] != "unregistered")
@@ -435,29 +432,30 @@ async fn oracle_2_restarted_server_does_not_list_exited_agy_child() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // 6. Assert Server 2 does NOT list the session as stage-1 registered (no ghost session)
-    let resp = client
-        .get(format!("{}/v1/sessions", server2.base_url))
-        .send()
-        .await
-        .unwrap();
-    let sessions: Vec<Value> = resp.json().await.unwrap();
+    let sessions = server2.agy_listing();
     assert!(
         !sessions.iter().any(|s| s["sessionId"] == expected_session_key && s["status"] != "unregistered"),
         "restarted server must NOT list a stage-1 registered agy session whose xmsg mcp child has exited (found: {sessions:?})"
     );
 
-    let get_resp = client
-        .get(format!(
-            "{}/v1/sessions/{}",
-            server2.base_url, expected_session_key
-        ))
+    // The conversation is still held by agy itself (its presence lock), unregistered:
+    // a send to it is queued for the next registration.
+    let get_val = sessions
+        .iter()
+        .find(|s| s["sessionId"] == expected_session_key)
+        .cloned()
+        .expect("the presence-locked conversation stays listed, unregistered");
+    assert_eq!(get_val["status"], "unregistered");
+    assert_eq!(get_val["registered"], false);
+    let post_resp = client
+        .post(format!("{}/v1/messages", server2.base_url))
+        .json(&serde_json::json!({ "to": expected_session_key, "from": "probe", "text": "queued" }))
         .send()
         .await
         .unwrap();
-    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
-    let get_val: Value = get_resp.json().await.unwrap();
-    assert_eq!(get_val["status"], "unregistered");
-    assert_eq!(get_val["registered"], false);
+    assert_eq!(post_resp.status(), reqwest::StatusCode::ACCEPTED);
+    let post_val: Value = post_resp.json().await.unwrap();
+    assert_eq!(post_val["outcome"], "queued", "{post_val}");
 
     server2.stop().await;
 }

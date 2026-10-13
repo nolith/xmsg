@@ -125,12 +125,12 @@ exit 0
     });
 
     let client = reqwest::Client::new();
-    let send_url = format!("http://127.0.0.1:{port}/v1/sessions/{conv_id}/messages");
+    let send_url = format!("http://127.0.0.1:{port}/v1/messages");
 
     // --- Phase 1: Successful Delivery ---
     let resp = client
         .post(&send_url)
-        .json(&serde_json::json!({
+        .json(&serde_json::json!({"to": conv_id,
             "from": "claude-orch",
             "text": "Hello Antigravity session!"
         }))
@@ -140,9 +140,8 @@ exit 0
 
     assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
     let resp_body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(resp_body["sessionId"], initial_key);
-    assert_eq!(resp_body["fromName"], "claude-orch · anon@test-host");
-    let msg_id = resp_body["messageId"].as_str().unwrap().to_string();
+    assert_eq!(resp_body["address"], format!("{initial_key}@test-host"));
+    let msg_id = resp_body["message_id"].as_str().unwrap().to_string();
     assert!(!msg_id.is_empty());
 
     // Verify argv: contains session, title, and envelope; NEVER contains csrf_token
@@ -166,6 +165,7 @@ exit 0
     let resp_fail = client
         .post(&send_url)
         .json(&serde_json::json!({
+            "to": conv_id,
             "from": "claude-orch",
             "text": "This should fail with credentials_stale"
         }))
@@ -192,6 +192,7 @@ exit 0
     let resp_still_stale = client
         .post(&send_url)
         .json(&serde_json::json!({
+            "to": conv_id,
             "from": "claude-orch",
             "text": "Still stale before re-registration"
         }))
@@ -222,6 +223,7 @@ exit 0
     let resp_recovered = client
         .post(&send_url)
         .json(&serde_json::json!({
+            "to": conv_id,
             "from": "claude-orch",
             "text": "Delivered after refreshed credentials"
         }))

@@ -50,21 +50,15 @@ async fn read_json_line(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     serde_json::from_str(line.trim()).unwrap()
 }
 
-async fn send_via_agent_sock(
-    agent_sock: &Path,
-    target_ref: &str,
-    text: &str,
-    push_replies: bool,
-) -> Value {
+async fn send_via_agent_sock(agent_sock: &Path, target_ref: &str, text: &str) -> Value {
     let stream = UnixStream::connect(agent_sock).await.unwrap();
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": target_ref,
+        "to": target_ref,
         "text": text,
-        "push_replies": push_replies,
     });
     writer
         .write_all(format!("{send_req}\n").as_bytes())
@@ -441,17 +435,19 @@ async fn test_oracle_1_http_caller_leaf_reply_stored_and_polled() {
         .unwrap();
     let reg_resp = read_json_line(&mut reader).await;
     assert_eq!(reg_resp["status"], "ok");
-    assert_eq!(reg_resp["sessionId"], "guard");
+    assert!(
+        reg_resp["address"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("guard@")),
+        "{reg_resp}"
+    );
 
     // 2. HTTP caller on hub sends to svc:guard@leaf
     let client = reqwest::Client::new();
-    let send_url = format!(
-        "http://127.0.0.1:{}/v1/sessions/svc:guard@leaf/messages",
-        hub.http_port
-    );
+    let send_url = format!("http://127.0.0.1:{}/v1/messages", hub.http_port);
     let send_resp = client
         .post(&send_url)
-        .json(&serde_json::json!({
+        .json(&serde_json::json!({"to": "guard@leaf",
             "from": "http-caller",
             "text": "audit request from http caller"
         }))
@@ -462,9 +458,9 @@ async fn test_oracle_1_http_caller_leaf_reply_stored_and_polled() {
     assert_eq!(send_resp.status(), StatusCode::ACCEPTED);
     let send_json: Value = send_resp.json().await.unwrap();
     assert_eq!(send_json["outcome"], "queued");
-    let msg_id = send_json["messageId"]
+    let msg_id = send_json["message_id"]
         .as_str()
-        .expect("messageId in response")
+        .expect("message_id in response")
         .to_string();
 
     // 3. Svc daemon on leaf polls message
@@ -520,25 +516,26 @@ async fn test_oracle_1_http_caller_leaf_reply_stored_and_polled() {
         "Reply text must match"
     );
 
-    // 6. Verify SQLite storage on hub: push_outcome == "disabled"
+    // 6. Verify SQLite storage on hub: the anonymous sender has no inbox, so the reply is
+    // stored for `replies` (A10)
     let conn = rusqlite::Connection::open(&hub.db_path).unwrap();
     let replies = xmsg::storage::get_all_replies(&conn, &msg_id).unwrap();
     assert_eq!(replies.len(), 1);
     assert_eq!(
         replies[0].push_outcome.as_deref(),
-        Some("disabled"),
-        "Stored reply push_outcome must be 'disabled'"
+        Some("stored"),
+        "Stored reply push_outcome must be 'stored'"
     );
     assert_eq!(replies[0].text, "audit approved by guard for http");
 }
 
 // =============================================================================
-// Oracle 2: Attested sender on hub with push_replies: false (bot shape)
+// Oracle 2: Attested sender on hub (bot shape; A10 removed its push opt-out)
 // sends to svc:<name>@<leaf>, svc replies, caller reads it via replies endpoint.
 // Mutant: restore the NotRecipient refusal for non-push senders => RED
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_oracle_2_attested_sender_push_replies_false() {
+async fn test_oracle_2_attested_sender_reply_stored_and_readable() {
     let (cert_hub, key_hub, pin_hub) = generate_self_signed_ed25519_pem("hub").unwrap();
     let (cert_leaf, key_leaf, pin_leaf) = generate_self_signed_ed25519_pem("leaf").unwrap();
 
@@ -578,20 +575,12 @@ async fn test_oracle_2_attested_sender_push_replies_false() {
     let reg_resp = read_json_line(&mut reader).await;
     assert_eq!(reg_resp["status"], "ok");
 
-    // 3. Attested sender sends with push_replies: false
-    let send_resp = send_via_agent_sock(
-        &hub.agent_sock,
-        "svc:guard@leaf",
-        "bot query without push",
-        false,
-    )
-    .await;
+    // 3. Attested sender sends
+    let send_resp =
+        send_via_agent_sock(&hub.agent_sock, "guard@leaf", "bot query without push").await;
     assert_eq!(send_resp["status"], "ok");
-    assert_eq!(send_resp["delivery"]["outcome"], "queued");
-    let msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert_eq!(send_resp["outcome"], "queued");
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // 3. Svc polls and delivers
     let poll_frame = serde_json::json!({ "action": "poll", "waitSecs": 5 });
@@ -637,11 +626,17 @@ async fn test_oracle_2_attested_sender_push_replies_false() {
     assert_eq!(replies_arr.len(), 1);
     assert_eq!(replies_arr[0]["text"], "bot answer from guard");
 
-    // 6. Verify stored push_outcome is "disabled"
+    // 6. The attested sender has an inbox, so the reply was also pushed to it (A10: no
+    // opt-out); it stays stored for `replies` either way.
     let conn = rusqlite::Connection::open(&hub.db_path).unwrap();
     let replies = xmsg::storage::get_all_replies(&conn, &msg_id).unwrap();
     assert_eq!(replies.len(), 1);
-    assert_eq!(replies[0].push_outcome.as_deref(), Some("disabled"));
+    assert_ne!(
+        replies[0].push_outcome.as_deref(),
+        Some("stored"),
+        "{:?}",
+        replies[0]
+    );
 }
 
 // =============================================================================
@@ -679,13 +674,10 @@ async fn test_oracle_3_leaf_replies_get_makes_zero_outbound_connections() {
 
     // Send a message via HTTP to create outbound record pointing to leaf
     let client = reqwest::Client::new();
-    let send_url = format!(
-        "http://127.0.0.1:{}/v1/sessions/svc:guard@leaf/messages",
-        hub.http_port
-    );
+    let send_url = format!("http://127.0.0.1:{}/v1/messages", hub.http_port);
     let send_resp = client
         .post(&send_url)
-        .json(&serde_json::json!({
+        .json(&serde_json::json!({"to": "guard@leaf",
             "from": "http-caller",
             "text": "message for tripwire check"
         }))
@@ -695,9 +687,9 @@ async fn test_oracle_3_leaf_replies_get_makes_zero_outbound_connections() {
 
     assert_eq!(send_resp.status(), StatusCode::ACCEPTED);
     let send_json: Value = send_resp.json().await.unwrap();
-    let msg_id = send_json["messageId"]
+    let msg_id = send_json["message_id"]
         .as_str()
-        .expect("messageId in response")
+        .expect("message_id in response")
         .to_string();
 
     // Now issue GET /v1/messages/{msg_id}/replies?wait=1 on the hub
@@ -768,19 +760,11 @@ async fn test_oracle_4_push_capable_sender_gets_pushed_exactly_once() {
     assert_eq!(reg_resp["status"], "ok");
 
     // 3. Alice on hub sends to svc:guard@leaf with push_replies: true
-    let send_resp = send_via_agent_sock(
-        &hub.agent_sock,
-        "svc:guard@leaf",
-        "audit request with push",
-        true,
-    )
-    .await;
+    let send_resp =
+        send_via_agent_sock(&hub.agent_sock, "guard@leaf", "audit request with push").await;
     assert_eq!(send_resp["status"], "ok");
-    assert_eq!(send_resp["delivery"]["outcome"], "queued");
-    let msg_id = send_resp["delivery"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert_eq!(send_resp["outcome"], "queued");
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // 4. Svc on leaf polls message
     let poll_frame = serde_json::json!({ "action": "poll", "waitSecs": 5 });

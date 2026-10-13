@@ -189,17 +189,26 @@ async fn create_fed_test_node(
     tokio::spawn(async move {
         let _ = run_register_server(
             r_sock,
-            reg_config,
-            reg_store,
-            reg_pi_store,
-            reg_db,
-            reg_pi_notify,
-            Duration::from_secs(3600),
+            std::sync::Arc::new(xmsg::http::AppState {
+                sessions_dirs: vec![],
+                agy_config: reg_config,
+                agy_store: reg_store,
+                pi_store: reg_pi_store,
+                pi_notify_tx: reg_pi_notify,
+                svc_store: reg_svc_store,
+                svc_notify_tx: reg_svc_notify,
+                node_name: xmsg::node::local_node_name(),
+                max_body: 65536,
+                request_counter: std::sync::atomic::AtomicU64::new(1),
+                db: reg_db,
+                notify_tx: tokio::sync::broadcast::channel(16).0,
+                reply_ttl: Duration::from_secs(3600),
+                idempotency_ttl: std::time::Duration::from_secs(86400),
+                long_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
+                fed_state: None,
+            }),
             my_uid,
-            reg_svc_store,
             reg_trusted_svc,
-            reg_svc_notify,
-            None,
         )
         .await;
     });
@@ -377,8 +386,8 @@ async fn test_oracle_1_peer_with_list_allowed() {
     let reg_resp = read_json_line(&mut daemon_reader).await;
     assert_eq!(reg_resp["status"], "ok");
 
-    // Node B queries local /v1/sessions?peer=host-a over http.sock
-    let (status, body) = http_get_unix(&node_b.http_sock, "/v1/sessions?peer=host-a").unwrap();
+    // Node B queries local /v1/recipients?node=host-a over http.sock
+    let (status, body) = http_get_unix(&node_b.http_sock, "/v1/recipients?node=host-a").unwrap();
     assert_eq!(status, StatusCode::OK, "Body: {body}");
 
     let sessions: Vec<Value> = serde_json::from_str(&body).unwrap();
@@ -389,17 +398,16 @@ async fn test_oracle_1_peer_with_list_allowed() {
 
     let claude_sess = sessions
         .iter()
-        .find(|s| s["sessionId"] == "sess-a")
-        .expect("sess-a found");
-    assert_eq!(claude_sess["ref"], "sess-a@host-a");
-    assert_eq!(claude_sess["harness"], "claude");
+        .find(|s| s["address"] == "sess-a@host-a")
+        .expect("sess-a found, addressable as sess-a@host-a");
+    assert_eq!(claude_sess["kind"], "instance");
+    assert_eq!(claude_sess["node"], "host-a");
 
     let svc_sess = sessions
         .iter()
-        .find(|s| s["name"] == "genie-expert" || s["sessionId"] == "svc:genie-expert")
-        .expect("svc daemon found");
-    let svc_id = svc_sess["sessionId"].as_str().unwrap();
-    assert_eq!(svc_sess["ref"], format!("{svc_id}@host-a"));
+        .find(|s| s["address"] == "genie-expert@host-a")
+        .expect("svc daemon found, addressable as genie-expert@host-a");
+    assert_eq!(svc_sess["kind"], "service");
 }
 
 // =============================================================================
@@ -465,8 +473,8 @@ async fn test_oracle_2_peer_without_list_allowed_403() {
     // Create session on Node A
     let (_sock, _rx) = create_claude_session_fixture(&node_a.sessions_dir, "sess-a", "agent-a");
 
-    // Node B queries /v1/sessions?peer=host-a
-    let (status, body) = http_get_unix(&node_b.http_sock, "/v1/sessions?peer=host-a").unwrap();
+    // Node B queries /v1/recipients?node=host-a
+    let (status, body) = http_get_unix(&node_b.http_sock, "/v1/recipients?node=host-a").unwrap();
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
@@ -474,7 +482,7 @@ async fn test_oracle_2_peer_without_list_allowed_403() {
     );
 
     let err: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(err["error"], "op_denied");
+    assert_eq!(err["error"], "denied");
     let detail = err["detail"].as_str().unwrap();
     assert!(
         detail.contains("host-a") || detail.contains("list operation not allowed"),
@@ -557,8 +565,8 @@ async fn test_oracle_3_peer_with_targets() {
     let reg_resp = read_json_line(&mut daemon_reader).await;
     assert_eq!(reg_resp["status"], "ok");
 
-    // Node B queries /v1/sessions?peer=host-a
-    let (status, body) = http_get_unix(&node_b.http_sock, "/v1/sessions?peer=host-a").unwrap();
+    // Node B queries /v1/recipients?node=host-a
+    let (status, body) = http_get_unix(&node_b.http_sock, "/v1/recipients?node=host-a").unwrap();
     assert_eq!(status, StatusCode::OK, "Body: {body}");
 
     let sessions: Vec<Value> = serde_json::from_str(&body).unwrap();
@@ -569,13 +577,9 @@ async fn test_oracle_3_peer_with_targets() {
     );
 
     let sess = &sessions[0];
-    assert!(
-        sess["name"] == "genie-expert" || sess["sessionId"] == "svc:genie-expert",
-        "Expected svc:genie-expert, got {sess:?}"
-    );
-    assert_ne!(
-        sess["sessionId"], "sess-a",
-        "Claude session sess-a must be excluded by targets filter"
+    assert_eq!(
+        sess["address"], "genie-expert@host-a",
+        "Expected genie-expert@host-a, got {sess:?}"
     );
 }
 
@@ -647,8 +651,8 @@ async fn test_oracle_4_no_cwd_or_pid() {
         .unwrap();
     assert!(!wire_entries.is_empty());
 
-    // Check via client route /v1/sessions?peer=host-a
-    let (status, body) = http_get_unix(&node_b.http_sock, "/v1/sessions?peer=host-a").unwrap();
+    // Check via client route /v1/recipients?node=host-a
+    let (status, body) = http_get_unix(&node_b.http_sock, "/v1/recipients?node=host-a").unwrap();
     assert_eq!(status, StatusCode::OK);
 
     let val: Value = serde_json::from_str(&body).unwrap();
@@ -688,12 +692,12 @@ async fn test_oracle_4_no_cwd_or_pid() {
             "entry must NOT contain registered: {entry:?}"
         );
 
-        // Assert exact key set on client route: {"harness", "kind", "name", "ref", "sessionId", "status"}
+        // Assert exact key set on client route (A13): address, kind, label, status, node
         let mut keys: Vec<String> = obj.keys().cloned().collect();
         keys.sort();
         assert_eq!(
             keys,
-            vec!["harness", "kind", "name", "ref", "sessionId", "status"],
+            vec!["address", "kind", "label", "node", "status"],
             "exact key set mismatch on entry: {entry:?}"
         );
     }
@@ -781,7 +785,7 @@ async fn test_oracle_5_mcp_list_host() {
             &mcp_cfg_clone,
             &client,
             "list",
-            &serde_json::json!({ "host": "host-a" }),
+            &serde_json::json!({ "node": "host-a" }),
         );
         let local = execute_tool(&mcp_cfg_clone, &client, "list", &serde_json::json!({}));
         (remote, local)
@@ -805,10 +809,10 @@ async fn test_oracle_5_mcp_list_host() {
     assert_eq!(local_call["isError"], false);
     let local_mcp_text = local_call["content"][0]["text"].as_str().unwrap();
 
-    let (_status, local_direct_text) = http_get_unix(&node_b.http_sock, "/v1/sessions").unwrap();
+    let (_status, local_direct_text) = http_get_unix(&node_b.http_sock, "/v1/recipients").unwrap();
     assert_eq!(
         local_mcp_text, local_direct_text,
-        "MCP list without host must match local /v1/sessions byte-for-byte"
+        "MCP list without node must match local /v1/recipients byte-for-byte"
     );
 }
 
@@ -877,15 +881,15 @@ async fn test_oracle_6_source_outside_from_cidr_refused() {
 
     // Node B connects from 127.0.0.1 to Node A
     let res = list_federated_sessions(&node_b.fed_state, "host-a").await;
+    // A refusal by the peer's rights is `denied` on the wire (A13's one vocabulary).
     match res {
-        Err(AppError::PeerRejected(detail)) => {
+        Err(e @ (AppError::PeerRejected(_) | AppError::OpDenied(_))) if e.code().1 == "denied" => {
+            let detail = e.detail();
             assert!(
-                detail.contains("host-a")
-                    || detail.contains("CIDR")
-                    || detail.contains("peer_rejected"),
+                detail.contains("host-a") || detail.contains("CIDR") || detail.contains("denied"),
                 "Detail must indicate source CIDR refusal: {detail}"
             );
         }
-        other => panic!("Expected PeerRejected error, got: {other:?}"),
+        other => panic!("Expected a denied refusal, got: {other:?}"),
     }
 }

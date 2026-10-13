@@ -270,17 +270,26 @@ async fn test_registration_server_e2e_and_atomic_replacement() {
     tokio::spawn(async move {
         let _ = run_register_server(
             s_path,
-            s_cfg,
-            s_store,
-            s_pi,
-            s_db,
-            s_tx,
-            reply_ttl,
+            std::sync::Arc::new(xmsg::http::AppState {
+                sessions_dirs: vec![],
+                agy_config: s_cfg,
+                agy_store: s_store,
+                pi_store: s_pi,
+                pi_notify_tx: s_tx,
+                svc_store: xmsg::svc::new_svc_store(),
+                svc_notify_tx: tokio::sync::broadcast::channel(16).0,
+                node_name: xmsg::node::local_node_name(),
+                max_body: 65536,
+                request_counter: std::sync::atomic::AtomicU64::new(1),
+                db: s_db,
+                notify_tx: tokio::sync::broadcast::channel(16).0,
+                reply_ttl,
+                idempotency_ttl: std::time::Duration::from_secs(86400),
+                long_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
+                fed_state: None,
+            }),
             my_uid,
-            xmsg::svc::new_svc_store(),
             std::collections::HashMap::new(),
-            tokio::sync::broadcast::channel(16).0,
-            None,
         )
         .await;
     });

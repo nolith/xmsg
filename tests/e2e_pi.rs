@@ -77,17 +77,26 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
     tokio::spawn(async move {
         let _ = run_register_server(
             s_path,
-            s_cfg,
-            s_store,
-            s_pi,
-            s_db,
-            s_tx,
-            reply_ttl,
+            std::sync::Arc::new(xmsg::http::AppState {
+                sessions_dirs: vec![],
+                agy_config: s_cfg,
+                agy_store: s_store,
+                pi_store: s_pi,
+                pi_notify_tx: s_tx,
+                svc_store: xmsg::svc::new_svc_store(),
+                svc_notify_tx: tokio::sync::broadcast::channel(16).0,
+                node_name: xmsg::node::local_node_name(),
+                max_body: 65536,
+                request_counter: std::sync::atomic::AtomicU64::new(1),
+                db: s_db,
+                notify_tx: tokio::sync::broadcast::channel(16).0,
+                reply_ttl,
+                idempotency_ttl: std::time::Duration::from_secs(86400),
+                long_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
+                fed_state: None,
+            }),
             my_uid,
-            xmsg::svc::new_svc_store(),
             std::collections::HashMap::new(),
-            tokio::sync::broadcast::channel(16).0,
-            None,
         )
         .await;
     });
@@ -154,7 +163,7 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
     // 4. Verify session appears in GET /v1/sessions
     let client = reqwest::Client::new();
     let sessions_resp = client
-        .get(format!("http://127.0.0.1:{http_port}/v1/sessions"))
+        .get(format!("http://127.0.0.1:{http_port}/v1/recipients"))
         .send()
         .await
         .unwrap();
@@ -163,11 +172,11 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
     let sessions_arr = sessions_json.as_array().unwrap();
     let pi_sess = sessions_arr
         .iter()
-        .find(|s| s["sessionId"] == derived_session_id)
-        .expect("pi session should be listed in /v1/sessions");
-    assert_eq!(pi_sess["harness"], "pi");
-    assert_eq!(pi_sess["name"], "worker-one");
-    assert_eq!(pi_sess["registered"], true);
+        .find(|s| s["address"] == format!("{derived_session_id}@test-host"))
+        .expect("pi session should be listed in /v1/recipients");
+    assert_eq!(pi_sess["kind"], "instance");
+    assert_eq!(pi_sess["label"], "worker-one");
+    assert_eq!(pi_sess["status"], "live");
 
     // 5. Pi starts long-poll on the socket in background task
     let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::channel::<Value>(1);
@@ -215,10 +224,8 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
 
     // 6. Post message to Pi session via HTTP (using session name worker-one)
     let send_resp = client
-        .post(format!(
-            "http://127.0.0.1:{http_port}/v1/sessions/worker-one/messages"
-        ))
-        .json(&serde_json::json!({
+        .post(format!("http://127.0.0.1:{http_port}/v1/messages"))
+        .json(&serde_json::json!({"to": "worker-one",
             "from": "alice-orch",
             "text": "Hello Pi agent, please run unit tests!"
         }))
@@ -228,8 +235,11 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
 
     assert_eq!(send_resp.status(), StatusCode::ACCEPTED);
     let send_data: Value = send_resp.json().await.unwrap();
-    let message_id = send_data["messageId"].as_str().unwrap().to_string();
-    assert_eq!(send_data["sessionId"], derived_session_id);
+    let message_id = send_data["message_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        send_data["address"],
+        format!("{derived_session_id}@test-host")
+    );
 
     // 7. Verify Pi socket waiter received the delivery with §9.4 envelope
     let delivered_val = tokio::time::timeout(Duration::from_secs(2), delivery_rx.recv())
@@ -244,11 +254,12 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
     assert!(envelope.contains("reply with the xmsg reply tool"));
     assert!(envelope.contains("Hello Pi agent, please run unit tests!"));
 
-    // 8a. Red Demo 1: HTTP POST to /v1/messages/{id}/replies returns 405 Method Not Allowed
+    // 8a. Red Demo 1: an HTTP caller cannot reply for the pi session. The reply route
+    // exists (A13), but an anonymous caller has received nothing (A15) and the old body,
+    // which named the session, is refused.
+    let reply_url = format!("http://127.0.0.1:{http_port}/v1/messages/{message_id}/replies");
     let http_reply_resp = client
-        .post(format!(
-            "http://127.0.0.1:{http_port}/v1/messages/{message_id}/replies"
-        ))
+        .post(&reply_url)
         .json(&serde_json::json!({
             "sessionRef": "worker-one",
             "text": "All 42 tests passed cleanly!"
@@ -256,7 +267,16 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
         .send()
         .await
         .unwrap();
-    assert_eq!(http_reply_resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(http_reply_resp.status(), StatusCode::BAD_REQUEST);
+    let http_reply_resp = client
+        .post(&reply_url)
+        .json(&serde_json::json!({ "text": "All 42 tests passed cleanly!" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(http_reply_resp.status(), StatusCode::FORBIDDEN);
+    let denied: Value = http_reply_resp.json().await.unwrap();
+    assert_eq!(denied["error"], "denied");
 
     // 8b. Test reply from recipient Pi session over agent.sock
     let agent_stream = UnixStream::connect(&agent_sock_path).await.unwrap();
@@ -265,7 +285,7 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
 
     let reply_cmd = serde_json::json!({
         "action": "reply",
-        "messageId": message_id,
+        "message_id": message_id,
         "text": "All 42 tests passed cleanly!"
     });
     ag_writer
@@ -291,7 +311,6 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
         recipient_harness: "pi".to_string(),
         return_harness: None,
         return_session_id: None,
-        push_replies: false,
         thread_id: "other-msg-123".to_string(),
         return_host: None,
     };
@@ -302,7 +321,7 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
 
     let hijack_cmd = serde_json::json!({
         "action": "reply",
-        "messageId": "other-msg-123",
+        "message_id": "other-msg-123",
         "text": "Unauthorized hijack reply"
     });
     ag_writer
@@ -314,7 +333,7 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
     ag_reader.read_line(&mut reject_line).await.unwrap();
     let reject_resp: Value = serde_json::from_str(&reject_line).unwrap();
     assert_eq!(reject_resp["status"], "error");
-    assert_eq!(reject_resp["error"], "not_recipient");
+    assert_eq!(reject_resp["error"], "denied");
 
     // 10. Check GET /v1/messages/{id} includes the delivered message and recipient's reply
     let msg_detail_resp = client

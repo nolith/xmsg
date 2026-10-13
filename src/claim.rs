@@ -83,9 +83,14 @@ pub fn validate_service_name(name: &str) -> Result<(), AppError> {
             "service name 'xmsg' is reserved".to_string(),
         ));
     }
-    if name.contains('@') || name.contains('·') || name.contains('~') || name.contains('.') {
+    if name.contains('@')
+        || name.contains('·')
+        || name.contains('~')
+        || name.contains('.')
+        || name.contains(':')
+    {
         return Err(AppError::BadRequest(format!(
-            "service name '{name}' contains forbidden character (@, ·, ~, or .)"
+            "service name '{name}' contains forbidden character (@, ·, ~, . or :)"
         )));
     }
     if is_uuid_shaped(name) {
@@ -454,7 +459,6 @@ pub async fn deliver_fork_notices(
                     recipient_harness: "claude".to_string(),
                     return_harness: None,
                     return_session_id: None,
-                    push_replies: false,
                     thread_id: msg_id,
                     return_host: None,
                 },
@@ -527,8 +531,8 @@ fn claude_target(claim: &InstanceClaim, entry: &SessionFileEntry) -> ClaudeTarge
     (session, PathBuf::from(&entry.messaging_socket_path))
 }
 
-/// Resolves `ref_str` as a Claude instance ID against one scan's live pairs: `X~n`, a
-/// bare `X`, or a pid. `None` when it names no live or recorded Claude instance by ID.
+/// Resolves `ref_str` as a Claude instance ID against one scan's live pairs: `X~n` or a
+/// bare `X`. `None` when it names no live or recorded Claude instance by ID.
 ///
 /// A bare X while the plain ID is free and only `X~n` forks are live is `ambiguous`,
 /// listing each fork as `X~n@node` (D-4); it is never taken as not running.
@@ -586,12 +590,6 @@ pub fn resolve_claude_id_in(
         return Some(Err(AppError::Ambiguous(candidates.join(", "))));
     }
 
-    // 3. A pid.
-    if let Ok(pid) = ref_str.parse::<u32>() {
-        if let Some((claim, entry)) = active_pairs.iter().find(|(_, e)| e.pid == pid) {
-            return Some(Ok(claude_target(claim, entry)));
-        }
-    }
     None
 }
 
@@ -638,12 +636,8 @@ pub fn claude_absence_in(
         Err(e) => return AppError::Internal(e.to_string()),
     }
 
-    let ref_pid = ref_str.parse::<u32>().ok();
     for entry in registry::read_session_entries(sessions_dirs) {
-        if entry.session_id == ref_str
-            || entry.name.as_deref() == Some(ref_str)
-            || Some(entry.pid) == ref_pid
-        {
+        if entry.session_id == ref_str || entry.name.as_deref() == Some(ref_str) {
             return AppError::Gone {
                 session_id: entry.session_id,
                 pid: entry.pid,

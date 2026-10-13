@@ -1396,18 +1396,16 @@ pub async fn run_agy_proc_watcher(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_register_server(
     sock_path: PathBuf,
-    config: AgyConfig,
-    store: AgyStore,
-    pi_store: crate::pi::PiStore,
-    db: Arc<Mutex<rusqlite::Connection>>,
-    pi_notify_tx: tokio::sync::broadcast::Sender<String>,
-    reply_ttl: Duration,
+    state: Arc<crate::http::AppState>,
     my_uid: u32,
-    svc_store: crate::svc::SvcStore,
     trusted_svc_exes: HashMap<String, PathBuf>,
-    svc_notify_tx: tokio::sync::broadcast::Sender<String>,
-    fed_state: Option<Arc<crate::fed::FedState>>,
 ) -> io::Result<()> {
+    let config = state.agy_config.clone();
+    let store = state.agy_store.clone();
+    let pi_store = state.pi_store.clone();
+    let db = state.db.clone();
+    let pi_notify_tx = state.pi_notify_tx.clone();
+    let reply_ttl = state.reply_ttl;
     if let Some(parent) = sock_path.parent() {
         if let Err(e) = crate::agent::ensure_secure_socket_dir(parent, my_uid) {
             return Err(io::Error::new(
@@ -1477,10 +1475,8 @@ pub async fn run_register_server(
         let pi_store_clone = pi_store.clone();
         let db_clone = db.clone();
         let pi_notify_tx_clone = pi_notify_tx.clone();
-        let svc_store_clone = svc_store.clone();
+        let state_clone = state.clone();
         let trusted_svc_exes_clone = trusted_svc_exes.clone();
-        let svc_notify_tx_clone = svc_notify_tx.clone();
-        let fed_state_clone = fed_state.clone();
         let stand_down_counts_clone = stand_down_counts.clone();
         let arm_tx_clone = arm_tx.clone();
 
@@ -1628,19 +1624,14 @@ pub async fn run_register_server(
                                 if let Err(e) = crate::svc::handle_svc_connection(
                                     buf_reader,
                                     writer,
-                                    config_clone.proc_root.clone(),
-                                    svc_store_clone,
+                                    state_clone,
                                     &trusted_svc_exes_clone,
                                     my_uid,
                                     peer_uid,
                                     peer_pid,
                                     req,
-                                    db_clone,
-                                    svc_notify_tx_clone,
-                                    reply_ttl,
                                     false,
                                     None,
-                                    fed_state_clone,
                                 )
                                 .await
                                 {

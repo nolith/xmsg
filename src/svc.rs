@@ -10,12 +10,48 @@ use crate::error::AppError;
 use crate::registry::{Session, SessionsQuery};
 use crate::storage::{self, now_epoch_secs};
 
+/// A service's registration frame on `register.sock`. Unknown fields are refused (plan
+/// §6 D3); `harness` is the multiplexer's tag.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SvcRegisterRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
     pub name: String,
     #[serde(default)]
     pub cwd: Option<String>,
+}
+
+/// A registered service's frames on `register.sock`: `poll`, `ack` and `reply`. It runs
+/// `list`, `send` and `replies` over `agent.sock` (AM-4; plan §6 D15).
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum SvcFrame {
+    Poll {
+        #[serde(default, rename = "waitSecs")]
+        wait_secs: Option<u64>,
+    },
+    Ack {
+        #[serde(rename = "messageId")]
+        message_id: String,
+    },
+    Reply {
+        #[serde(rename = "messageId")]
+        message_id: String,
+        text: String,
+    },
+}
+
+fn deliver_frame(msg: &storage::SvcPendingMessage) -> serde_json::Value {
+    serde_json::json!({
+        "action": "deliver",
+        "messageId": msg.id,
+        "fromName": msg.from_name,
+        "text": msg.text,
+        "envelope": msg.envelope,
+        "origin": msg.origin,
+        "inReplyTo": msg.in_reply_to,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -128,55 +164,17 @@ pub fn list_svc_sessions(
     sessions
 }
 
+/// The live service named `name` (case-insensitive). A name is unique per node (A2).
 pub fn resolve_svc_session(
     proc_root: &Path,
     store: &SvcStore,
-    ref_str: &str,
+    name: &str,
 ) -> Result<Option<Session>, AppError> {
-    let query = SessionsQuery::default();
-    let all = list_svc_sessions(proc_root, store, &query);
-    let ref_lower = ref_str.to_ascii_lowercase();
-    let ref_unprefixed = ref_lower.strip_prefix("svc:").unwrap_or(&ref_lower);
-    let ref_pid = ref_str.parse::<u32>().ok();
-
-    let matched: Vec<Session> = all
-        .into_iter()
-        .filter(|s| {
-            if s.session_id.to_ascii_lowercase() == ref_lower {
-                return true;
-            }
-            if let Some(ref name) = s.name {
-                if name.to_ascii_lowercase() == ref_lower
-                    || name.to_ascii_lowercase() == ref_unprefixed
-                {
-                    return true;
-                }
-            }
-            if s.session_id
-                .to_ascii_lowercase()
-                .strip_prefix("svc:")
-                .unwrap_or("")
-                == ref_unprefixed
-            {
-                return true;
-            }
-            if let Some(pid) = ref_pid {
-                if s.pid == pid {
-                    return true;
-                }
-            }
-            false
-        })
-        .collect();
-
-    if matched.is_empty() {
-        Ok(None)
-    } else if matched.len() > 1 {
-        let ids: Vec<String> = matched.into_iter().map(|s| s.session_id).collect();
-        Err(AppError::Ambiguous(ids.join(", ")))
-    } else {
-        Ok(Some(matched.into_iter().next().unwrap()))
-    }
+    Ok(
+        list_svc_sessions(proc_root, store, &SessionsQuery::default())
+            .into_iter()
+            .find(|s| s.session_id.eq_ignore_ascii_case(name)),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -186,25 +184,22 @@ pub async fn handle_svc_connection<
 >(
     mut buf_reader: R,
     mut writer: W,
-    proc_root: std::path::PathBuf,
-    store: SvcStore,
+    state: Arc<crate::http::AppState>,
     trusted_svc_exes: &HashMap<String, PathBuf>,
     my_uid: u32,
     peer_uid: u32,
     peer_pid: u32,
     req: SvcRegisterRequest,
-    db: Arc<Mutex<rusqlite::Connection>>,
-    svc_notify_tx: broadcast::Sender<String>,
-    reply_ttl: Duration,
     leaf_mode: bool,
     leaf_principal: Option<String>,
-    fed_state: Option<Arc<crate::fed::FedState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let proc_root = state.agy_config.proc_root.clone();
+    let store = state.svc_store.clone();
+    let db = state.db.clone();
+    let svc_notify_tx = state.svc_notify_tx.clone();
+    let reply_ttl = state.reply_ttl;
     let raw_name = req.name.trim();
-    let name = raw_name
-        .strip_prefix("svc:")
-        .unwrap_or(raw_name)
-        .to_string();
+    let name = raw_name.to_string();
     if name.is_empty() {
         let err_resp = serde_json::json!({
             "status": "error",
@@ -224,11 +219,8 @@ pub async fn handle_svc_connection<
     }
 
     let starttime = if leaf_mode {
-        let expected_name = leaf_principal
-            .as_deref()
-            .unwrap_or("")
-            .strip_prefix("svc:")
-            .unwrap_or("");
+        let expected_name =
+            crate::surface::leaf_service_name(leaf_principal.as_deref().unwrap_or(""));
         if name != expected_name {
             let err_resp = serde_json::json!({
                 "status": "error",
@@ -280,13 +272,7 @@ pub async fn handle_svc_connection<
     // Single live registration check (Gate r2 G5 / Oracle 5)
     let conflict = {
         let store_lock = store.read().unwrap();
-        let existing = store_lock.get(&session_id).or_else(|| {
-            if let Some(stripped) = session_id.strip_prefix("svc:") {
-                store_lock.get(stripped)
-            } else {
-                store_lock.get(&format!("svc:{session_id}"))
-            }
-        });
+        let existing = store_lock.get(&session_id);
         if let Some(existing) = existing {
             (existing.pid != peer_pid || existing.starttime != starttime)
                 && is_svc_session_alive(&proc_root, existing)
@@ -318,10 +304,12 @@ pub async fn handle_svc_connection<
         store.write().unwrap().insert(session_id.clone(), info);
     }
 
-    // Write initial registration ok with server-derived sessionId
+    // The registration's address and this node's name (AM-4); MA's origin check reads
+    // the node.
     let ok_resp = serde_json::json!({
         "status": "ok",
-        "sessionId": session_id,
+        "address": format!("{session_id}@{}", state.node_name),
+        "node": state.node_name,
     });
     writer.write_all(format!("{ok_resp}\n").as_bytes()).await?;
 
@@ -360,24 +348,18 @@ pub async fn handle_svc_connection<
             continue;
         }
 
-        let cmd: serde_json::Value = match serde_json::from_str(trimmed) {
+        let cmd: SvcFrame = match crate::surface::parse_frame(trimmed) {
             Ok(v) => v,
-            Err(_) => {
-                let err = serde_json::json!({ "status": "error", "detail": "invalid json" });
+            Err(e) => {
+                let err = e.frame();
                 writer.write_all(format!("{err}\n").as_bytes()).await?;
                 continue;
             }
         };
 
-        let action = cmd.get("action").and_then(|a| a.as_str()).unwrap_or("");
-
-        match action {
-            "poll" => {
-                let wait_secs = cmd
-                    .get("waitSecs")
-                    .and_then(|w| w.as_u64())
-                    .unwrap_or(30)
-                    .min(60);
+        match cmd {
+            SvcFrame::Poll { wait_secs } => {
+                let wait_secs = wait_secs.unwrap_or(30).min(60);
 
                 // Run TTL purge on queue
                 {
@@ -395,14 +377,7 @@ pub async fn handle_svc_connection<
                 };
 
                 if let Some(msg) = pending {
-                    let resp = serde_json::json!({
-                        "action": "deliver",
-                        "messageId": msg.id,
-                        "fromName": msg.from_name,
-                        "text": msg.text,
-                        "envelope": msg.envelope,
-                        "origin": msg.origin,
-                    });
+                    let resp = deliver_frame(&msg);
                     writer.write_all(format!("{resp}\n").as_bytes()).await?;
                 } else if wait_secs == 0 {
                     let resp = serde_json::json!({ "action": "timeout" });
@@ -412,15 +387,7 @@ pub async fn handle_svc_connection<
                     let wait_fut = async {
                         loop {
                             match rx.recv().await {
-                                Ok(ref id)
-                                    if id == &sess_clone
-                                        || id.strip_prefix("svc:").unwrap_or(id)
-                                            == sess_clone
-                                                .strip_prefix("svc:")
-                                                .unwrap_or(&sess_clone) =>
-                                {
-                                    break
-                                }
+                                Ok(ref id) if id == &sess_clone => break,
                                 Err(broadcast::error::RecvError::Lagged(_)) => break,
                                 Err(_) => break,
                                 _ => {}
@@ -436,14 +403,7 @@ pub async fn handle_svc_connection<
                     };
 
                     if let Some(msg) = pending_after {
-                        let resp = serde_json::json!({
-                            "action": "deliver",
-                            "messageId": msg.id,
-                            "fromName": msg.from_name,
-                            "text": msg.text,
-                            "envelope": msg.envelope,
-                            "origin": msg.origin,
-                        });
+                        let resp = deliver_frame(&msg);
                         writer.write_all(format!("{resp}\n").as_bytes()).await?;
                     } else {
                         let resp = serde_json::json!({ "action": "timeout" });
@@ -451,114 +411,24 @@ pub async fn handle_svc_connection<
                     }
                 }
             }
-            "ack" => {
-                if let Some(msg_id) = cmd.get("messageId").and_then(|m| m.as_str()) {
+            SvcFrame::Ack { message_id } => {
+                {
                     let conn = db.lock().unwrap();
-                    let _ = storage::ack_svc_message(&conn, &session_id, msg_id);
+                    let _ = storage::ack_svc_message(&conn, &session_id, &message_id);
                 }
                 let resp = serde_json::json!({ "status": "ok" });
                 writer.write_all(format!("{resp}\n").as_bytes()).await?;
             }
-            "reply" => {
-                let msg_id = match cmd.get("messageId").and_then(|m| m.as_str()) {
-                    Some(id) => id,
-                    None => {
-                        let err =
-                            serde_json::json!({ "status": "error", "detail": "missing messageId" });
-                        writer.write_all(format!("{err}\n").as_bytes()).await?;
-                        continue;
-                    }
+            SvcFrame::Reply { message_id, text } => {
+                let caller = crate::surface::service_session(&name);
+                let resp = match crate::surface::reply(&state, &caller, &message_id, &text).await {
+                    Ok(reply) => serde_json::json!({
+                        "status": "ok",
+                        "messageId": reply.pushed_message_id,
+                    }),
+                    Err(e) => e.frame(),
                 };
-                let text = match cmd.get("text").and_then(|t| t.as_str()) {
-                    Some(t) => t,
-                    None => {
-                        let err =
-                            serde_json::json!({ "status": "error", "detail": "missing text" });
-                        writer.write_all(format!("{err}\n").as_bytes()).await?;
-                        continue;
-                    }
-                };
-
-                let orig_msg = {
-                    let conn = db.lock().unwrap();
-                    storage::get_message(&conn, msg_id)?
-                };
-
-                match orig_msg {
-                    Some(orig) => {
-                        let new_message_id = ulid::Ulid::new().to_string();
-                        let push_res: Result<(), AppError> = if let Some(ret_host) =
-                            orig.return_host.as_deref().filter(|h| !h.is_empty())
-                        {
-                            if let Some(ref fs) = fed_state {
-                                let replier_name = if leaf_mode {
-                                    leaf_principal
-                                        .as_deref()
-                                        .unwrap_or(&session_id)
-                                        .strip_prefix("svc:")
-                                        .unwrap_or(&session_id)
-                                } else {
-                                    &name
-                                };
-                                let replier = crate::fed::FedReplier {
-                                    harness: "svc".to_string(),
-                                    session_id: format!("svc:{replier_name}"),
-                                    name: replier_name.to_string(),
-                                };
-                                let reply_envelope = crate::fed::FedReplyEnvelope {
-                                    v: 1,
-                                    id: new_message_id.clone(),
-                                    in_reply_to: msg_id.to_string(),
-                                    replier,
-                                    text: text.to_string(),
-                                    created_at: storage::now_epoch_secs(),
-                                };
-                                crate::fed::send_federated_reply(fs, ret_host, &reply_envelope)
-                                    .await
-                                    .map(|_| ())
-                            } else {
-                                Err(AppError::Internal("federation not configured".to_string()))
-                            }
-                        } else {
-                            Ok(())
-                        };
-
-                        let outcome = match push_res {
-                            Ok(()) => "pushed",
-                            Err(e) => {
-                                tracing::warn!("failed to send federated reply: {e}");
-                                "push_failed"
-                            }
-                        };
-
-                        {
-                            let conn = db.lock().unwrap();
-                            let _ = storage::insert_reply(
-                                &conn,
-                                msg_id,
-                                &session_id,
-                                text,
-                                Some(outcome),
-                                Some(&new_message_id),
-                            );
-                            let _ = storage::purge_replies(&conn, reply_ttl.as_secs());
-                        }
-
-                        let resp = serde_json::json!({
-                            "status": "ok",
-                            "messageId": new_message_id,
-                        });
-                        writer.write_all(format!("{resp}\n").as_bytes()).await?;
-                    }
-                    None => {
-                        let err = serde_json::json!({ "status": "error", "detail": format!("message '{msg_id}' not found") });
-                        writer.write_all(format!("{err}\n").as_bytes()).await?;
-                    }
-                }
-            }
-            _ => {
-                let err = serde_json::json!({ "status": "error", "detail": format!("unknown action: {action}") });
-                writer.write_all(format!("{err}\n").as_bytes()).await?;
+                writer.write_all(format!("{resp}\n").as_bytes()).await?;
             }
         }
     }
@@ -577,14 +447,9 @@ pub async fn handle_svc_connection<
 #[allow(clippy::too_many_arguments)]
 pub async fn run_leaf_register_server(
     sock_path: PathBuf,
-    proc_root: PathBuf,
-    store: SvcStore,
+    state: Arc<crate::http::AppState>,
     my_uid: u32,
-    db: Arc<Mutex<rusqlite::Connection>>,
-    svc_notify_tx: broadcast::Sender<String>,
-    reply_ttl: Duration,
     leaf_principal: String,
-    fed_state: Option<Arc<crate::fed::FedState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(parent) = sock_path.parent() {
         crate::agent::ensure_secure_socket_dir(parent, my_uid)?;
@@ -619,12 +484,8 @@ pub async fn run_leaf_register_server(
         let peer_uid = ucred.uid();
         let peer_pid = ucred.pid().unwrap_or(0) as u32;
 
-        let proc_root_clone = proc_root.clone();
-        let store_clone = store.clone();
-        let db_clone = db.clone();
-        let svc_notify_tx_clone = svc_notify_tx.clone();
+        let state_clone = state.clone();
         let leaf_principal_clone = leaf_principal.clone();
-        let fed_state_clone = fed_state.clone();
 
         tokio::spawn(async move {
             let (reader, writer) = stream.into_split();
@@ -659,19 +520,14 @@ pub async fn run_leaf_register_server(
             if let Err(e) = handle_svc_connection(
                 buf_reader,
                 writer,
-                proc_root_clone,
-                store_clone,
+                state_clone,
                 &empty_map,
                 my_uid,
                 peer_uid,
                 peer_pid,
                 req,
-                db_clone,
-                svc_notify_tx_clone,
-                reply_ttl,
                 true,
                 Some(leaf_principal_clone),
-                fed_state_clone,
             )
             .await
             {
@@ -697,36 +553,23 @@ pub async fn run_leaf_inbox_task(
             Ok(Some(msg)) => {
                 backoff_millis = 100;
 
-                let target_session_id = if let Some(ref to) = msg.to {
-                    if to.starts_with("svc:") {
-                        to.clone()
-                    } else {
-                        format!("svc:{to}")
-                    }
-                } else {
-                    leaf_principal.clone()
-                };
-
-                let ret_host = match &msg.origin {
-                    storage::SvcOrigin::Fed { host, .. } => host.clone(),
-                    _ => peer_name.clone(),
-                };
+                let leaf_name = crate::surface::leaf_service_name(&leaf_principal);
+                let target_session_id = msg.to.clone().unwrap_or_else(|| leaf_name.to_string());
+                // Replies go back to the hub this message came from (A-2).
+                let ret_host = peer_name.clone();
 
                 // F1 (liveness): If target is not the leaf principal, do not enqueue it locally.
                 // Ack at the hub and reply not_found to the sender.
-                if target_session_id != leaf_principal {
+                if target_session_id != leaf_name {
                     tracing::warn!(
                         "message {} target '{target_session_id}' does not match leaf principal '{leaf_principal}'; rejecting and acking at hub",
                         msg.id
                     );
 
-                    let replier_name = leaf_principal
-                        .strip_prefix("svc:")
-                        .unwrap_or(&leaf_principal);
                     let replier = crate::fed::FedReplier {
                         harness: "svc".to_string(),
-                        session_id: format!("svc:{replier_name}"),
-                        name: replier_name.to_string(),
+                        session_id: leaf_name.to_string(),
+                        name: leaf_name.to_string(),
                     };
 
                     let reply_text = serde_json::json!({
@@ -767,15 +610,14 @@ pub async fn run_leaf_inbox_task(
                     continue;
                 }
 
-                let from_name = match &msg.origin {
-                    storage::SvcOrigin::Fed { host, principal } => {
-                        let host = fed_state.peers.display_name(host);
-                        match principal {
-                            Some(p) => format!("xmsg@{host} · {p}"),
-                            None => format!("xmsg@{host}"),
-                        }
-                    }
-                    _ => format!("xmsg@{peer_name}"),
+                // A12: one render, from the origin the hub attests.
+                let from_name = msg
+                    .origin
+                    .render(fed_state.peers.display_name(&msg.origin.node));
+                // A sender with an inbox gets its reply pushed back through the hub.
+                let (return_harness, return_session_id) = match msg.origin.key() {
+                    Some(key) => (Some("fed".to_string()), Some(key.to_string())),
+                    None => (None, None),
                 };
 
                 let envelope = format!(
@@ -791,9 +633,8 @@ pub async fn run_leaf_inbox_task(
                     bytes: msg.body.len(),
                     outcome: "delivered".to_string(),
                     recipient_harness: "svc".to_string(),
-                    return_harness: None,
-                    return_session_id: None,
-                    push_replies: true,
+                    return_harness,
+                    return_session_id,
                     thread_id: msg.id.clone(),
                     return_host: Some(ret_host),
                 };
@@ -808,6 +649,7 @@ pub async fn run_leaf_inbox_task(
                     envelope,
                     delivered_at: None,
                     origin: msg.origin.clone(),
+                    in_reply_to: None,
                 };
 
                 // F2 (no silent loss or spin): propagate storage errors, do not ack hub, back off and repoll

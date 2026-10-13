@@ -218,12 +218,12 @@ async fn test_oracle_1_lock_held_unregistered_send_queues_and_flushes_once() {
     .await;
 
     let client = reqwest::Client::new();
-    let send_url = format!("{}/v1/sessions/{conv_id}/messages", server.base_url);
+    let send_url = format!("{}/v1/messages", server.base_url);
 
     // 1. Send to unregistered session by conversation id => 202 Accepted, outcome: queued
     let resp = client
         .post(&send_url)
-        .json(&serde_json::json!({
+        .json(&serde_json::json!({"to": conv_id,
             "from": "claude-orch",
             "text": "first queued message for oracle 1"
         }))
@@ -238,7 +238,7 @@ async fn test_oracle_1_lock_held_unregistered_send_queues_and_flushes_once() {
     );
     let resp_body: Value = resp.json().await.unwrap();
     assert_eq!(resp_body["outcome"], "queued");
-    assert_eq!(resp_body["sessionId"], conv_id);
+    assert_eq!(resp_body["address"], format!("{conv_id}@test-host"));
 
     // Verify nothing delivered to fake agy yet
     assert!(
@@ -380,12 +380,14 @@ async fn test_oracle_2_old_agy_key_with_matching_starttime_queues_recycled_fails
 
     let client = reqwest::Client::new();
 
-    // 2A. Matching key `agy:7002:200` => 202 Accepted, queued under conv-x20-oracle2
-    let matching_key = format!("agy:{holder_pid}:{actual_starttime}");
-    let matching_url = format!("{}/v1/sessions/{matching_key}/messages", server.base_url);
+    // 2A. The conversation ID => 202 Accepted, queued under conv-x20-oracle2. The old
+    // `agy:<pid>:<start>` key is no ref any more (XA3: kind prefixes and pid refs leave
+    // the grammar); 2B and 2C show both its forms are names nothing carries.
+    let matching_key = conv_id.to_string();
+    let matching_url = format!("{}/v1/messages", server.base_url);
     let resp = client
         .post(&matching_url)
-        .json(&serde_json::json!({
+        .json(&serde_json::json!({"to": matching_key,
             "from": "claude-orch",
             "text": "matching key payload"
         }))
@@ -396,7 +398,19 @@ async fn test_oracle_2_old_agy_key_with_matching_starttime_queues_recycled_fails
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let resp_body: Value = resp.json().await.unwrap();
     assert_eq!(resp_body["outcome"], "queued");
-    assert_eq!(resp_body["sessionId"], conv_id);
+    assert_eq!(resp_body["address"], format!("{conv_id}@test-host"));
+    let old_key = format!("agy:{holder_pid}:{actual_starttime}");
+    let resp_old = client
+        .post(&matching_url)
+        .json(&serde_json::json!({ "to": old_key, "from": "claude-orch", "text": "old key" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_old.status(),
+        StatusCode::NOT_FOUND,
+        "the old agy key is not a ref"
+    );
 
     // Verify stored under conversation id
     {
@@ -408,10 +422,10 @@ async fn test_oracle_2_old_agy_key_with_matching_starttime_queues_recycled_fails
 
     // 2B. Recycled PID with different starttime `agy:7002:999` => 404 Not Found
     let recycled_key = format!("agy:{holder_pid}:999");
-    let recycled_url = format!("{}/v1/sessions/{recycled_key}/messages", server.base_url);
+    let recycled_url = format!("{}/v1/messages", server.base_url);
     let resp_recycled = client
         .post(&recycled_url)
-        .json(&serde_json::json!({
+        .json(&serde_json::json!({"to": recycled_key,
             "from": "claude-orch",
             "text": "recycled pid payload"
         }))
@@ -435,10 +449,10 @@ async fn test_oracle_2_old_agy_key_with_matching_starttime_queues_recycled_fails
     }
 
     // 2C. Non-matching PID `agy:9999:200` => 404 Not Found
-    let nonmatching_url = format!("{}/v1/sessions/agy:9999:200/messages", server.base_url);
+    let nonmatching_url = format!("{}/v1/messages", server.base_url);
     let resp_nonmatching = client
         .post(&nonmatching_url)
-        .json(&serde_json::json!({
+        .json(&serde_json::json!({"to": "agy:9999:200",
             "from": "claude-orch",
             "text": "nonmatching pid payload"
         }))
@@ -486,10 +500,10 @@ async fn test_oracle_3_lock_not_held_returns_not_found_nothing_stored() {
     let client = reqwest::Client::new();
 
     // 3A. Send to conversation id without lock held => 404 Not Found
-    let url_conv = format!("{}/v1/sessions/{conv_id}/messages", server.base_url);
+    let url_conv = format!("{}/v1/messages", server.base_url);
     let resp_conv = client
         .post(&url_conv)
-        .json(&serde_json::json!({
+        .json(&serde_json::json!({"to": conv_id,
             "from": "claude-orch",
             "text": "unheld lock payload"
         }))
@@ -504,10 +518,10 @@ async fn test_oracle_3_lock_not_held_returns_not_found_nothing_stored() {
     );
 
     // 3B. Send with agy: prefix => 404 Not Found
-    let url_agy_conv = format!("{}/v1/sessions/agy:{conv_id}/messages", server.base_url);
+    let url_agy_conv = format!("{}/v1/messages", server.base_url);
     let resp_agy_conv = client
         .post(&url_agy_conv)
-        .json(&serde_json::json!({
+        .json(&serde_json::json!({"to": format!("agy:{conv_id}"),
             "from": "claude-orch",
             "text": "unheld lock payload with prefix"
         }))
@@ -722,7 +736,7 @@ async fn send_via_agent_sock(agent_sock: &Path, target_ref: &str, text: &str) ->
 
     let send_req = serde_json::json!({
         "action": "send",
-        "ref": target_ref,
+        "to": target_ref,
         "text": text,
     });
     writer
@@ -819,8 +833,8 @@ async fn test_oracle_4_federated_send_queues_unregistered_and_checks_starttime()
     )
     .await;
 
-    // 4A. Federated send to `agy:7004:400@host-b` => accepted and queued on node B
-    let target_valid = format!("agy:{holder_pid}:{actual_starttime}@host-b");
+    // 4A. Federated send to `<conv>@host-b` => accepted and queued on node B
+    let target_valid = format!("{conv_id}@host-b");
     let resp1 = send_via_agent_sock(&node_a.agent_sock, &target_valid, "fed payload 1").await;
 
     assert_eq!(
@@ -829,10 +843,7 @@ async fn test_oracle_4_federated_send_queues_unregistered_and_checks_starttime()
         "send to valid unregistered agy target over federation must succeed: {resp1:?}"
     );
     assert_eq!(
-        resp1
-            .get("delivery")
-            .and_then(|d| d.get("outcome"))
-            .and_then(|o| o.as_str()),
+        resp1.get("outcome").and_then(|o| o.as_str()),
         Some("queued")
     );
 
@@ -848,7 +859,7 @@ async fn test_oracle_4_federated_send_queues_unregistered_and_checks_starttime()
         );
     }
 
-    // 4B. Federated send to recycled PID `agy:7004:999@host-b` => refused (not_found)
+    // 4B. Federated send to the old key form `agy:7004:999@host-b` => refused (not_found)
     let target_recycled = format!("agy:{holder_pid}:999@host-b");
     let resp2 = send_via_agent_sock(&node_a.agent_sock, &target_recycled, "fed payload 2").await;
 

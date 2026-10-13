@@ -75,7 +75,7 @@ flowchart TD
   subgraph Bridge["xmsg Bridge Daemon (127.0.0.1)"]
     Registry["Session Registry & Liveness"]
     Store[("SQLite Store<br/>messages, replies")]
-    HTTP["HTTP API<br/>(/healthz, /v1/sessions, /v1/messages)"]
+    HTTP["HTTP API<br/>(/healthz, /v1/recipients, /v1/messages)"]
   end
 
   Claude -->|direct socket injection| HTTP
@@ -96,32 +96,36 @@ Serves the HTTP API directly over a local Unix domain socket. Peer credentials (
 
 ### 2.2 `agent.sock`
 
-Used by active agent sessions and MCP tool instances:
+Used by agent sessions, MCP tool instances and registered services. One JSON frame per line; each mirrors an MCP tool field for field, with `idempotency_key` added on `send` (AM-4). **Every frame refuses a field it does not know** with `bad_request` naming every unknown field (an old client's `{"action":"send","ref":…,"push_replies":…}` is refused naming `ref` and `push_replies`).
 
-- **`send` action:** Formats an attested sender badge `xmsg@<host> · <harness>:<name>`, enforces payload limits (`max_body`), derives kernel-attested return address (`return_harness`, `return_session_id`), and delivers directly to the recipient session. Supports optional `"push_replies": bool` (defaults to `true`). Callers cannot supply or spoof return addresses.
-- **`reply` action:** Validates caller identity via ancestor walk, verifies recipient authorization against SQLite records, and records the reply. If the original message has an attested return address and `push_replies` is enabled, pushes the reply directly into the original sender's adapter (Claude channel socket, Antigravity `agentapi`, or Pi queue) with conversational threading (`thread_id`), returning `push_outcome` (`pushed`, `sender_gone`, `push_failed`, or `disabled`).
+| frame                                                | answer                                             |
+| ---------------------------------------------------- | -------------------------------------------------- |
+| `{"action":"list","name"?,"node"?,"kind"?}`          | `{"status":"ok","recipients":[…]}` (§4)            |
+| `{"action":"send","to","text","idempotency_key"?}`   | `{"status":"ok","message_id","address","outcome"}` |
+| `{"action":"reply","message_id","text"}`             | `{"status":"ok","reply":{…}}`                      |
+| `{"action":"replies","message_id","wait"?,"after"?}` | `{"status":"ok","replies":[…]}`                    |
+
+`send` and `reply` are attributed to the caller by its process ancestry (`SO_PEERCRED`): a Claude, agy or pi session, or a registered service (a service sends over `agent.sock`, attributed by its pid; plan §6 D15). The sender's label is A12's one render, `label · id@node` for an instance and `name@node` for a service; callers cannot supply a sender or a return address. Errors are `{"status":"error","error","detail"}` with the codes of §4.
 
 ### 2.3 `register.sock`
 
-Used by non-Claude harnesses for registration and polling:
+Used by non-Claude harnesses for registration and polling, and by services:
 
 - **Antigravity Registration:** `xmsg register agy` sends session credentials (`conversation_id`, `ls_address`, `csrf_token`) over this socket to enable outbound HTTP message injection into Antigravity.
-- **Pi Registration & Polling:** The Pi extension registers its process and enters an event-driven long-poll loop to receive inbound messages.
+- **Pi Registration & Polling:** The Pi extension registers its process and enters an event-driven long-poll loop to receive inbound messages (`poll`, `ack`).
+- **Services:** a registration's `ok` frame is `{"status":"ok","address":"<name>@<node>","node":"<node>"}`. A service then uses `poll`, `ack` and `reply` here; it runs `list`, `send` and `replies` over `agent.sock`. `register.sock` carries registration, `poll`, `ack` and `reply` only, and its frames refuse unknown fields too.
 
-### 2.4 Return Address & Reply Push Delivery (Unit U8)
+### 2.4 Replies: stored always, pushed by sender kind (A10)
 
-- **Strictly Derived Return Address:** The server derives `return_harness = caller.harness` and `return_session_id = caller.session_id` directly from kernel process attestation. Any caller-supplied address fields are strictly rejected. Anonymous HTTP sends have `return_harness = None` and `push_replies = false`.
-- **Push Opt-Out:** Senders can pass `"push_replies": false` to opt out of asynchronous push delivery. Replies to opt-out messages record `push_outcome = "disabled"` without attempting delivery.
-- **Envelope Header & Threading:** Pushed replies are inserted as full first-class messages with a new ULID `id`, reciprocal return address, and `thread_id` pointing to the originating message. The delivered envelope begins with:
+- **Every reply is stored**, and read with `replies` (MCP, `agent.sock`, or `GET /v1/messages/{id}/replies`) by anyone holding the message ID.
+- **It is also pushed when the original sender has an inbox:** a Claude, agy or pi session, or a registered service (whose push lands in the inbox it long-polls, with `inReplyTo` naming the message answered). An anonymous HTTP caller has no inbox and reads with `replies`. There is no per-message opt-out; `push_replies` is gone from every frame, the storage and the node-to-node envelope.
+- **Strictly Derived Return Address:** the server derives the return address from the attested caller; anything the caller supplies is refused.
+- **Envelope Header & Threading:** a pushed reply is a first-class message with a new ULID, a return address and a `thread_id` pointing at the original. Its envelope begins:
   ```text
   [xmsg] reply to message_id=<orig_id> — message_id=<new_id>; reply with the xmsg reply tool
   ```
-  This enables persistent bidirectional conversational threading across disparate harnesses.
-- **Push Outcomes:** Recorded in the `replies` table:
-  - `pushed`: Successfully delivered to recipient adapter.
-  - `sender_gone`: Original sender socket or process no longer exists.
-  - `push_failed`: Transient error or adapter connection failure.
-  - `disabled`: Original sender opted out with `push_replies = false`.
+- **Push Outcomes**, recorded with the reply: `pushed`, `sender_gone`, `push_failed`, or `stored` (the origin is a leaf that pulls its replies). A reply to a sender with no inbox records none.
+- A reply to a message from another node always travels back to that node, which decides how it reaches the sender (A-2).
 
 ---
 
@@ -142,11 +146,12 @@ Used by non-Claude harnesses for registration and polling:
 }
 ```
 
-Exposes three tools by default (all execute autonomously without user interaction prompts):
+Exposes four tools (A13; all execute autonomously without user interaction prompts):
 
-- **`list`:** Enumerate active agent sessions across all harnesses.
-- **`send(ref, text, [push_replies])`:** Send a message to a session ref (derives attested caller identity and return address; callers cannot override the sender).
-- **`reply(message_id, text)`:** Reply to a received message by its `message_id` (enforces recipient authorization and pushes to the original sender if return address exists).
+- **`list(name?, node?, kind?)`:** the recipients the caller may see: each entry's address (`id@node` for an instance, `name@node` for a service), kind (`service` or `instance`), label and status. `node` lists a federated peer.
+- **`send(to, text)`:** `to` is an instance ID (a UUID, optionally `~n`), a service name or an instance label, optionally followed by `@node` (one `@` at most). Returns the message ID, the resolved address and the outcome; follow-ups to the address cannot drift to another instance. The caller's identity is derived; a `from` argument is refused. MCP carries no `idempotency_key`: agents do not retry a send by accident, and programs that retry use HTTP or `agent.sock`.
+- **`reply(message_id, text)`:** reply to a message the caller received.
+- **`replies(message_id, wait?)`:** the stored replies to a message the caller sent, waiting up to `wait` seconds (at most 60) for the first.
 
 #### Reply-Only Mode (`--reply-only`)
 
@@ -163,7 +168,7 @@ For restricted subagent or responder-only sessions where the model should only b
 }
 ```
 
-In reply-only mode, `tools/list` returns exclusively `[reply]`. The `list` and `send` tools are omitted from the catalog and any direct JSON-RPC calls to them fail closed with an error.
+In reply-only mode, `tools/list` returns `[reply, replies]`. The `list` and `send` tools are omitted from the catalog and any direct JSON-RPC calls to them fail closed with an error.
 
 ### 3.2 Pi Coding Agent Extension: `extensions/pi/`
 
@@ -313,7 +318,7 @@ The server responds with the registered canonical session ID:
 }
 ```
 
-Registered services appear in `list` / `/v1/sessions` as bare `<name>` (with kind `"daemon"` and status `"idle"`) and are addressable as `<name>` (or legacy `svc:<name>`).
+Registered services appear in `list` / `/v1/recipients` as `<name>@<node>` with kind `service`, and are addressable by the bare `<name>` (A11; the `svc:` prefix is gone).
 
 #### Long-Poll & Explicit Acknowledgment Semantics
 
@@ -375,8 +380,8 @@ The HTTP API is bound by default to the local Unix domain socket `$XDG_RUNTIME_D
 # Health check
 curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/xmsg/http.sock" http://localhost/healthz
 
-# List active sessions
-curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/xmsg/http.sock" http://localhost/v1/sessions
+# List the recipients you can message
+curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/xmsg/http.sock" http://localhost/v1/recipients
 ```
 
 ### Migration Note (`matrix-xmsg`, `xmsg-pi`, and External Clients)
@@ -384,61 +389,60 @@ curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/xmsg/http.sock" http:
 - **Default Socket Shift:** `xmsg serve` no longer binds loopback TCP port `7787` by default. Local clients and background daemons (such as `matrix-xmsg` and `xmsg-pi`) connect via Unix domain socket (`http.sock`). TCP (`--listen`) is now only for clients that explicitly configure `XMSG_URL` or run in container/pod environments with isolated namespaces.
 - **Container / Pod Deployments:** In Kubernetes pods or containerized setups where clients and `xmsg` share an isolated pod network namespace and use TCP via `XMSG_URL`, start `xmsg` with `--listen 127.0.0.1:7787` (or `XMSG_LISTEN="127.0.0.1:7787"`) to bind the loopback TCP port.
 
-### How a target resolves
+### Addresses and how a `to` resolves
 
-One order, for every surface that takes a target (`/v1/sessions/{ref}/messages`, the `agent.sock` `send` frame, the MCP `send` tool, and a federated send arriving at this node):
+An address is `<id or name>[@<node>]`, with at most one `@` (A9). A UUID, optionally followed by `~n`, is an instance; anything else is a name (A11). There are no kind prefixes (`svc:`, `claude:`, …) and no pid refs. A `to` with more than one `@` is refused `bad_request`: the route is the server's, and the explicit hop `x@dest@hub` is not in the grammar (A3, B4). `@node` names this node or a peer.
 
-1. **An instance ID.** A Claude conversation's `X~n` or bare `X` (or its pid), then an agy or pi session's ID. A bare `X` while the plain ID is free and only `X~n` forks are live is `ambiguous`, listing each fork as `X~n@<node>`; it is never taken as not running.
+One order, for every surface that takes a target (`POST /v1/messages`, the `agent.sock` `send` frame, the MCP `send` tool, and a federated send arriving at this node):
+
+1. **An instance ID.** A Claude conversation's `X~n` or bare `X`, then an agy or pi session's ID. A bare `X` while the plain ID is free and only `X~n` forks are live is `ambiguous`, listing each fork as `X~n@<node>`; it is never taken as not running.
 2. **A name, among services first.** If a registered service has the name, the send goes to it, whatever any instance is labelled. A session labelled `genie-guard` can never shadow or block the service `genie-guard`; it is reachable only by its ID.
 3. **Instance labels, only when unique.** Only when no service has the name are instance labels (a Claude or pi session's name) considered, and the send resolves only when exactly one live instance carries the label. Two or more give `409 ambiguous`, whose detail lists each candidate as `id@<node>`. Nothing is guessed.
-4. Otherwise `410 gone` (the ID was live here before), or `404 not_found`.
+4. Otherwise `410 gone` (the ID was live here before), or `404 not_found`. Until XA4, a send to an instance that is not running is `not_found`.
 
-### Health & Sessions
+### Errors
+
+One vocabulary on every surface, as `{"error": <code>, "detail": …}` (HTTP) or `{"status":"error","error","detail"}` (sockets):
+
+- addressing: `not_found` (404; an unknown node too), `ambiguous` (409, with the candidates), `denied` (403: a peer's rights refuse it, a reply by a non-recipient or an anonymous caller, a forward the hub refuses), `gone` (410);
+- transport: `bad_request` (400, naming any unknown field), `bad_sender` (400), `payload_too_large` (413), `rate_limited` (429), `service_unavailable` (503), and the inbox and peer transport errors.
+
+### Routes
 
 - `GET /healthz`: Server health check.
-- `GET /v1/sessions`: List active sessions (supports `?cwd=`, `?status=busy|idle`).
-- `GET /v1/sessions/{ref}`: Get single session details by ID, PID, or name.
-
-### Messaging
-
-- `POST /v1/sessions/{ref}/messages`: Inject a message into a session inbox. Accepts optional `"push_replies": bool` (defaults to `true`; set `false` to opt out of asynchronous reply pushes, allowing replies to be read by long-poll instead).
+- `GET /v1/recipients?name=&node=&kind=`: the recipients the caller may see: `[{"address","kind","label"?,"status","node"}]`. `address` is `id@node` for an instance and `name@node` for a service; `kind` is `service` or `instance`; `label` is an instance's own description (none for a service, and none for a label containing `@` or `·`); `status` is `live`. `name` matches a label or a service name, `kind` filters by kind, and `node` lists a federated peer (by canonical name or local nickname) instead of this node.
+- `POST /v1/messages`: send.
   ```json
   {
-    "from": "alice-orchestrator",
+    "to": "genie-guard",
     "text": "Hello, please review unit tests.",
-    "idempotency_key": "optional-key-1-to-128-chars",
-    "push_replies": true
+    "from": "alice-orchestrator",
+    "idempotency_key": "optional-key-1-to-128-chars"
   }
   ```
-  Returns `202 Accepted` with ULID `messageId`:
+  `from` is an anonymous caller's own description, shown as `<from> · anon@<node>`. Returns `202 Accepted`:
   ```json
-  {
-    "sessionId": "live-session-1234",
-    "fromName": "alice-orchestrator · anon@sini.cortex",
-    "bytes": 35,
-    "messageId": "01J9XYZ..."
-  }
+  { "message_id": "01J9XYZ...", "address": "genie-guard@sini.cortex", "outcome": "delivered" }
   ```
+  `address` is the resolved address; send follow-ups to it, so they cannot drift to another instance. `outcome` is `delivered` or `queued`.
+- `POST /v1/messages/{id}/replies` `{"text"}`: reply to a message the caller received. An anonymous HTTP caller has received nothing and is `denied` (A15); in leaf mode the caller is the leaf principal.
+- `GET /v1/messages/{id}/replies?after={seq}&wait={seconds}`: the stored replies to a message, waiting up to `wait` seconds (capped at 60; at most 128 concurrent waiters) for the first. Anyone holding the message ID may read them.
+- `GET /v1/messages/{id}`: a message's record and its replies (kept; not part of A13's surface).
 
-#### Idempotency Key Scoping & Anonymous HTTP Limitation
+`/v1/sessions`, `/v1/sessions/{ref}`, `/v1/sessions/{ref}/messages` and `?peer=` are removed with no alias (A1). Every request body refuses unknown fields.
 
-- **Semantics**: Providing `idempotency_key` ensures at-most-once delivery across network retries. Re-sending with the identical body returns the existing `messageId` and delivery metadata with zero duplicate side effects. Re-sending the same key with an altered body returns `409 Conflict`.
-- **Attested vs Anonymous Scoping**:
-  - Attested senders connecting over `agent.sock` (MCP, CLI tools, child agent sessions) are isolated by kernel-attested session ID (`principal = session:<session_id>`). They cannot collide with or be affected by other sessions or external HTTP callers.
-  - Anonymous HTTP senders are partitioned by their declared sender name (`principal = http:<from_name>`).
-- **Limitation**: Because HTTP endpoints do not authenticate callers, anonymous callers self-choose their `from` value. Distinct HTTP clients specifying the identical `from` name share that idempotency namespace (`http:<from_name>`). Callers requiring strong multi-tenant key isolation should communicate through attested agent sockets (`agent.sock`).
+#### Idempotency
 
-### Replies & Long-Polling
-
-- `GET /v1/messages/{id}`: Retrieve message metadata and all thread replies.
-- `GET /v1/messages/{id}/replies?after={seq}&wait={seconds}`: Long-poll for replies (bounded to 60s timeout, max 128 concurrent waiters).
+- **Semantics**: Providing `idempotency_key` (HTTP and `agent.sock`; not MCP) ensures at-most-once delivery across retries. A replay with the identical body returns the first send's result, its `message_id` included, with no second delivery. Re-sending the same key with an altered body returns `409 conflict`. Message-ID deduplication between nodes is separate and unchanged.
+- **Scoping**: keys are scoped to the sender: an attested session by its instance ID (a fork's `~n` included), a service by its name, and an anonymous HTTP caller by `anon:<from>` (A15).
+- **Limitation**: anonymous callers choose their own `from`, so two HTTP clients using the same `from` share a key namespace. Callers that need isolation send over `agent.sock`, attributed by process.
 
 ### Persisted state and the schema version
 
-The database (`--db-path`; default `$XDG_STATE_HOME/xmsg/xmsg.db`, else `~/.local/state/xmsg/xmsg.db`) records its schema version in `PRAGMA user_version`. This schema is version 1. At startup:
+The database (`--db-path`; default `$XDG_STATE_HOME/xmsg/xmsg.db`, else `~/.local/state/xmsg/xmsg.db`) records its schema version in `PRAGMA user_version`. This schema is version 2. At startup:
 
 - a database at version 1 is opened as it is, so queued messages, stored replies and outbound records survive a restart;
-- a database below it (every build up to and including the deployed `ee1b6ca`, none of which recorded a version, reads 0) has its message state dropped (`messages`, `outbound`, `replies`, the `*_pending_messages` queues, `idempotency_keys`, `peer_mailbox`, and `forwarded_messages` where it exists) and is recreated at version 1, in one transaction. The claim table is kept;
+- a database below it (every build up to and including the deployed `ee1b6ca`, none of which recorded a version, reads 0) has its message state dropped (`messages`, `outbound`, `replies`, the `*_pending_messages` queues, `idempotency_keys`, `peer_mailbox`, and `forwarded_messages` where it exists) and is recreated at version 2, in one transaction. The claim table is kept;
 - a database above it is refused, naming both versions.
 
 So the first start after the upgrade from `ee1b6ca` loses messages queued before it, and a reply to a message sent before it fails as unknown. To roll back, copy the database before the upgrade and restore it with the previous binary.
@@ -619,19 +623,19 @@ No CRL (Certificate Revocation List) or OCSP (Online Certificate Status Protocol
   | `targets`    | list[string] (optional) | Permitted local targets: a service name or an instance ID.                                  |
 
   - **Filters (`principals`, `targets`):** an entry is a service name or an instance ID, matched exactly; `principals` also takes `anon:<from>` for an anonymous HTTP sender. The node that resolves the target never matches an instance label, so there `targets = ["genie-guard"]` admits the service `genie-guard` and refuses an instance merely labelled `genie-guard`. A forwarding hub checks the destination's `targets` against the unresolved ref instead (see Hub Forwarding). An entry in the retired kind-qualified form (`svc:`, `session:`, `claude:`, `agy:`, `pi:`, `http:` followed by a name) is refused at load with a message naming the new form; it is never silently ignored.
-  - **Target Filtering (`targets`):** When `targets` is configured, a federated `send` from that peer is refused with HTTP `403 Forbidden` (`op_denied`, "target not allowed for peer") before rate-limiting or queueing unless the resolved local target's service name or instance ID is listed. An empty present list (`"targets": []`) refuses all targets. When `targets` is omitted, every local target is reachable. Replies on the federated reply route are not gated by `targets`.
+  - **Target Filtering (`targets`):** When `targets` is configured, a federated `send` from that peer is refused with HTTP `403 Forbidden` (`denied`, "target not allowed for peer") before rate-limiting or queueing unless the resolved local target's service name or instance ID is listed. An empty present list (`"targets": []`) refuses all targets. When `targets` is omitted, every local target is reachable. Replies on the federated reply route are not gated by `targets`.
     - *Target Resolution & Prefix Stripping (P1):* Federated refs may still carry a harness prefix (`claude:sess-target`, `svc:guard`, `session:sess-id`); `resolve_target_session_fed` strips it before querying the local session stores. This does not bypass policy: the `targets` check runs on the fully resolved target.
 
-- **Federated Session Listing (`GET /fed/v1/sessions` & `GET /v1/sessions?peer=<name>`):**
+- **Federated Session Listing (`GET /fed/v1/sessions` & `GET /v1/recipients?node=<name>`):**
 
-  - **Inbound Route (`GET /fed/v1/sessions`):** Remote peers authenticate over mTLS and must have `"list"` in their configured `allow` list, or requests are refused with HTTP `403 Forbidden` (`op_denied`).
+  - **Inbound Route (`GET /fed/v1/sessions`):** Remote peers authenticate over mTLS and must have `"list"` in their configured `allow` list, or requests are refused with HTTP `403 Forbidden` (`denied`).
   - **Target Filtering:** When the peer has `targets` configured, `xmsg` filters local sessions with the same rule as `send` (`target_matches_allowlist`: service name or instance ID), returning only sessions and service daemons that the peer is permitted to message. When `targets` is omitted, all local sessions are visible.
   - **Minimal Field Set:** To preserve host isolation and privacy, each entry returned on the federated wire route carries only `name`, `sessionId`, `harness`, `kind`, and `status`. Host-internal details (`cwd`, `pid`, timestamps, versions, entrypoints) are stripped.
-  - **Client-Side Query (`GET /v1/sessions?peer=<name>`):** Local clients query remote peer sessions over `http.sock`. `xmsg` looks up `<name>` (a canonical name or a local nickname) in the peers map, calls the remote peer's `/fed/v1/sessions` over the outbound mTLS connector, and returns entries with `ref` set to `<sessionId>@<entry key>` (the exact address format accepted by `send`), where `<entry key>` is the peer's key in the local peers file: a pinned peer queried by its canonical name comes back under its nickname. If `<name>` is unknown, HTTP `404 Not Found` is returned. If the remote peer refuses or is unreachable, the error status is passed through naming the peer.
+  - **Client-Side Query (`GET /v1/recipients?node=<name>`):** Local clients query remote peer sessions over `http.sock`. `xmsg` looks up `<name>` (a canonical name or a local nickname) in the peers map, calls the remote peer's `/fed/v1/sessions` over the outbound mTLS connector, and returns entries with `ref` set to `<sessionId>@<entry key>` (the exact address format accepted by `send`), where `<entry key>` is the peer's key in the local peers file: a pinned peer queried by its canonical name comes back under its nickname. If `<name>` is unknown, HTTP `404 Not Found` is returned. If the remote peer refuses or is unreachable, the error status is passed through naming the peer.
 
-- **No Forwarding by default:** a receiving node delivers only to its own sessions. A `to.ref` that still contains `@` is refused (`no_forward`) unless the sending peer holds the `"forward"` right on this node (Section 7.7, Forwarding through a hub), and a message that already carries a forward mark is never forwarded again.
+- **No Forwarding by default:** a receiving node delivers only to its own sessions. A `to.ref` that still contains `@` is refused (`denied`) unless the sending peer holds the `"forward"` right on this node (Section 7.7, Forwarding through a hub), and a message that already carries a forward mark is never forwarded again.
 
-- **Router Isolation:** Federated TLS listeners only expose `/fed/` routes and strictly isolate local loopback routes (`/healthz`, `/v1/sessions`).
+- **Router Isolation:** Federated TLS listeners only expose `/fed/` routes and strictly isolate local loopback routes (`/healthz`, `/v1/recipients`, `/v1/messages`).
 
 ### 7.4 Dynamic Credential & CA Bundle Reloading
 
@@ -650,7 +654,7 @@ For workloads running inside containers or Kubernetes pods (e.g. `genie-guard` o
 - **Admission Invariant:** Daemons registering on `register.sock` in leaf mode must match the configured `--leaf-principal` (`svc:<name>`) and run under the same UID as `xmsg` (`SO_PEERCRED`). Because containers in a pod do not share a PID namespace, `/proc/<pid>/exe` attestation is omitted; `--svc-exe` is refused at startup when combined with `--leaf` naming both flags.
 - **Hub-Side Durable Mailbox:** When any local or federated sender addresses `<ref>@<leaf-peer>` where `<leaf-peer>` is marked `"leaf": true`, the hub does not push over TCP. Instead, after gating against the peer's `targets` filter, the hub stores the message in a durable `peer_mailbox` (subject to body TTL).
 - **Federated Inbox Routes (`/fed/v1/inbox`):**
-  - `GET /fed/v1/inbox?wait=<s>`: Long-polls the hub (clamped between 0 and 60 seconds), returning at most one pending message with its `id`, `origin`, and `body`. Non-leaf peers receive HTTP `403 Forbidden` (`op_denied`).
+  - `GET /fed/v1/inbox?wait=<s>`: Long-polls the hub (clamped between 0 and 60 seconds), returning at most one pending message with its `id`, `origin`, and `body`. Non-leaf peers receive HTTP `403 Forbidden` (`denied`).
   - `POST /fed/v1/inbox/{id}/ack`: Removes the message from the peer's mailbox upon explicit acknowledgment. Returns HTTP `404 Not Found` if the ID does not exist in that peer's mailbox. Unacknowledged messages remain queued and are returned on the next poll. Mailboxes are strictly isolated per peer.
 - **Strict Acknowledgment Ordering:** A leaf background task long-polls the hub inbox, enqueues inbound messages into the local `svc` inbox, and forwards `POST /fed/v1/inbox/{id}/ack` to the hub **only after** the local service daemon explicitly acknowledges the delivery over `register.sock`. If the daemon terminates before acknowledging, the unacknowledged message is redelivered when the daemon reconnects.
 - **Reply Routing & Attribution:** Svc replies sent over `register.sock` (`action: "reply"`) route back to the originating hub over `/fed/v1/replies`, attributed to the leaf principal.
@@ -695,12 +699,7 @@ An **outbound link** allows a full `xmsg` node to connect to a dialable hub node
 
 In a star or multi-node mesh topology, nodes that cannot directly dial one another (e.g. edge nodes behind NAT or in separate networks) can route messages through an intermediate forwarding node (hub). Forwarding is strictly opt-in and off by default.
 
-- **Explicit Addressing (`ref@dest@hub`):**
-  Clients explicitly route a message through a hub by suffixing the target with the destination peer and the hub peer:
-  ```
-  ref@dest@hub
-  ```
-  The sending node dials `hub` with target `ref@dest`, writing `dest` as its canonical name when the sender has a nickname for it. The hub splits this target, recognizes `dest` (a canonical name or the hub's own nickname for it) as another known peer, and relays the message to `dest` with target `ref`.
+- **The hop is node-to-node only (A3, B4):** a client address has at most one `@`, and a client `to` of the form `x@dest@hub` is refused `bad_request`. The hop survives only between nodes, as a `/fed/v1` envelope whose target is `ref@dest` sent to the hub. The hub splits this target, recognizes `dest` (a canonical name or the hub's own nickname for it) as another known peer, and relays the message to `dest` with target `ref`. No client surface originates a hop in this release; the server's own routing (H6: a direct link wins, otherwise the hub) is what will.
 - **Peer Configuration Fields:**
   Forwarding requires explicit permissions configured on both the hub and the final recipient:
   - **On the Forwarder (`allow = ["forward"]`):** The sending peer's entry in the hub's `peers.json` must include `"forward"` in its `allow` list:
@@ -713,7 +712,7 @@ In a star or multi-node mesh topology, nodes that cannot directly dial one anoth
       }
     }
     ```
-    Without `"forward"`, the hub refuses any send addressed to `ref@dest` with HTTP `403 Forbidden` (`no_forward`).
+    Without `"forward"`, the hub refuses any send addressed to `ref@dest` with HTTP `403 Forbidden` (`denied`).
   - **On the Recipient (`allow = ["relayed"]`):** The recipient node accepts a forwarded message only if its entry for the forwarding node includes `"relayed"` (or `"relay"`) in its `allow` list:
     ```json
     {
@@ -724,9 +723,9 @@ In a star or multi-node mesh topology, nodes that cannot directly dial one anoth
       }
     }
     ```
-    If the forwarding node lacks the `"relayed"` capability, the recipient refuses the send with HTTP `403 Forbidden` (`op_denied`).
+    If the forwarding node lacks the `"relayed"` capability, the recipient refuses the send with HTTP `403 Forbidden` (`denied`).
 - **One-Hop Limit:**
-  Forwarded messages are marked with `forwarded: { origin_peer, origin_principal }`, where `origin_peer` is the origin's canonical node name, never the hub's nickname for it. A node refuses to forward any message that already carries the forward mark (`no_forward`). Multi-hop daisy-chaining is prohibited.
+  Forwarded messages are marked with `forwarded: { origin_peer, origin_principal }`, where `origin_peer` is the origin's canonical node name, never the hub's nickname for it. A node refuses to forward any message that already carries the forward mark (`denied`). Multi-hop daisy-chaining is prohibited.
 - **Origin & Attestation (Trust Model):**
   When a recipient receives a forwarded message, the sender origin displayed to local sessions and services (`label · id@<origin_peer>`, or `name@<origin_peer>` for a service) is the forwarding node's assertion, **not proven end-to-end**. The recipient trusts the hub to attest accurately to who sent the message. (For end-to-end origin signatures, see Section B of `xmsg-hub-design.md`).
 - **Destination Target Filters:**
@@ -736,7 +735,7 @@ In a star or multi-node mesh topology, nodes that cannot directly dial one anoth
   - When the recipient replies, its reply is addressed to the forwarding node (`return_host = hub`).
   - The hub authorizes the reply against the outbound record created during forwarding, looks up the origin peer, and relays the reply back to the origin peer using `send_federated_reply` (if dialable) or stores it in SQLite for long-polling if the origin is a leaf or outbound-linked node.
 - **Default State (Off by Default):**
-  Without `"forward"` configured on the sender's peer entry, a node behaves identically to older releases: cross-host target references containing `@` are rejected with `no_forward`.
+  Without `"forward"` configured on the sender's peer entry, a node behaves identically to older releases: cross-host target references containing `@` are rejected with `denied`.
 
 ---
 

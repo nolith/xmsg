@@ -350,11 +350,12 @@ async fn test_oracle_3_reply_only_mcp() {
 
     assert_eq!(
         tools.len(),
-        1,
-        "With --reply-only, exactly 1 tool must be listed; got: {:?}",
+        2,
+        "With --reply-only, exactly reply and replies must be listed; got: {:?}",
         tools
     );
     assert_eq!(tools[0]["name"], "reply");
+    assert_eq!(tools[1]["name"], "replies");
     assert!(
         !tools.iter().any(|t| t["name"] == "send"),
         "send tool must NOT be exposed in reply-only mode"
@@ -372,7 +373,7 @@ async fn test_oracle_3_reply_only_mcp() {
         "params": {
             "name": "send",
             "arguments": {
-                "ref": "someone",
+                "to": "someone",
                 "text": "hello"
             }
         }
@@ -407,5 +408,5 @@ async fn test_oracle_3_reply_only_mcp() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["list", "send", "reply"]);
+    assert_eq!(names, vec!["list", "send", "reply", "replies"]);
 }
