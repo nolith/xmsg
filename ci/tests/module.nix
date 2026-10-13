@@ -225,10 +225,10 @@ in
         );
         source =
           (builtins.tryEval (
-            builtins.deepSeq
+            builtins.deepSeq (toString
               (hmEval "x86_64-linux" { home.file.".gemini/config/hooks.json".source = ./fixtures/peer.crt; })
-              .home.file.".gemini/config/hooks.json".source.outPath
-              true
+              .home.file.".gemini/config/hooks.json".source
+            ) true
           )).success;
       };
       expected = {
