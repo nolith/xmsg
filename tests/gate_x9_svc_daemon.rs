@@ -134,7 +134,7 @@ async fn setup_harness(service_name: &str) -> SvcTestHarness {
         pi_notify_tx,
         svc_store: svc_store.clone(),
         svc_notify_tx,
-        host_label: "test-host".to_string(),
+        node_name: "test-host".to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db,

@@ -418,7 +418,7 @@ pub async fn run_agent_server(
                                 &state_clone.db,
                                 &state_clone.agy_config.proc_root,
                                 &state_clone.sessions_dirs,
-                                &state_clone.host_label,
+                                &state_clone.node_name,
                             ).await;
                             let resp = serde_json::json!({
                                 "status": "ok",
@@ -433,7 +433,7 @@ pub async fn run_agent_server(
                                 &state_clone.db,
                                 &state_clone.agy_config.proc_root,
                                 &state_clone.sessions_dirs,
-                                &state_clone.host_label,
+                                &state_clone.node_name,
                             )
                             .await
                             .ok()
@@ -483,7 +483,7 @@ pub async fn run_agent_server(
                         &state_clone.db,
                         &state_clone.agy_config.proc_root,
                         &state_clone.sessions_dirs,
-                        &state_clone.host_label,
+                        &state_clone.node_name,
                     ).await;
                     let res = {
                         let db_guard = state_clone.db.lock().ok();
@@ -626,7 +626,7 @@ pub async fn run_agent_server(
                             } else if let Some(ret_host) = msg
                                 .return_host
                                 .as_deref()
-                                .filter(|h| !h.is_empty() && *h != state_clone.host_label)
+                                .filter(|h| !h.is_empty() && *h != state_clone.node_name)
                             {
                                 let new_message_id = ulid::Ulid::new().to_string();
                                 let replier_name =
@@ -681,7 +681,7 @@ pub async fn run_agent_server(
                             } else if let Some(ret_host) = msg
                                 .return_host
                                 .as_deref()
-                                .filter(|h| !h.is_empty() && *h != state_clone.host_label)
+                                .filter(|h| !h.is_empty() && *h != state_clone.node_name)
                             {
                                 let new_message_id = ulid::Ulid::new().to_string();
                                 let replier_name =
@@ -726,7 +726,7 @@ pub async fn run_agent_server(
                                 let replier_name =
                                     caller.name.as_deref().unwrap_or(&caller.session_id);
                                 let replier_badge = inbox::sanitize_attested_from(
-                                    &state_clone.host_label,
+                                    &state_clone.node_name,
                                     &caller.harness,
                                     replier_name,
                                 );
@@ -737,7 +737,7 @@ pub async fn run_agent_server(
                                             &state_clone.db,
                                             &state_clone.agy_config.proc_root,
                                             &state_clone.sessions_dirs,
-                                            &state_clone.host_label,
+                                            &state_clone.node_name,
                                             ret_session_id,
                                         )
                                         .await
@@ -1155,7 +1155,7 @@ pub async fn run_agent_server(
                         // Derive from_name: xmsg@<host> · <harness>:<name> (sanitized and capped to 64)
                         let caller_name = caller.name.as_deref().unwrap_or(&caller.session_id);
                         let from_name = inbox::sanitize_attested_from(
-                            &state_clone.host_label,
+                            &state_clone.node_name,
                             &caller.harness,
                             caller_name,
                         );
@@ -1163,7 +1163,7 @@ pub async fn run_agent_server(
                         // Check if target is cross-host
                         let (local_ref, remote_host) = match crate::fed::split_peer_ref(target_ref)
                         {
-                            Some((r, h)) if h != state_clone.host_label => (r, Some(h)),
+                            Some((r, h)) if h != state_clone.node_name => (r, Some(h)),
                             Some((r, _)) => (r, None),
                             None => (target_ref, None),
                         };
@@ -1182,6 +1182,14 @@ pub async fn run_agent_server(
                                     continue;
                                 }
                             };
+                            // A typed nickname or canonical name, as this node's entry key.
+                            let target_host = fed_state
+                                .peers
+                                .key_for(target_host)
+                                .unwrap_or(target_host)
+                                .to_string();
+                            let target_host = target_host.as_str();
+                            let wire_ref = crate::fed::wire_ref(&fed_state.peers, local_ref);
 
                             let message_id = ulid::Ulid::new().to_string();
                             let principal = crate::fed::FedPrincipal::Session {
@@ -1193,9 +1201,7 @@ pub async fn run_agent_server(
                                 v: 1,
                                 id: message_id.clone(),
                                 principal,
-                                to: crate::fed::FedTarget {
-                                    r#ref: local_ref.to_string(),
-                                },
+                                to: crate::fed::FedTarget { r#ref: wire_ref },
                                 body: text.to_string(),
                                 push_replies,
                                 thread_id: message_id.clone(),
@@ -1243,7 +1249,7 @@ pub async fn run_agent_server(
                                             return_session_id: Some(caller.session_id.clone()),
                                             push_replies,
                                             thread_id: message_id.clone(),
-                                            return_host: Some(state_clone.host_label.clone()),
+                                            return_host: Some(state_clone.node_name.clone()),
                                         };
                                         let _ = storage::insert_message(&db, &msg_record);
                                         if let Some(key) = idempotency_key {

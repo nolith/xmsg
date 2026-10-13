@@ -185,7 +185,7 @@ async fn create_hub_test_node(
     let rate_limiter = Arc::new(RateLimiter::new(60, 20));
 
     let fed_state = Arc::new(FedState {
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         peers: peers_arc,
         cert_der,
         cert_chain_der: Vec::new(),
@@ -222,7 +222,7 @@ async fn create_hub_test_node(
         pi_notify_tx,
         svc_store: svc_store.clone(),
         svc_notify_tx,
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db: db.clone(),
@@ -337,7 +337,7 @@ async fn create_leaf_test_node(
     let rate_limiter = Arc::new(RateLimiter::new(60, 20));
 
     let fed_state = Arc::new(FedState {
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         peers: peers_arc.clone(),
         cert_der,
         cert_chain_der: Vec::new(),
@@ -896,7 +896,7 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
         .unwrap();
 
     let leaf1_fed_state = FedState {
-        host_label: "leaf1".to_string(),
+        node_name: "leaf1".to_string(),
         peers: Arc::new(leaf1_peers),
         cert_der: creds_leaf1.0,
         cert_chain_der: Vec::new(),
@@ -967,7 +967,7 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
         .unwrap();
 
     let nonleaf_fed_state = FedState {
-        host_label: "nonleaf".to_string(),
+        node_name: "nonleaf".to_string(),
         peers: Arc::new(nonleaf_peers),
         cert_der: creds_nonleaf.0,
         cert_chain_der: Vec::new(),
@@ -1017,7 +1017,7 @@ async fn test_oracle_5_targets_filter_on_queue_path() {
             from: None,
             leaf: true,
             principals: Vec::new(),
-            targets: Some(vec!["svc:guard".to_string()]),
+            targets: Some(vec!["guard".to_string()]),
             dial: None,
         }],
         creds_hub.clone(),

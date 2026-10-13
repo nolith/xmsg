@@ -150,7 +150,7 @@ struct NodeFixture {
 }
 
 async fn spawn_hub_node(
-    name: &str,
+    _name: &str,
     cert_pem: &str,
     key_pem: &str,
     client_name: &str,
@@ -199,8 +199,6 @@ async fn spawn_hub_node(
             .env("XDG_RUNTIME_DIR", &run_dir)
             .args([
                 "serve",
-                "--host-label",
-                name,
                 "--listen",
                 "127.0.0.1:0",
                 "--fed-listen",
@@ -285,7 +283,7 @@ async fn spawn_hub_node(
 }
 
 async fn spawn_client_node(
-    name: &str,
+    _name: &str,
     cert_pem: &str,
     key_pem: &str,
     hub_name: &str,
@@ -331,8 +329,6 @@ async fn spawn_client_node(
     cmd.env("XDG_RUNTIME_DIR", &run_dir);
     cmd.args([
         "serve",
-        "--host-label",
-        name,
         "--listen",
         "127.0.0.1:0",
         "--peers-file",
@@ -678,9 +674,11 @@ async fn test_oracle_4_off_by_default_no_pull_loop() {
     let peers_file = tmp.path().join("peers.json");
     let db_path = tmp.path().join("node.db");
 
-    let (cert_pem, key_pem, pin) = generate_self_signed_ed25519_pem("plain-node").unwrap();
+    let (cert_pem, key_pem, _own_pin) = generate_self_signed_ed25519_pem("plain-node").unwrap();
     fs::write(&cert_file, cert_pem).unwrap();
     fs::write(&key_file, key_pem).unwrap();
+    // XA2 (AM-6): a node may not pin its own key, so the peer has a key of its own.
+    let (_, _, pin) = generate_self_signed_ed25519_pem("peer-regular").unwrap();
     let peers_content = serde_json::json!({
         "peer-regular": {
             "address": "127.0.0.1:49999",
@@ -707,8 +705,6 @@ async fn test_oracle_4_off_by_default_no_pull_loop() {
         .env("RUST_LOG", "info")
         .args([
             "serve",
-            "--host-label",
-            "plain-node",
             "--listen",
             "127.0.0.1:0",
             "--peers-file",

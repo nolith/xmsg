@@ -101,7 +101,7 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
         pi_notify_tx: pi_notify_tx.clone(),
         svc_store: xmsg::svc::new_svc_store(),
         svc_notify_tx: tokio::sync::broadcast::channel(16).0,
-        host_label: "test-host".to_string(),
+        node_name: "test-host".to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db: db.clone(),

@@ -7,6 +7,7 @@ pub mod fed;
 pub mod http;
 pub mod inbox;
 pub mod mcp;
+pub mod node;
 pub mod pi;
 pub mod process;
 pub mod registry;

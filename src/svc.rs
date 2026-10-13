@@ -768,10 +768,13 @@ pub async fn run_leaf_inbox_task(
                 }
 
                 let from_name = match &msg.origin {
-                    storage::SvcOrigin::Fed { host, principal } => match principal {
-                        Some(p) => format!("xmsg@{host} · {p}"),
-                        None => format!("xmsg@{host}"),
-                    },
+                    storage::SvcOrigin::Fed { host, principal } => {
+                        let host = fed_state.peers.display_name(host);
+                        match principal {
+                            Some(p) => format!("xmsg@{host} · {p}"),
+                            None => format!("xmsg@{host}"),
+                        }
+                    }
                     _ => format!("xmsg@{peer_name}"),
                 };
 

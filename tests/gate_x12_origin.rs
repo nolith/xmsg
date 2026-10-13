@@ -158,7 +158,7 @@ async fn test_oracle_1_local_attested_session_origin() {
         pi_notify_tx,
         svc_store: svc_store.clone(),
         svc_notify_tx,
-        host_label: "test-host".to_string(),
+        node_name: "test-host".to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db,
@@ -359,7 +359,7 @@ async fn create_fed_test_node(
     let (cert_der, key_der, _pin) = creds;
 
     let fed_state = Arc::new(FedState {
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         peers: peers_arc,
         cert_der,
         cert_chain_der: Vec::new(),
@@ -427,7 +427,7 @@ async fn create_fed_test_node(
         pi_notify_tx,
         svc_store: svc_store.clone(),
         svc_notify_tx,
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db,
@@ -586,10 +586,13 @@ async fn test_oracle_2_federated_message_origin() {
         Some("fed"),
         "origin kind must be 'fed' for federated send"
     );
+    // XA2: the origin is the sender's canonical node name; host-a is a pinned peer, so it
+    // is the key-derived name (the entry key "host-a" is only node_b's nickname for it).
+    let host_a_node = xmsg::node::node_name_from_pin(&creds_a.2).unwrap();
     assert_eq!(
         origin.get("host").and_then(|h| h.as_str()),
-        Some("host-a"),
-        "origin host must match peer host label"
+        Some(host_a_node.as_str()),
+        "origin host must be the sender's canonical node name"
     );
 }
 
@@ -721,10 +724,11 @@ async fn test_oracle_3_text_containing_fake_origin_still_reads_fed() {
         Some("fed"),
         "origin kind must NEVER be parsed from message text; must remain 'fed'"
     );
+    let host_a_node = xmsg::node::node_name_from_pin(&creds_a.2).unwrap();
     assert_eq!(
         origin.get("host").and_then(|h| h.as_str()),
-        Some("host-a"),
-        "origin host must match federated sender peer"
+        Some(host_a_node.as_str()),
+        "origin host must be the federated sender's canonical node name"
     );
     assert_ne!(
         origin.get("kind").and_then(|k| k.as_str()),

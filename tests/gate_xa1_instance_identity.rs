@@ -177,7 +177,7 @@ async fn start_server_with(
         pi_notify_tx,
         svc_store: xmsg::svc::new_svc_store(),
         svc_notify_tx,
-        host_label: "test-node".to_string(),
+        node_name: "test-node".to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db: db.clone(),

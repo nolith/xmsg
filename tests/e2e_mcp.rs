@@ -152,7 +152,7 @@ async fn start_mcp_harness() -> McpHarness {
         pi_notify_tx,
         svc_store: xmsg::svc::new_svc_store(),
         svc_notify_tx: tokio::sync::broadcast::channel(16).0,
-        host_label: "test-host".to_string(),
+        node_name: "test-host".to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db: Arc::new(std::sync::Mutex::new(conn)),

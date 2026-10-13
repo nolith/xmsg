@@ -64,70 +64,72 @@ impl PeerConfig {
     }
 }
 
+/// Filter-entry prefixes from before XA2. An entry starting with one of these and `:` is
+/// refused at load, naming the form that replaced it. The list is enumerated, not a
+/// `<word>:<rest>` shape, so `anon:<from>` stays admitted.
+const RETIRED_FILTER_KINDS: [&str; 6] = ["svc", "session", "claude", "agy", "pi", "http"];
+
+fn check_filter_entry(peer: &str, field: &str, entry: &str) -> Result<(), String> {
+    if entry.is_empty() {
+        return Err(format!("peer '{peer}': empty '{field}' entry"));
+    }
+    if let Some((kind, rest)) = entry.split_once(':') {
+        if RETIRED_FILTER_KINDS.contains(&kind) {
+            return Err(format!(
+                "peer '{peer}': '{field}' entry '{entry}' uses the retired '{kind}:' form; \
+                 filters match a service name or an instance ID itself (e.g. '{rest}'){}",
+                if field == "principals" {
+                    ", or 'anon:<from>'"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The service name or instance ID a filter matches for a resolved target. Instance labels
+/// are never matched.
+fn target_filter_key(target: &crate::http::ResolvedTarget) -> &str {
+    match target {
+        crate::http::ResolvedTarget::Svc(s) => s
+            .name
+            .as_deref()
+            .unwrap_or_else(|| s.session_id.strip_prefix("svc:").unwrap_or(&s.session_id)),
+        crate::http::ResolvedTarget::Claude(s, _)
+        | crate::http::ResolvedTarget::Agy(s)
+        | crate::http::ResolvedTarget::Pi(s) => &s.session_id,
+    }
+}
+
 pub(crate) fn target_matches_allowlist(
     target: &crate::http::ResolvedTarget,
     targets: &[String],
 ) -> bool {
-    if targets.is_empty() {
-        return false;
-    }
-    let badges: Vec<String> = match target {
-        crate::http::ResolvedTarget::Svc(s) => {
-            let mut b = Vec::new();
-            if let Some(ref name) = s.name {
-                b.push(format!("svc:{name}"));
-            }
-            if s.session_id.starts_with("svc:") {
-                b.push(s.session_id.clone());
-            } else {
-                b.push(format!("svc:{}", s.session_id));
-            }
-            b.push(format!("session:{}", s.session_id));
-            b
-        }
-        crate::http::ResolvedTarget::Claude(s, _)
-        | crate::http::ResolvedTarget::Agy(s)
-        | crate::http::ResolvedTarget::Pi(s) => {
-            let mut b = Vec::new();
-            if let Some(ref name) = s.name {
-                b.push(format!("{}:{name}", s.harness));
-            }
-            b.push(format!("session:{}", s.session_id));
-            let harness_prefix = format!("{}:", s.harness);
-            if s.session_id.starts_with(&harness_prefix) {
-                b.push(s.session_id.clone());
-            } else {
-                b.push(format!("{}:{}", s.harness, s.session_id));
-            }
-            b
-        }
-    };
-    targets.iter().any(|t| badges.iter().any(|b| b == t))
+    let key = target_filter_key(target);
+    targets.iter().any(|t| t == key)
 }
 
+/// Before resolution: could `target_ref` name an allowed target? An old-surface kind
+/// prefix on the ref is stripped first.
 pub(crate) fn target_ref_could_match(target_ref: &str, targets: &[String]) -> bool {
-    if targets.is_empty() {
-        return false;
-    }
-    for t in targets {
-        if t == target_ref {
-            return true;
-        }
-        if let Some(name) = t.strip_prefix("svc:") {
-            if target_ref == name || target_ref == t {
-                return true;
-            }
-        } else if let Some(id) = t.strip_prefix("session:") {
-            if target_ref == id || target_ref == t {
-                return true;
-            }
-        } else if let Some((_harness, name)) = t.split_once(':') {
-            if target_ref == name || target_ref == t {
-                return true;
-            }
-        }
-    }
-    false
+    let bare = match target_ref.split_once(':') {
+        Some((kind, rest)) if RETIRED_FILTER_KINDS.contains(&kind) => rest,
+        _ => target_ref,
+    };
+    targets.iter().any(|t| t == bare)
+}
+
+/// Does a `principals` filter admit this sender? It matches the service name, the
+/// instance ID, or `anon:<from>`.
+pub(crate) fn principal_allowed(principal: &FedPrincipal, principals: &[String]) -> bool {
+    let key = match principal {
+        FedPrincipal::Session { session_id, .. } => session_id.clone(),
+        FedPrincipal::Service { name } => name.clone(),
+        FedPrincipal::Anonymous { from } => format!("anon:{from}"),
+    };
+    principals.contains(&key)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +266,55 @@ pub struct PeersMap {
     peers_by_name: HashMap<String, PeerConfig>,
     name_by_pin: HashMap<String, String>,
     ca_bundles_by_name: HashMap<String, Vec<rustls::pki_types::TrustAnchor<'static>>>,
+    /// Entry key -> canonical node name, and back (B5's nickname translation).
+    canonical_by_name: HashMap<String, String>,
+    name_by_canonical: HashMap<String, String>,
+}
+
+/// This node's own identity, for the peers loader's namespace checks.
+#[derive(Debug, Clone)]
+pub struct OwnNode {
+    pub name: String,
+    pub pin: Option<String>,
+}
+
+/// A peer entry's canonical node name: derived from its single CA identity, or from its
+/// pin. A map built in code rather than by the loader may hold entries the rules refuse;
+/// those keep their key as their name.
+fn derive_canonical(peer: &PeerConfig) -> String {
+    let derived = match (&peer.pin, &peer.identities) {
+        (Some(pin), _) => crate::node::node_name_from_pin(pin).ok(),
+        (None, Some(ids)) if ids.len() == 1 => crate::node::node_name_from_uri(&ids[0]).ok(),
+        _ => None,
+    };
+    derived.unwrap_or_else(|| peer.name.clone())
+}
+
+/// Collects a JSON object's members in order, keeping duplicate keys, which
+/// `serde_json::Value` would silently collapse to the last one.
+struct Members(Vec<(String, serde_json::Value)>);
+
+impl<'de> Deserialize<'de> for Members {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Members;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut m: A,
+            ) -> Result<Members, A::Error> {
+                let mut v = Vec::new();
+                while let Some(kv) = m.next_entry()? {
+                    v.push(kv);
+                }
+                Ok(Members(v))
+            }
+        }
+        d.deserialize_map(V)
+    }
 }
 
 impl PeersMap {
@@ -288,6 +339,10 @@ impl PeersMap {
             peer.pin = Some(norm_pin.clone());
             self.name_by_pin.insert(norm_pin, peer.name.clone());
         }
+        let canonical = derive_canonical(&peer);
+        self.name_by_canonical
+            .insert(canonical.clone(), peer.name.clone());
+        self.canonical_by_name.insert(peer.name.clone(), canonical);
         self.peers_by_name.insert(peer.name.clone(), peer);
         Ok(())
     }
@@ -305,13 +360,41 @@ impl PeersMap {
             peer.pin = Some(norm_pin.clone());
             self.name_by_pin.insert(norm_pin, peer.name.clone());
         }
+        let canonical = derive_canonical(&peer);
+        self.name_by_canonical
+            .insert(canonical.clone(), peer.name.clone());
+        self.canonical_by_name.insert(peer.name.clone(), canonical);
         self.ca_bundles_by_name.insert(peer.name.clone(), anchors);
         self.peers_by_name.insert(peer.name.clone(), peer);
         Ok(())
     }
 
+    /// A peer by its entry key, or by its canonical node name.
     pub fn get(&self, name: &str) -> Option<&PeerConfig> {
-        self.peers_by_name.get(name)
+        self.peers_by_name.get(name).or_else(|| {
+            self.name_by_canonical
+                .get(name)
+                .and_then(|k| self.peers_by_name.get(k))
+        })
+    }
+
+    /// The entry key for a typed `@node`: a local nickname, or a canonical name.
+    pub fn key_for(&self, typed: &str) -> Option<&str> {
+        self.get(typed).map(|p| p.name.as_str())
+    }
+
+    /// The canonical node name of the entry keyed `key`; this is what crosses the wire.
+    pub fn canonical_name(&self, key: &str) -> Option<&str> {
+        self.canonical_by_name.get(key).map(String::as_str)
+    }
+
+    /// How this node shows a canonical node name: its local nickname when it has one, the
+    /// canonical name otherwise.
+    pub fn display_name<'a>(&'a self, canonical: &'a str) -> &'a str {
+        self.name_by_canonical
+            .get(canonical)
+            .map(String::as_str)
+            .unwrap_or(canonical)
     }
 
     pub fn get_by_pin(&self, pin: &str) -> Option<&PeerConfig> {
@@ -341,7 +424,7 @@ impl PeersMap {
     }
 
     pub fn contains_name(&self, name: &str) -> bool {
-        self.peers_by_name.contains_key(name)
+        self.get(name).is_some()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -360,6 +443,11 @@ impl PeersMap {
         self.peers_by_name.values()
     }
 
+    /// Every pinned entry's pin -> entry key.
+    pub fn pinned_entries(&self) -> HashMap<String, String> {
+        self.name_by_pin.clone()
+    }
+
     pub fn allowed_pins(&self) -> HashMap<String, String> {
         self.peers_by_name
             .values()
@@ -369,33 +457,43 @@ impl PeersMap {
     }
 
     pub fn load_from_json(json_str: &str) -> Result<Self, String> {
+        Self::load_from_json_for(json_str, None)
+    }
+
+    /// Loads a peers file for the node `own` (when known), applying A9's naming rules:
+    /// a CA entry is keyed by the name its one identity derives (D10); a pinned entry's
+    /// key is a nickname or its key-derived name; every canonical name, this node's own
+    /// included, is distinct (A-8); a nickname is not name-shaped (AM-5); no entry pins
+    /// this node's own key (AM-6).
+    pub fn load_from_json_for(json_str: &str, own: Option<&OwnNode>) -> Result<Self, String> {
         let val: serde_json::Value = serde_json::from_str(json_str)
             .map_err(|e| format!("Failed to parse peers JSON: {e}"))?;
 
-        let entries: Vec<(String, &serde_json::Map<String, serde_json::Value>)> = match &val {
+        type PeerObjects = Vec<(String, serde_json::Map<String, serde_json::Value>)>;
+        let member_objects = |members: Members| -> Result<PeerObjects, String> {
+            members
+                .0
+                .into_iter()
+                .map(|(k, v)| match v {
+                    serde_json::Value::Object(obj) => Ok((k, obj)),
+                    _ => Err(format!("peer entry for '{k}' must be an object")),
+                })
+                .collect()
+        };
+        let owned_entries: PeerObjects = match &val {
             serde_json::Value::Object(map) => {
-                if let Some(peers_val) = map.get("peers") {
-                    let peers_obj = peers_val
-                        .as_object()
-                        .ok_or_else(|| "'peers' field must be an object".to_string())?;
-                    peers_obj
-                        .iter()
-                        .map(|(k, v)| {
-                            let obj = v
-                                .as_object()
-                                .ok_or_else(|| format!("peer entry for '{k}' must be an object"))?;
-                            Ok((k.clone(), obj))
-                        })
-                        .collect::<Result<Vec<_>, String>>()?
+                if map.contains_key("peers") {
+                    #[derive(Deserialize)]
+                    struct Wrapped {
+                        peers: Members,
+                    }
+                    let w: Wrapped = serde_json::from_str(json_str)
+                        .map_err(|_| "'peers' field must be an object".to_string())?;
+                    member_objects(w.peers)?
                 } else {
-                    map.iter()
-                        .map(|(k, v)| {
-                            let obj = v
-                                .as_object()
-                                .ok_or_else(|| format!("peer entry for '{k}' must be an object"))?;
-                            Ok((k.clone(), obj))
-                        })
-                        .collect::<Result<Vec<_>, String>>()?
+                    let m: Members = serde_json::from_str(json_str)
+                        .map_err(|e| format!("Failed to parse peers JSON: {e}"))?;
+                    member_objects(m)?
                 }
             }
             serde_json::Value::Array(list) => list
@@ -408,23 +506,26 @@ impl PeersMap {
                         .get("name")
                         .and_then(|n| n.as_str())
                         .ok_or_else(|| "peer list entry missing 'name' field".to_string())?;
-                    Ok((name.to_string(), obj))
+                    Ok((name.to_string(), obj.clone()))
                 })
                 .collect::<Result<Vec<_>, String>>()?,
             _ => return Err("peers JSON must be an object or an array".to_string()),
         };
+        let entries = owned_entries.iter().map(|(k, o)| (k.clone(), o));
 
-        let mut map = Self::empty();
+        // Each parsed entry, with its canonical node name and what derived it.
+        let mut parsed: Vec<(
+            PeerConfig,
+            Option<Vec<rustls::pki_types::TrustAnchor<'static>>>,
+            String,
+            String,
+        )> = Vec::new();
         for (key_name, obj) in entries {
             let name = obj
                 .get("name")
                 .and_then(|n| n.as_str())
                 .unwrap_or(&key_name)
                 .to_string();
-
-            if map.contains_name(&name) {
-                return Err(format!("duplicate peer name '{name}'"));
-            }
 
             // Oracle 5: A peers file that still carries no_whois is a load error naming the field
             if obj.contains_key("no_whois") {
@@ -511,6 +612,12 @@ impl PeersMap {
                         "peer '{name}': 'identities' must contain at least one identity"
                     ));
                 }
+                if ids_val.len() > 1 {
+                    return Err(format!(
+                        "peer '{name}': a CA entry names exactly one node, so 'identities' holds exactly one identity (found {})",
+                        ids_val.len()
+                    ));
+                }
                 let mut ids = Vec::with_capacity(ids_val.len());
                 for item in ids_val {
                     let s = item.as_str().ok_or_else(|| {
@@ -524,6 +631,11 @@ impl PeersMap {
                     if s.contains('*') && (!s.ends_with("/*") || s[..s.len() - 2].contains('*')) {
                         return Err(format!(
                             "peer '{name}': invalid identity pattern '{s}': wildcards only supported as a single trailing '/*'"
+                        ));
+                    }
+                    if s.contains('*') {
+                        return Err(format!(
+                            "peer '{name}': identity pattern '{s}' names no single node; a CA entry needs one concrete identity"
                         ));
                     }
                     ids.push(s.to_string());
@@ -600,20 +712,10 @@ impl PeersMap {
                     .ok_or_else(|| format!("peer '{name}': 'principals' must be an array"))?;
                 arr.iter()
                     .map(|v| {
-                        let s = v
-                            .as_str()
-                            .ok_or_else(|| format!("peer '{name}': 'principals' elements must be strings"))?;
-                        let valid = s.starts_with("claude:")
-                            || s.starts_with("agy:")
-                            || s.starts_with("pi:")
-                            || s.starts_with("svc:")
-                            || s.starts_with("anon:")
-                            || s.starts_with("session:");
-                        if !valid {
-                            return Err(format!(
-                                "principal filter entry '{s}' must be kind-qualified (e.g. claude:<name>, svc:<name>, anon:<from>, session:<id>)"
-                            ));
-                        }
+                        let s = v.as_str().ok_or_else(|| {
+                            format!("peer '{name}': 'principals' elements must be strings")
+                        })?;
+                        check_filter_entry(&name, "principals", s)?;
                         Ok(s.to_string())
                     })
                     .collect::<Result<Vec<_>, String>>()?
@@ -630,21 +732,46 @@ impl PeersMap {
                     let s = v.as_str().ok_or_else(|| {
                         format!("peer '{name}': 'targets' elements must be strings")
                     })?;
-                    let valid = s.starts_with("claude:")
-                        || s.starts_with("agy:")
-                        || s.starts_with("pi:")
-                        || s.starts_with("svc:")
-                        || s.starts_with("session:");
-                    if !valid {
-                        return Err(format!(
-                            "target filter entry '{s}' must be kind-qualified (e.g. svc:<name>, claude:<name>, session:<id>)"
-                        ));
-                    }
+                    check_filter_entry(&name, "targets", s)?;
                     target_list.push(s.to_string());
                 }
                 Some(target_list)
             } else {
                 None
+            };
+
+            // A9 / B5: the entry's canonical node name, and the key rules (D10, AM-5).
+            let (canonical, source) = if let Some(ref p) = pin {
+                let canonical = crate::node::node_name_from_pin(p)
+                    .map_err(|e| format!("peer '{name}': {e}"))?;
+                if name != canonical {
+                    if name.contains('.') {
+                        return Err(format!(
+                            "peer '{name}': a nickname may not contain '.', which marks a certificate-derived node name"
+                        ));
+                    }
+                    if crate::node::is_key_name_shaped(&name) {
+                        return Err(format!(
+                            "peer '{name}': a nickname may not be {} characters of [a-z2-7], the shape of a key-derived node name",
+                            crate::node::KEY_NAME_LEN
+                        ));
+                    }
+                }
+                (canonical, format!("pin {}", normalize_pin(p)))
+            } else {
+                let uri = identities
+                    .as_ref()
+                    .and_then(|ids| ids.first())
+                    .cloned()
+                    .unwrap_or_default();
+                let canonical = crate::node::node_name_from_uri(&uri)
+                    .map_err(|e| format!("peer '{name}': {e}"))?;
+                if name != canonical {
+                    return Err(format!(
+                        "peer '{name}': a CA entry is keyed by its node name; {uri} is '{canonical}'"
+                    ));
+                }
+                (canonical, uri)
             };
 
             let peer_config = PeerConfig {
@@ -660,6 +787,13 @@ impl PeersMap {
                 targets,
                 dial,
             };
+            parsed.push((peer_config, ca_anchors, canonical, source));
+        }
+
+        check_node_namespace(&parsed, own)?;
+
+        let mut map = Self::empty();
+        for (peer_config, ca_anchors, _, _) in parsed {
             if let Some(anchors) = ca_anchors {
                 map.insert_with_anchors(peer_config, anchors)?;
             } else {
@@ -670,9 +804,13 @@ impl PeersMap {
     }
 
     pub fn load_from_file(path: &Path) -> Result<Self, String> {
+        Self::load_from_file_for(path, None)
+    }
+
+    pub fn load_from_file_for(path: &Path, own: Option<&OwnNode>) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read peers file {}: {e}", path.display()))?;
-        Self::load_from_json(&content)
+        Self::load_from_json_for(&content, own)
     }
 
     pub fn resolve_incoming_peer(
@@ -714,14 +852,12 @@ impl PeersMap {
 
         if let Some(pin_peer) = any_pin_match {
             if !ca_matches.is_empty() {
-                tracing::warn!(
-                    "Presented certificate matches both pinned peer '{}' and CA peer(s); refusing (fail closed)",
-                    pin_peer.name
+                let msg = one_node_two_names(
+                    &pin_peer.name,
+                    ca_matches.iter().map(|(p, _)| p.name.as_str()),
                 );
-                return Err(AppError::PeerRejected(format!(
-                    "client certificate matches both pinned peer '{}' and CA peer(s); refusing (fail closed)",
-                    pin_peer.name
-                )));
+                tracing::warn!("{msg}");
+                return Err(AppError::PeerRejected(msg));
             }
             if pin_peer.allow.is_empty() {
                 return Err(AppError::PeerRejected(format!(
@@ -754,6 +890,58 @@ impl PeersMap {
 
 pub fn load_peers_file(path: &Path) -> Result<PeersMap, String> {
     PeersMap::load_from_file(path)
+}
+
+/// A-8 and AM-6 over a parsed peers file: host, pod and key-derived names share one
+/// namespace with this node's own name, and no entry pins this node's own key.
+#[allow(clippy::type_complexity)]
+fn check_node_namespace(
+    parsed: &[(
+        PeerConfig,
+        Option<Vec<rustls::pki_types::TrustAnchor<'static>>>,
+        String,
+        String,
+    )],
+    own: Option<&OwnNode>,
+) -> Result<(), String> {
+    let mut seen: HashMap<&str, (&str, &str)> = HashMap::new();
+    for (peer, _, canonical, source) in parsed {
+        if let Some(own) = own {
+            if *canonical == own.name {
+                return Err(format!(
+                    "node name '{canonical}' collides: peer '{}' ({source}) has this node's own name",
+                    peer.name
+                ));
+            }
+            if let (Some(pin), Some(own_pin)) = (&peer.pin, &own.pin) {
+                if normalize_pin(pin) == normalize_pin(own_pin) {
+                    return Err(format!(
+                        "peer '{}' pins this node's own key; one node has one canonical name ('{}')",
+                        peer.name, own.name
+                    ));
+                }
+            }
+        }
+        if let Some((other, other_source)) = seen.insert(canonical, (&peer.name, source)) {
+            return Err(format!(
+                "node name '{canonical}' collides: peer '{other}' ({other_source}) and peer '{}' ({source})",
+                peer.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A ref as it goes on the wire: in `<ref>@<node>` (a hop through a hub), a node this
+/// node knows by nickname is written as its canonical name.
+pub fn wire_ref(peers: &PeersMap, r: &str) -> String {
+    match split_peer_ref(r) {
+        Some((target, node)) => match peers.get(node).and_then(|p| peers.canonical_name(&p.name)) {
+            Some(canonical) => format!("{target}@{canonical}"),
+            None => r.to_string(),
+        },
+        None => r.to_string(),
+    }
 }
 
 pub fn split_peer_ref(r: &str) -> Option<(&str, &str)> {
@@ -1088,12 +1276,13 @@ impl rustls::server::danger::ClientCertVerifier for CombinedClientCertVerifier {
             }
         }
 
-        // Silent overlap: refuse if both pin and CA match (including outbound-only pinned peers)
+        // AM-6: a CA-authenticated connection presenting a pinned entry's key is one node
+        // under two names; refuse it (including outbound-only pinned peers).
         if let Some(pin_peer) = any_pin_match {
             if !ca_matches.is_empty() {
                 tracing::warn!(
-                    "Presented certificate matches both pinned peer '{}' and CA peer(s); refusing (fail closed)",
-                    pin_peer.name
+                    "{}",
+                    one_node_two_names(&pin_peer.name, ca_matches.iter().map(|p| p.name.as_str()))
                 );
                 return Err(rustls::Error::InvalidCertificate(
                     rustls::CertificateError::ApplicationVerificationFailure,
@@ -1160,10 +1349,23 @@ impl rustls::server::danger::ClientCertVerifier for CombinedClientCertVerifier {
     }
 }
 
+/// The AM-6 refusal: one key reached both as a pinned entry and as CA entries.
+fn one_node_two_names<'a>(pinned: &str, ca: impl Iterator<Item = &'a str>) -> String {
+    let ca: Vec<String> = ca.map(|n| format!("'{n}'")).collect();
+    format!(
+        "certificate presents the key pinned for peer '{pinned}' and the CA identity of peer {}; \
+         one node has one canonical name, so configure it once; refusing",
+        ca.join(", ")
+    )
+}
+
 #[derive(Debug)]
 pub struct CaServerCertVerifier {
     anchors: Vec<rustls::pki_types::TrustAnchor<'static>>,
     allowed_identities: Vec<String>,
+    /// This CA entry's key, and the peers file's pinned keys (pin -> entry key), for AM-6.
+    peer_name: String,
+    pinned: HashMap<String, String>,
 }
 
 impl CaServerCertVerifier {
@@ -1174,7 +1376,16 @@ impl CaServerCertVerifier {
         Self {
             anchors,
             allowed_identities,
+            peer_name: String::new(),
+            pinned: HashMap::new(),
         }
+    }
+
+    /// Refuse a server whose key is pinned by another entry of the peers file (AM-6).
+    pub fn refusing_pinned(mut self, peer_name: &str, pinned: HashMap<String, String>) -> Self {
+        self.peer_name = peer_name.to_string();
+        self.pinned = pinned;
+        self
     }
 }
 
@@ -1208,6 +1419,15 @@ impl rustls::client::danger::ServerCertVerifier for CaServerCertVerifier {
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
+        }
+
+        let pin = spki_sha256_from_der(end_entity.as_ref()).map_err(|_| {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+        })?;
+        if let Some(pinned) = self.pinned.get(&normalize_pin(&pin)) {
+            let msg = one_node_two_names(pinned, std::iter::once(self.peer_name.as_str()));
+            tracing::warn!("{msg}");
+            return Err(rustls::Error::General(msg));
         }
 
         Ok(rustls::client::danger::ServerCertVerified::assertion())
@@ -1480,7 +1700,7 @@ impl DynamicTls {
 }
 
 pub struct FedState {
-    pub host_label: String,
+    pub node_name: String,
     pub peers: Arc<PeersMap>,
     pub cert_der: Vec<u8>,
     pub cert_chain_der: Vec<Vec<u8>>,
@@ -1734,29 +1954,7 @@ async fn fed_send_message_handler(
     }
 
     if !peer_cfg.principals.is_empty() {
-        let authorized = match &envelope.principal {
-            FedPrincipal::Session {
-                harness,
-                name,
-                session_id,
-            } => {
-                let badge = format!("{harness}:{name}");
-                let sess_badge = format!("session:{session_id}");
-                let harness_sess = format!("{harness}:{session_id}");
-                peer_cfg
-                    .principals
-                    .iter()
-                    .any(|p| p == &badge || p == &sess_badge || p == &harness_sess)
-            }
-            FedPrincipal::Service { name } => {
-                let badge = format!("svc:{name}");
-                peer_cfg.principals.iter().any(|p| p == &badge)
-            }
-            FedPrincipal::Anonymous { from } => {
-                let badge = format!("anon:{from}");
-                peer_cfg.principals.iter().any(|p| p == &badge)
-            }
-        };
+        let authorized = principal_allowed(&envelope.principal, &peer_cfg.principals);
         if !authorized {
             return Err(AppError::OpDenied(
                 "principal not authorized for peer".to_string(),
@@ -1779,12 +1977,19 @@ async fn fed_send_message_handler(
     // 2. Validate to.ref and handle forwarding
     let raw_target_ref = &envelope.to.r#ref;
     let (target_ref, dest_host) = match split_peer_ref(raw_target_ref) {
-        Some((r, h)) if h != fed_state.host_label => (r, Some(h)),
+        Some((r, h)) if h != fed_state.node_name => (r, Some(h)),
         Some((r, _)) => (r, None),
         None => (raw_target_ref.as_str(), None),
     };
+    // The canonical name this node knows the sender by; it is what crosses the wire.
+    let sender_node = fed_state
+        .peers
+        .canonical_name(&peer.name)
+        .unwrap_or(&peer.name)
+        .to_string();
 
     if let Some(dest) = dest_host {
+        let dest = fed_state.peers.key_for(dest).unwrap_or(dest);
         // One-hop rule: cannot forward an already forwarded message
         if envelope.forwarded.is_some() {
             return Err(AppError::NoForward(
@@ -1875,7 +2080,7 @@ async fn fed_send_message_handler(
             thread_id: envelope.thread_id.clone(),
             created_at: envelope.created_at,
             forwarded: Some(FedForwarded {
-                origin_peer: peer.name.clone(),
+                origin_peer: sender_node.clone(),
                 origin_principal: envelope.principal.clone(),
             }),
         };
@@ -1944,11 +2149,13 @@ async fn fed_send_message_handler(
         ));
     }
 
-    let (effective_origin_peer, effective_principal) = if let Some(ref fwd) = envelope.forwarded {
+    // The origin node is a canonical name; it is shown by its local nickname, if any.
+    let (origin_node, effective_principal) = if let Some(ref fwd) = envelope.forwarded {
         (&fwd.origin_peer, &fwd.origin_principal)
     } else {
-        (&peer.name, &envelope.principal)
+        (&sender_node, &envelope.principal)
     };
+    let effective_origin_peer = &fed_state.peers.display_name(origin_node).to_string();
 
     let target = match resolve_target_session_fed(&fed_state, target_ref).await {
         Ok(t) => {
@@ -2176,7 +2383,7 @@ async fn fed_send_message_handler(
         &envelope.id,
         &envelope.body,
         storage::SvcOrigin::Fed {
-            host: effective_origin_peer.clone(),
+            host: origin_node.clone(),
             principal: Some(effective_principal.badge()),
         },
     )
@@ -2257,7 +2464,7 @@ pub async fn deliver_federated_reply_locally(
                 &fed_state.db,
                 &fed_state.agy_config.proc_root,
                 &fed_state.sessions_dir,
-                &fed_state.host_label,
+                &fed_state.node_name,
                 ret_session_id,
             )
             .await
@@ -2371,7 +2578,11 @@ pub async fn deliver_federated_reply_locally(
                     envelope: envelope_text,
                     delivered_at: None,
                     origin: storage::SvcOrigin::Fed {
-                        host: peer_name.to_string(),
+                        host: fed_state
+                            .peers
+                            .canonical_name(peer_name)
+                            .unwrap_or(peer_name)
+                            .to_string(),
                         principal: Some(replier_badge.to_string()),
                     },
                 };
@@ -2773,7 +2984,7 @@ async fn fed_list_sessions_handler(
             &fed_state.db,
             &fed_state.agy_config.proc_root,
             std::slice::from_ref(&fed_state.sessions_dir),
-            &fed_state.host_label,
+            &fed_state.node_name,
         )
         .await?;
         let mut list = Vec::new();
@@ -2964,7 +3175,7 @@ pub fn queue_leaf_mailbox_message(
     }
 
     let origin = storage::SvcOrigin::Fed {
-        host: fed_state.host_label.clone(),
+        host: fed_state.node_name.clone(),
         principal: Some(envelope.principal.badge()),
     };
 
@@ -3023,7 +3234,7 @@ async fn resolve_target_session_fed(
         &fed_state.pi_store,
         &fed_state.svc_store,
         &fed_state.db,
-        &fed_state.host_label,
+        &fed_state.node_name,
         ref_str,
     )
     .await
@@ -3071,7 +3282,10 @@ pub fn make_tls_connector_for_peer(
             Arc::new(PinnedServerCertVerifier::new(pin))
         } else if let Some(anchors) = fed_state.get_ca_anchors(&peer.name) {
             let identities = peer.identities.clone().unwrap_or_default();
-            Arc::new(CaServerCertVerifier::new(anchors, identities))
+            Arc::new(
+                CaServerCertVerifier::new(anchors, identities)
+                    .refusing_pinned(&peer.name, fed_state.current_peers().pinned_entries()),
+            )
         } else {
             return Err(AppError::Internal(format!(
                 "peer '{}' has neither pin nor valid CA bundle",
@@ -3120,7 +3334,10 @@ fn map_tls_connect_error(peer_name: &str, e: std::io::Error) -> AppError {
         .get_ref()
         .and_then(|err| err.downcast_ref::<rustls::Error>())
     {
-        if matches!(rustls_err, rustls::Error::InvalidCertificate(_)) {
+        if matches!(
+            rustls_err,
+            rustls::Error::InvalidCertificate(_) | rustls::Error::General(_)
+        ) {
             return AppError::PeerRejected(format!(
                 "server TLS certificate verification failed for {peer_name}: {rustls_err}"
             ));
@@ -3148,6 +3365,7 @@ pub async fn send_federated_message(
         .peers
         .get(peer_name)
         .ok_or_else(|| AppError::UnknownPeer(peer_name.to_string()))?;
+    let peer_name = peer.name.as_str();
 
     if peer.leaf {
         let from_name = match &envelope.principal {
@@ -3157,16 +3375,16 @@ pub async fn send_federated_message(
                 name,
             } => {
                 if !name.is_empty() {
-                    format!("xmsg@{} · {}:{}", fed_state.host_label, harness, name)
+                    format!("xmsg@{} · {}:{}", fed_state.node_name, harness, name)
                 } else {
-                    format!("xmsg@{} · {}:{}", fed_state.host_label, harness, session_id)
+                    format!("xmsg@{} · {}:{}", fed_state.node_name, harness, session_id)
                 }
             }
             FedPrincipal::Service { name } => {
-                format!("xmsg@{} · svc:{}", fed_state.host_label, name)
+                format!("xmsg@{} · svc:{}", fed_state.node_name, name)
             }
             FedPrincipal::Anonymous { from } => {
-                format!("xmsg@{} · {}", fed_state.host_label, from)
+                format!("xmsg@{} · {}", fed_state.node_name, from)
             }
         };
         return queue_leaf_mailbox_message(
@@ -3301,6 +3519,7 @@ pub async fn send_federated_reply(
         .peers
         .get(peer_name)
         .ok_or_else(|| AppError::UnknownPeer(peer_name.to_string()))?;
+    let peer_name = peer.name.as_str();
 
     let reply_fut = async {
         let connector = make_tls_connector_for_peer(fed_state, peer)?;
@@ -3415,6 +3634,7 @@ pub async fn poll_federated_replies(
         .peers
         .get(peer_name)
         .ok_or_else(|| AppError::UnknownPeer(peer_name.to_string()))?;
+    let peer_name = peer.name.as_str();
 
     let poll_fut = async {
         let connector = make_tls_connector_for_peer(fed_state, peer)?;
@@ -3507,6 +3727,7 @@ pub async fn get_federated_inbox(
         .peers
         .get(peer_name)
         .ok_or_else(|| AppError::UnknownPeer(peer_name.to_string()))?;
+    let peer_name = peer.name.as_str();
 
     let poll_fut = async {
         let connector = make_tls_connector_for_peer(fed_state, peer)?;
@@ -3596,6 +3817,7 @@ pub async fn ack_federated_inbox(
         .peers
         .get(peer_name)
         .ok_or_else(|| AppError::UnknownPeer(peer_name.to_string()))?;
+    let peer_name = peer.name.as_str();
 
     let ack_fut = async {
         let connector = make_tls_connector_for_peer(fed_state, peer)?;
@@ -3796,10 +4018,13 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
                     _ => peer_name.clone(),
                 };
                 let from_name = match &msg.origin {
-                    storage::SvcOrigin::Fed { host, principal } => match principal {
-                        Some(p) => format!("xmsg@{host} · {p}"),
-                        None => format!("xmsg@{host}"),
-                    },
+                    storage::SvcOrigin::Fed { host, principal } => {
+                        let host = fed_state.peers.display_name(host);
+                        match principal {
+                            Some(p) => format!("xmsg@{host} · {p}"),
+                            None => format!("xmsg@{host}"),
+                        }
+                    }
                     _ => format!("xmsg@{peer_name}"),
                 };
 
@@ -3978,6 +4203,7 @@ pub async fn list_federated_sessions(
         .get(peer_name)
         .cloned()
         .ok_or_else(|| AppError::NotFound(format!("peer '{peer_name}'")))?;
+    let peer_name = peer.name.as_str();
 
     let list_fut = async {
         let connector = make_tls_connector_for_peer(fed_state, &peer)?;

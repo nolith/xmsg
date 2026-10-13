@@ -83,8 +83,6 @@ async fn spawn_full_node(tmp: Option<TempDir>) -> FullNodeFixture {
         .env("RUST_LOG", "info")
         .args([
             "serve",
-            "--host-label",
-            "full-node",
             "--db-path",
             db_path.to_str().unwrap(),
             "--sessions-dir",
@@ -175,8 +173,6 @@ async fn spawn_leaf_node() -> LeafNodeFixture {
         .env("RUST_LOG", "info")
         .args([
             "serve",
-            "--host-label",
-            "leaf-node",
             "--leaf",
             "--leaf-principal",
             "svc:guard",
@@ -359,8 +355,6 @@ async fn test_oracle_3_unacked_message_persists_across_sigterm_restart() {
         .env("RUST_LOG", "info")
         .args([
             "serve",
-            "--host-label",
-            "persist-node",
             "--db-path",
             db_path.to_str().unwrap(),
             "--sessions-dir",
@@ -460,8 +454,6 @@ async fn test_oracle_3_unacked_message_persists_across_sigterm_restart() {
         .env("RUST_LOG", "info")
         .args([
             "serve",
-            "--host-label",
-            "persist-node",
             "--db-path",
             db_path.to_str().unwrap(),
             "--sessions-dir",
@@ -562,8 +554,6 @@ async fn test_oracle_4_pid_1_unshare_container_sigterm_clean_shutdown() {
             "--forward-signals",
             bin,
             "serve",
-            "--host-label",
-            "pid1-node",
             "--db-path",
             db_path.to_str().unwrap(),
             "--sessions-dir",

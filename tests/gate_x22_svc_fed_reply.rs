@@ -202,7 +202,7 @@ async fn create_full_test_node(
     let svc_store = new_svc_store();
 
     let fed_state = Arc::new(FedState {
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         peers: peers_arc,
         cert_der,
         cert_chain_der: Vec::new(),
@@ -242,7 +242,7 @@ async fn create_full_test_node(
         pi_notify_tx: pi_notify_tx.clone(),
         svc_store: svc_store.clone(),
         svc_notify_tx: svc_notify_tx.clone(),
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db: db.clone(),
@@ -389,8 +389,6 @@ async fn test_oracle_1_full_node_svc_federated_reply() {
             .env("XDG_RUNTIME_DIR", &sock_dir_b)
             .args([
                 "serve",
-                "--host-label",
-                "node_b",
                 "--listen",
                 "127.0.0.1:0",
                 "--fed-listen",

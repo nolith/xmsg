@@ -146,7 +146,7 @@ async fn create_test_node_full_inner(
     let (svc_notify_tx, _) = broadcast::channel(16);
 
     let fed_state = Arc::new(FedState {
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         peers: peers_arc,
         cert_der: cert_der.clone(),
         cert_chain_der: Vec::new(),
@@ -192,7 +192,7 @@ async fn create_test_node_full_inner(
         pi_notify_tx,
         svc_store: fed_state.svc_store.clone(),
         svc_notify_tx,
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db: db.clone(),
@@ -515,7 +515,7 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
     };
 
     let fed_state_a1 = Arc::new(FedState {
-        host_label: "host-a".to_string(),
+        node_name: "host-a".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-b".to_string(),
@@ -603,7 +603,7 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
     };
 
     let fed_state_a2 = Arc::new(FedState {
-        host_label: "host-a".to_string(),
+        node_name: "host-a".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-b".to_string(),
@@ -704,7 +704,7 @@ async fn test_oracle_2_from_absent_pin_only_accepted() {
     };
 
     let fed_state_a = Arc::new(FedState {
-        host_label: "host-a".to_string(),
+        node_name: "host-a".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-b".to_string(),
@@ -837,7 +837,7 @@ async fn test_oracle_4_reply_route_source_check() {
     }
 
     let fed_state_b = Arc::new(FedState {
-        host_label: "host-b".to_string(),
+        node_name: "host-b".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-a".to_string(),
@@ -1049,7 +1049,7 @@ async fn test_oracle_6_anonymous_from_with_colon_gives_400() {
     };
 
     let fed_state_a = Arc::new(FedState {
-        host_label: "host-a".to_string(),
+        node_name: "host-a".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-b".to_string(),
@@ -1126,7 +1126,7 @@ async fn test_oracle_7_root_harness_rejected_and_badge_spoof_sanitized() {
     .await;
 
     let fed_state_a = Arc::new(FedState {
-        host_label: "host-a".to_string(),
+        node_name: "host-a".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-b".to_string(),
@@ -1246,7 +1246,7 @@ async fn test_n4_attested_name_ascii_only_u0387() {
     .await;
 
     let fed_state_a = Arc::new(FedState {
-        host_label: "host-a".to_string(),
+        node_name: "host-a".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-b".to_string(),
@@ -1338,7 +1338,7 @@ async fn test_oracle_8_no_forward_rejected() {
     .await;
 
     let fed_state_a = Arc::new(FedState {
-        host_label: "host-a".to_string(),
+        node_name: "host-a".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-b".to_string(),
@@ -1431,7 +1431,7 @@ async fn test_oracle_9_forged_reply_id_gives_403() {
     .await;
 
     let fed_state_b = Arc::new(FedState {
-        host_label: "host-b".to_string(),
+        node_name: "host-b".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-a".to_string(),
@@ -1570,7 +1570,7 @@ async fn test_oracle_10_duplicate_id_delivered_once() {
     .await;
 
     let fed_state_a = Arc::new(FedState {
-        host_label: "host-a".to_string(),
+        node_name: "host-a".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-b".to_string(),
@@ -1680,7 +1680,7 @@ async fn test_oracle_11_rate_limit_429() {
     .await;
 
     let fed_state_a = Arc::new(FedState {
-        host_label: "host-a".to_string(),
+        node_name: "host-a".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-b".to_string(),
@@ -1863,7 +1863,7 @@ async fn test_amendment_a_peer_without_send_gets_403_op_denied() {
     .await;
 
     let fed_state_a = Arc::new(FedState {
-        host_label: "host-a".to_string(),
+        node_name: "host-a".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-b".to_string(),
@@ -2211,7 +2211,7 @@ exit 0
 
 #[allow(clippy::too_many_arguments)]
 fn make_client_fed_state(
-    host_label: &str,
+    node_name: &str,
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
     peer_name: &str,
@@ -2222,7 +2222,7 @@ fn make_client_fed_state(
     base_node: &TestNode,
 ) -> Arc<FedState> {
     Arc::new(FedState {
-        host_label: host_label.to_string(),
+        node_name: node_name.to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 peer_name.to_string(),
@@ -2869,7 +2869,7 @@ async fn test_f9_kind_qualified_principal_filter() {
             allow: vec!["send".to_string()],
             from: None,
             leaf: false,
-            principals: vec!["svc:matrix".to_string(), "anon:genie".to_string()],
+            principals: vec!["matrix".to_string(), "anon:genie".to_string()],
             targets: None,
             dial: None,
         }],
@@ -2937,7 +2937,8 @@ async fn test_f9_kind_qualified_principal_filter() {
         "Expected anon:genie to be admitted: {anon_ok:?}"
     );
 
-    // 3. Claude session named "svc:matrix" -> MUST NOT match filter "svc:matrix"
+    // 3. Claude session labelled "matrix" -> MUST NOT match filter "matrix" (XA2: filters
+    //    match service names and instance IDs, never labels)
     let fake_svc = send_federated_message(
         &fed_state_a,
         "host-b",
@@ -2947,7 +2948,7 @@ async fn test_f9_kind_qualified_principal_filter() {
             principal: FedPrincipal::Session {
                 harness: "claude".into(),
                 session_id: "s1".into(),
-                name: "svc:matrix".into(),
+                name: "matrix".into(),
             },
             to: FedTarget {
                 r#ref: "sess-b".into(),
@@ -2962,7 +2963,7 @@ async fn test_f9_kind_qualified_principal_filter() {
     .await;
     assert!(matches!(fake_svc, Err(xmsg::error::AppError::OpDenied(_))));
 
-    // 4. Genuine service named "matrix" matches "svc:matrix" -> accepted
+    // 4. Genuine service named "matrix" matches "matrix" -> accepted
     let real_svc = send_federated_message(
         &fed_state_a,
         "host-b",
@@ -2985,7 +2986,7 @@ async fn test_f9_kind_qualified_principal_filter() {
     .await;
     assert!(
         real_svc.is_ok(),
-        "Expected svc:matrix to be admitted: {real_svc:?}"
+        "Expected service matrix to be admitted: {real_svc:?}"
     );
 }
 
@@ -3389,7 +3390,7 @@ async fn test_n1_offsource_flood_leaves_legit_bucket_intact() {
     )
     .await;
     let legit_state = Arc::new(FedState {
-        host_label: "host-r".to_string(),
+        node_name: "host-r".to_string(),
         peers: Arc::new(PeersMap::new(
             [(
                 "host-a".to_string(),
@@ -3798,26 +3799,32 @@ async fn test_n7_f5b_semaphore_bound() {
     }
 }
 
+// XA2 inverted F9's load rule: principals are bare service names and instance IDs (or
+// anon:<from>), and the retired kind-qualified form is the one refused at load.
 #[test]
-fn test_n7_f9_bare_principal_refused_at_load() {
-    let json = r#"{
+fn test_n7_f9_retired_principal_form_refused_at_load() {
+    let pin = format!("sha256:{}", "12".repeat(32));
+    let json = serde_json::json!({
         "peer-a": {
             "address": "127.0.0.1:9",
-            "pin": "sha256:1234",
+            "pin": pin,
             "allow": ["send"],
-            "principals": ["alice"]
+            "principals": ["claude:alice"]
         }
-    }"#;
-    let res = PeersMap::load_from_json(json);
+    })
+    .to_string();
+    let res = PeersMap::load_from_json(&json);
     assert!(
         res.is_err(),
-        "Bare principal 'alice' must be refused at load time"
+        "Retired principal 'claude:alice' must be refused at load time"
     );
     let err = res.unwrap_err();
     assert!(
-        err.contains("principal filter entry 'alice'") && err.contains("kind-qualified"),
+        err.contains("'claude:alice'") && err.contains("retired"),
         "Error message must name the invalid principal, got: {err}"
     );
+    let bare = json.replace("claude:alice", "alice");
+    assert!(PeersMap::load_from_json(&bare).is_ok());
 }
 
 #[tokio::test]

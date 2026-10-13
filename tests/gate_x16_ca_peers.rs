@@ -123,7 +123,7 @@ async fn create_test_node(
     let svc_store = new_svc_store();
 
     let fed_state = Arc::new(FedState {
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         peers: Arc::new(peers_map),
         cert_der,
         cert_chain_der,
@@ -1304,7 +1304,7 @@ async fn test_oracle_9_ca_peer_policy_targets_enforced() {
                 from: None,
                 leaf: false,
                 principals: Vec::new(),
-                targets: Some(vec!["claude:allowed-target".to_string()]),
+                targets: Some(vec!["allowed-target".to_string()]),
                 dial: None,
             },
             anchors.clone(),
@@ -1429,9 +1429,9 @@ fn test_oracle_10_config_validation() {
         .unwrap_err()
         .contains("specifies 'identities' with 'pin'"));
 
-    // 5. Valid CA config -> succeeds
+    // 5. Valid CA config -> succeeds (XA2: keyed by the node name its identity derives)
     let json_valid_ca = serde_json::json!({
-        "peer-x": {
+        "x.test": {
             "address": "127.0.0.1:9000",
             "ca": ca_file.display().to_string(),
             "identities": ["spiffe://example.org/ns/test/sa/x"]
@@ -1527,20 +1527,23 @@ fn test_oracle_11_duplicate_peer_name_refused() {
     let (_ca_params, _ca_key, _ca_der, ca_pem) = generate_ca("Test Root CA 11");
     fs::write(&ca_file, &ca_pem).unwrap();
 
-    // 1. Arm C from adversarial review: pin entry and CA entry with same name in map form
+    // 1. Arm C from adversarial review: two entries with the same name in map form.
+    //    XA2: a CA entry must be keyed by its derived node name, so the same-name pair is
+    //    now two pinned entries (distinct keys) sharing the nickname "x".
+    let pin1 = format!("sha256:{}", "ab".repeat(32));
+    let pin2 = format!("sha256:{}", "ef".repeat(32));
     let json_map_dup = serde_json::json!({
         "peers": {
             "k1": {
                 "name": "x",
                 "address": "127.0.0.1:9000",
-                "pin": "sha256:abcd",
+                "pin": pin1,
                 "allow": ["send"]
             },
             "k2": {
                 "name": "x",
                 "address": "127.0.0.1:9001",
-                "ca": ca_file.display().to_string(),
-                "identities": ["spiffe://t/x"],
+                "pin": pin2,
                 "allow": ["send", "reply"]
             }
         }
@@ -1562,13 +1565,13 @@ fn test_oracle_11_duplicate_peer_name_refused() {
         {
             "name": "dup-peer",
             "address": "127.0.0.1:9000",
-            "pin": "sha256:abcd",
+            "pin": pin1,
             "allow": ["send"]
         },
         {
             "name": "dup-peer",
             "address": "127.0.0.1:9001",
-            "pin": "sha256:ef01",
+            "pin": pin2,
             "allow": ["send"]
         }
     ])

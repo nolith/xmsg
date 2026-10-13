@@ -61,9 +61,9 @@ pub struct DeliveryResponse {
 /// - Strips quotes (") and angle brackets (<, >).
 /// - Collapses whitespace runs to a single space.
 /// - Trims leading and trailing whitespace.
-/// - Prefixes `xmsg@<host-label> · `.
+/// - Prefixes `xmsg@<node-name> · `.
 /// - Truncates the whole resulting string to 64 characters.
-pub fn sanitize_from(host_label: &str, raw_from: &str) -> Result<String, AppError> {
+pub fn sanitize_from(node_name: &str, raw_from: &str) -> Result<String, AppError> {
     if raw_from.contains(':') || raw_from.contains('/') {
         return Err(AppError::BadSender(
             "sender name cannot contain ':' or '/'".to_string(),
@@ -102,18 +102,18 @@ pub fn sanitize_from(host_label: &str, raw_from: &str) -> Result<String, AppErro
         ));
     }
 
-    let prefixed = format!("xmsg@{host_label} · {trimmed}");
+    let prefixed = format!("xmsg@{node_name} · {trimmed}");
     let capped: String = prefixed.chars().take(64).collect();
     Ok(capped)
 }
 
 /// Sanitizes an attested caller session name and formats the attested badge:
-/// `xmsg@<host-label> · <harness>:<cleaned_caller_name>`.
+/// `xmsg@<node-name> · <harness>:<cleaned_caller_name>`.
 /// - Strips `"`, `<`, `>`, `\n`, `\r`, and Unicode categories Cc, Cf, Cs, Zl, Zp.
 /// - Collapses whitespace runs to a single space.
 /// - Trims leading and trailing whitespace.
 /// - Caps total string to 64 Unicode scalar characters.
-pub fn sanitize_attested_from(host_label: &str, harness: &str, caller_name: &str) -> String {
+pub fn sanitize_attested_from(node_name: &str, harness: &str, caller_name: &str) -> String {
     let mut cleaned = String::with_capacity(caller_name.len());
     let mut prev_whitespace = false;
 
@@ -161,7 +161,7 @@ pub fn sanitize_attested_from(host_label: &str, harness: &str, caller_name: &str
         name_stripped
     };
 
-    let prefixed = format!("xmsg@{host_label} · {harness}:{name_final}");
+    let prefixed = format!("xmsg@{node_name} · {harness}:{name_final}");
     prefixed.chars().take(64).collect()
 }
 

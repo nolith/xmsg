@@ -146,7 +146,7 @@ async fn start_test_http_server(
         pi_notify_tx,
         svc_store: xmsg::svc::new_svc_store(),
         svc_notify_tx: broadcast::channel(16).0,
-        host_label: "test-host".to_string(),
+        node_name: "test-host".to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db: db.clone(),
@@ -640,7 +640,7 @@ async fn create_fed_test_node(
     let rate_limiter = Arc::new(RateLimiter::new(60, 20));
 
     let fed_state = Arc::new(FedState {
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         peers: peers_arc,
         cert_der,
         cert_chain_der: Vec::new(),
@@ -680,7 +680,7 @@ async fn create_fed_test_node(
         pi_notify_tx,
         svc_store: xmsg::svc::new_svc_store(),
         svc_notify_tx,
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db: db.clone(),

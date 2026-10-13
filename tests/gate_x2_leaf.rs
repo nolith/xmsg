@@ -185,7 +185,7 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
             allow: vec!["send".to_string()],
             from: None,
             leaf: true,
-            principals: vec!["svc:matrix".to_string()],
+            principals: vec!["matrix".to_string()],
             targets: None,
             dial: None,
         },
@@ -200,7 +200,7 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
     let (node_b_svc_notify_tx, _) = broadcast::channel(16);
 
     let node_b_fed_state = Arc::new(FedState {
-        host_label: "target-node".to_string(),
+        node_name: "target-node".to_string(),
         peers: Arc::new(PeersMap::new(node_b_peers)),
         cert_der: node_b_cert.clone(),
         cert_chain_der: Vec::new(),
@@ -294,7 +294,7 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
     let (leaf_svc_notify_tx, _) = broadcast::channel(16);
 
     let leaf_fed_state = Arc::new(FedState {
-        host_label: "leaf-node".to_string(),
+        node_name: "leaf-node".to_string(),
         peers: Arc::new(PeersMap::new(leaf_peers)),
         cert_der: leaf_cert,
         cert_chain_der: Vec::new(),
@@ -330,7 +330,7 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
         pi_notify_tx: leaf_pi_notify_tx.clone(),
         svc_store: xmsg::svc::new_svc_store(),
         svc_notify_tx: leaf_svc_notify_tx,
-        host_label: "leaf-node".to_string(),
+        node_name: "leaf-node".to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db: leaf_db.clone(),
@@ -429,7 +429,7 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
             allow: vec!["send".to_string()],
             from: None,
             leaf: true,
-            principals: vec!["svc:matrix".to_string()],
+            principals: vec!["matrix".to_string()],
             targets: None,
             dial: None,
         },
@@ -444,7 +444,7 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
     let (node_b_svc_notify_tx, _) = broadcast::channel(16);
 
     let node_b_fed_state = Arc::new(FedState {
-        host_label: "target-node".to_string(),
+        node_name: "target-node".to_string(),
         peers: Arc::new(PeersMap::new(node_b_peers)),
         cert_der: node_b_cert,
         cert_chain_der: Vec::new(),
@@ -485,7 +485,7 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
         pi_notify_tx: node_b_pi_notify_tx,
         svc_store: xmsg::svc::new_svc_store(),
         svc_notify_tx: node_b_svc_notify_tx,
-        host_label: "target-node".to_string(),
+        node_name: "target-node".to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db: node_b_db.clone(),
@@ -569,7 +569,7 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
     let (leaf_svc_notify_tx, _) = broadcast::channel(16);
 
     let leaf_fed_state = Arc::new(FedState {
-        host_label: "leaf-node".to_string(),
+        node_name: "leaf-node".to_string(),
         peers: Arc::new(PeersMap::new(leaf_peers)),
         cert_der: leaf_cert,
         cert_chain_der: Vec::new(),
@@ -605,7 +605,7 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
         pi_notify_tx: leaf_pi_notify_tx,
         svc_store: xmsg::svc::new_svc_store(),
         svc_notify_tx: leaf_svc_notify_tx,
-        host_label: "leaf-node".to_string(),
+        node_name: "leaf-node".to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db: leaf_db.clone(),

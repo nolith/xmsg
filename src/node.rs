@@ -1,0 +1,133 @@
+//! Node names (A9, B5, D4).
+//!
+//! A node's name is derived, never assigned by hand:
+//! - from a certificate's URI SAN: `.../host/<host>/user/<user>` is `<user>.<host>`,
+//!   `.../ns/<ns>/sa/<sa>` is `<sa>.<ns>`;
+//! - from a pinned key: the first 16 characters of the lowercase RFC 4648 base32 of the
+//!   key's SHA-256 (the pin);
+//! - with no federation identity at all: `<user>.<host>` from the OS, never sent anywhere.
+
+/// Length of a key-derived node name.
+pub const KEY_NAME_LEN: usize = 16;
+
+const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+/// The node name in a SPIFFE identity URI.
+pub fn node_name_from_uri(uri: &str) -> Result<String, String> {
+    let path = uri
+        .strip_prefix("spiffe://")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(_, p)| p)
+        .ok_or_else(|| format!("identity '{uri}' is not a spiffe:// URI with a path"))?;
+    let (first, second) = match path.split('/').collect::<Vec<_>>().as_slice() {
+        ["host", host, "user", user] => (*user, *host),
+        ["ns", ns, "sa", sa] => (*sa, *ns),
+        _ => {
+            return Err(format!(
+                "identity '{uri}' names no node: expected .../host/<host>/user/<user> or .../ns/<ns>/sa/<sa>"
+            ))
+        }
+    };
+    for part in [first, second] {
+        if part.is_empty() {
+            return Err(format!("identity '{uri}' has an empty name part"));
+        }
+        if part.contains('.') {
+            return Err(format!(
+                "identity '{uri}': '{part}' contains '.', which separates the parts of a node name"
+            ));
+        }
+    }
+    Ok(format!("{first}.{second}"))
+}
+
+/// The key-derived node name of a pin (`sha256:<hex>` or bare hex of the key's SHA-256).
+pub fn node_name_from_pin(pin: &str) -> Result<String, String> {
+    let norm = crate::fed::normalize_pin(pin);
+    let bytes = hex::decode(&norm)
+        .ok()
+        .filter(|b| b.len() == 32)
+        .ok_or_else(|| format!("pin '{pin}' is not a SHA-256 digest (64 hex characters)"))?;
+    // 16 base32 characters are 80 bits: the first 10 bytes.
+    let mut acc: u128 = 0;
+    for b in &bytes[..10] {
+        acc = (acc << 8) | u128::from(*b);
+    }
+    Ok((0..KEY_NAME_LEN)
+        .map(|i| BASE32[((acc >> (75 - 5 * i)) & 31) as usize] as char)
+        .collect())
+}
+
+/// True for a string that could be a key-derived node name.
+pub fn is_key_name_shaped(s: &str) -> bool {
+    s.len() == KEY_NAME_LEN && s.bytes().all(|b| BASE32.contains(&b))
+}
+
+/// The name a node holding this leaf certificate goes by: its URI SAN's name, or with no
+/// URI SAN, its key-derived name.
+pub fn node_name_from_cert(cert_der: &[u8]) -> Result<String, String> {
+    let uris = crate::fed::extract_uri_sans(cert_der)?;
+    match uris.as_slice() {
+        [] => node_name_from_pin(&crate::fed::spki_sha256_from_der(cert_der)?),
+        [uri] => node_name_from_uri(uri),
+        _ => Err(format!(
+            "certificate carries {} URI SANs; a node identity has exactly one",
+            uris.len()
+        )),
+    }
+}
+
+/// D4: a node with no federation identity is `<user>.<host>`, from its uid's user name and
+/// the OS host name cut at its first `.` (as `hostname -s` does).
+pub fn local_node_name() -> String {
+    let host = gethostname::gethostname().to_string_lossy().to_string();
+    let host = host.split('.').next().unwrap_or_default();
+    format!("{}.{host}", os_user_name())
+}
+
+fn os_user_name() -> String {
+    let uid = unsafe { libc::getuid() };
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16384];
+    let mut res: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut res) };
+    if rc == 0 && !res.is_null() && !pwd.pw_name.is_null() {
+        unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        // ponytail: a uid with no passwd entry (some containers) is named by its number.
+        uid.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names() {
+        assert_eq!(
+            node_name_from_uri("spiffe://json64.dev/host/bitstream/user/sini").unwrap(),
+            "sini.bitstream"
+        );
+        assert_eq!(
+            node_name_from_uri("spiffe://json64.dev/ns/genie/sa/genie-guard").unwrap(),
+            "genie-guard.genie"
+        );
+        assert!(node_name_from_uri("spiffe://json64.dev/host/a.b/user/sini").is_err());
+        assert!(node_name_from_uri("spiffe://json64.dev/ns/x").is_err());
+        // RFC 4648 test vector: base32("foobar") = "MZXW6YTBOI======"; zero-padded digest here.
+        let mut d = [0u8; 32];
+        d[..6].copy_from_slice(b"foobar");
+        assert_eq!(
+            node_name_from_pin(&hex::encode(d)).unwrap(),
+            "mzxw6ytboiaaaaaa"
+        );
+        assert!(node_name_from_pin("sha256:abcd").is_err());
+        assert!(is_key_name_shaped("mzxw6ytboiaaaaaa"));
+        assert!(!is_key_name_shaped("laptop"));
+        let local = local_node_name();
+        assert_eq!(local.matches('.').count(), 1, "{local}");
+    }
+}

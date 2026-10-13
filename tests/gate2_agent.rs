@@ -192,7 +192,7 @@ async fn setup(max_body: usize) -> Env {
         pi_notify_tx: ptx,
         svc_store: xmsg::svc::new_svc_store(),
         svc_notify_tx: tokio::sync::broadcast::channel(16).0,
-        host_label: "h".into(),
+        node_name: "h".into(),
         max_body,
         request_counter: AtomicU64::new(1),
         db: db.clone(),

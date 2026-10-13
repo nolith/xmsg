@@ -135,7 +135,7 @@ struct HubFixture {
 }
 
 async fn spawn_hub_node(
-    name: &str,
+    _name: &str,
     cert_pem: &str,
     key_pem: &str,
     leaf_name: &str,
@@ -186,8 +186,6 @@ async fn spawn_hub_node(
             .env("XDG_RUNTIME_DIR", &run_dir)
             .args([
                 "serve",
-                "--host-label",
-                name,
                 "--listen",
                 &format!("127.0.0.1:{http_port}"),
                 "--fed-listen",
@@ -280,7 +278,7 @@ struct LeafFixture {
 }
 
 async fn spawn_leaf_node(
-    name: &str,
+    _name: &str,
     cert_pem: &str,
     key_pem: &str,
     hub_name: &str,
@@ -328,8 +326,6 @@ async fn spawn_leaf_node(
             .env("XDG_RUNTIME_DIR", &run_dir)
             .args([
                 "serve",
-                "--host-label",
-                name,
                 "--leaf",
                 "--leaf-principal",
                 leaf_principal,

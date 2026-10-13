@@ -31,7 +31,7 @@ pub struct AppState {
     pub pi_notify_tx: broadcast::Sender<String>,
     pub svc_store: crate::svc::SvcStore,
     pub svc_notify_tx: broadcast::Sender<String>,
-    pub host_label: String,
+    pub node_name: String,
     pub max_body: usize,
     pub request_counter: AtomicU64,
     pub db: Arc<Mutex<rusqlite::Connection>>,
@@ -139,7 +139,7 @@ pub(crate) async fn resolve_target(
     pi_store: &crate::pi::PiStore,
     svc_store: &crate::svc::SvcStore,
     db: &Arc<Mutex<rusqlite::Connection>>,
-    host_label: &str,
+    node_name: &str,
     ref_str: &str,
 ) -> Result<ResolvedTarget, AppError> {
     let claude_ref = ref_str
@@ -151,7 +151,7 @@ pub(crate) async fn resolve_target(
         db,
         &agy_config.proc_root,
         sessions_dirs,
-        host_label,
+        node_name,
         claude_ref,
     )
     .await;
@@ -219,7 +219,7 @@ pub(crate) async fn resolve_target_session(
         &state.pi_store,
         &state.svc_store,
         &state.db,
-        &state.host_label,
+        &state.node_name,
         ref_str,
     )
     .await
@@ -243,7 +243,7 @@ async fn list_sessions_handler(
             &state.db,
             &state.agy_config.proc_root,
             &state.sessions_dirs,
-            &state.host_label,
+            &state.node_name,
         )
         .await?;
         let mut list = Vec::new();
@@ -343,11 +343,11 @@ async fn send_message_handler(
     let (from_name, fed_principal, idempotency_principal) = if state.is_leaf() {
         let p_str = state.leaf_principal().expect("leaf_principal in leaf mode");
         let p = crate::fed::parse_fed_principal(p_str)?;
-        let name = format!("xmsg@{} · {}", state.host_label, p_str);
+        let name = format!("xmsg@{} · {}", state.node_name, p_str);
         (name, p, p_str.to_string())
     } else {
         // Sanitize sender name (enforces printable ASCII and rejects ':' and '/')
-        let name = match inbox::sanitize_from(&state.host_label, &req.from) {
+        let name = match inbox::sanitize_from(&state.node_name, &req.from) {
             Ok(name) => name,
             Err(err) => {
                 eprintln!(
@@ -421,7 +421,7 @@ async fn send_message_handler(
 
     // Check if target is cross-host
     let (ref_str, remote_host) = match crate::fed::split_peer_ref(&ref_str) {
-        Some((r, h)) if h != state.host_label => (r.to_string(), Some(h)),
+        Some((r, h)) if h != state.node_name => (r.to_string(), Some(h)),
         Some((r, _)) => (r.to_string(), None),
         None => (ref_str, None),
     };
@@ -435,6 +435,13 @@ async fn send_message_handler(
                 )))
             }
         };
+        // A typed nickname or canonical name, as this node's entry key.
+        let target_host = fed_state
+            .peers
+            .key_for(target_host)
+            .unwrap_or(target_host)
+            .to_string();
+        let target_host = target_host.as_str();
 
         let message_id = ulid::Ulid::new().to_string();
         let envelope = crate::fed::FedEnvelope {
@@ -442,7 +449,7 @@ async fn send_message_handler(
             id: message_id.clone(),
             principal: fed_principal.clone(),
             to: crate::fed::FedTarget {
-                r#ref: ref_str.clone(),
+                r#ref: crate::fed::wire_ref(&fed_state.peers, &ref_str),
             },
             body: req.text.clone(),
             push_replies: req.push_replies,
@@ -487,7 +494,7 @@ async fn send_message_handler(
                 recipient_harness: "fed".to_string(),
                 return_harness: Some("svc".to_string()),
                 return_session_id: state.leaf_principal().map(|s| s.to_string()),
-                return_host: Some(state.host_label.clone()),
+                return_host: Some(state.node_name.clone()),
                 push_replies: req.push_replies,
                 thread_id: message_id.clone(),
             };

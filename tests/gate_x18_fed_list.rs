@@ -144,7 +144,7 @@ async fn create_fed_test_node(
     let rate_limiter = rate_limiter_opt.unwrap_or_else(|| Arc::new(RateLimiter::new(60, 20)));
 
     let fed_state = Arc::new(FedState {
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         peers: peers_arc,
         cert_der,
         cert_chain_der: Vec::new(),
@@ -212,7 +212,7 @@ async fn create_fed_test_node(
         pi_notify_tx,
         svc_store: svc_store.clone(),
         svc_notify_tx,
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         max_body: 65536,
         request_counter: AtomicU64::new(1),
         db: db.clone(),
@@ -509,7 +509,7 @@ async fn test_oracle_3_peer_with_targets() {
             from: None,
             leaf: false,
             principals: Vec::new(),
-            targets: Some(vec!["svc:genie-expert".to_string()]),
+            targets: Some(vec!["genie-expert".to_string()]),
             dial: None,
         }],
         creds_a.clone(),

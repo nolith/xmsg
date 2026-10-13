@@ -181,7 +181,7 @@ pub fn sync_claims_db(
     conn: &Connection,
     proc_root: &Path,
     sessions_dirs: &(impl SessionDirs + ?Sized),
-    host_label: &str,
+    node_name: &str,
 ) -> Result<
     (
         Vec<(InstanceClaim, SessionFileEntry)>,
@@ -190,7 +190,7 @@ pub fn sync_claims_db(
     AppError,
 > {
     let raw_entries = registry::read_session_entries(sessions_dirs);
-    sync_claims_entries(conn, proc_root, raw_entries, host_label)
+    sync_claims_entries(conn, proc_root, raw_entries, node_name)
 }
 
 /// One claim scan over session file entries in the order given. The scan
@@ -202,7 +202,7 @@ pub fn sync_claims_entries(
     conn: &Connection,
     proc_root: &Path,
     raw_entries: Vec<SessionFileEntry>,
-    host_label: &str,
+    node_name: &str,
 ) -> Result<
     (
         Vec<(InstanceClaim, SessionFileEntry)>,
@@ -394,10 +394,10 @@ pub fn sync_claims_entries(
                         recipient_proc_start: me.proc_start.clone(),
                         target_session_id: me.address(),
                         socket_path: PathBuf::from(&entry.messaging_socket_path),
-                        from_name: format!("xmsg@{host_label}"),
+                        from_name: format!("xmsg@{node_name}"),
                         text: format!(
                             "xmsg: conversation {} is open in two processes on {}. This process is {}; the other is {}. A send to {} reaches {}.",
-                            id, host_label, me.address(), other.address(), id, plain_addr
+                            id, node_name, me.address(), other.address(), id, plain_addr
                         ),
                     });
                 }
@@ -487,12 +487,12 @@ pub async fn with_claims<T>(
     db: &Arc<Mutex<Connection>>,
     proc_root: &Path,
     sessions_dirs: &(impl SessionDirs + ?Sized),
-    host_label: &str,
+    node_name: &str,
     f: impl FnOnce(&Connection, &[(InstanceClaim, SessionFileEntry)]) -> T,
 ) -> Result<T, AppError> {
     let (out, notices) = {
         let conn = db.lock().map_err(|e| AppError::Internal(e.to_string()))?;
-        let (pairs, notices) = sync_claims_db(&conn, proc_root, sessions_dirs, host_label)?;
+        let (pairs, notices) = sync_claims_db(&conn, proc_root, sessions_dirs, node_name)?;
         (f(&conn, &pairs), notices)
     };
     if !notices.is_empty() {
@@ -509,9 +509,9 @@ pub async fn sync_claims(
     db: &Arc<Mutex<Connection>>,
     proc_root: &Path,
     sessions_dirs: &(impl SessionDirs + ?Sized),
-    host_label: &str,
+    node_name: &str,
 ) -> Result<Vec<(InstanceClaim, SessionFileEntry)>, AppError> {
-    with_claims(db, proc_root, sessions_dirs, host_label, |_, pairs| {
+    with_claims(db, proc_root, sessions_dirs, node_name, |_, pairs| {
         pairs.to_vec()
     })
     .await
@@ -636,10 +636,10 @@ pub async fn resolve_claude_session_and_deliver(
     db: &Arc<Mutex<Connection>>,
     proc_root: &Path,
     sessions_dirs: &(impl SessionDirs + ?Sized),
-    host_label: &str,
+    node_name: &str,
     ref_str: &str,
 ) -> Result<(Session, PathBuf), AppError> {
-    with_claims(db, proc_root, sessions_dirs, host_label, |conn, pairs| {
+    with_claims(db, proc_root, sessions_dirs, node_name, |conn, pairs| {
         resolve_claude_in(conn, sessions_dirs, pairs, ref_str)
     })
     .await?

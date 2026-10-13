@@ -133,7 +133,7 @@ async fn create_reloader_node(
     let svc_store = new_svc_store();
 
     let fed_state = Arc::new(FedState {
-        host_label: name.to_string(),
+        node_name: name.to_string(),
         peers: peers_arc.clone(),
         cert_der: Vec::new(),
         cert_chain_der: Vec::new(),

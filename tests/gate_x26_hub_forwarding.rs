@@ -197,8 +197,6 @@ async fn spawn_test_node(
         .env("XDG_RUNTIME_DIR", &run_dir)
         .args([
             "serve",
-            "--host-label",
-            name,
             "--listen",
             &format!("127.0.0.1:{http_port}"),
             "--fed-listen",
@@ -409,9 +407,12 @@ async fn test_oracle_1_relay_and_reply() {
             b_msg.contains("Hello Bob from Alice via Hub!"),
             "Bob should see original message body: {b_msg}"
         );
+        // XA2: B has no nickname for node-a, so it sees node-a's canonical (key-derived)
+        // name, which is what the hub put on the wire.
+        let node_a_name = xmsg::node::node_name_from_pin(&pin_a).unwrap();
         assert!(
-            b_msg.contains("xmsg@node-a · claude:Alice") || b_msg.contains("xmsg@node-a"),
-            "Bob should see origin showing node-a: {b_msg}"
+            b_msg.contains(&format!("xmsg@{node_a_name} · claude:Alice")),
+            "Bob should see origin showing node-a's canonical name {node_a_name}: {b_msg}"
         );
 
         let msg_id = extract_message_id(&b_msg).expect("message_id in Bob's delivery footer");
@@ -846,7 +847,7 @@ async fn test_oracle_4c_dest_targets_gate() {
                 "address": format!("127.0.0.1:{port_b}"),
                 "pin": normalize_pin(&pin_b),
                 "allow": ["send", "reply"],
-                "targets": ["claude:allowed_bob"]
+                "targets": ["allowed_bob"]
             }
         });
 

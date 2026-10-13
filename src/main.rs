@@ -34,6 +34,20 @@ enum Commands {
 
     /// Register credentials with running xmsg server
     Register(RegisterArgs),
+
+    /// Load a peers file with every rule `serve` applies, and exit 0 or name the failure
+    CheckPeers(CheckPeersArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct CheckPeersArgs {
+    /// Path to the peers file (JSON)
+    pub peers_file: PathBuf,
+
+    /// This node's federation certificate (PEM); with it, the peers file is also checked
+    /// against this node's own name and key
+    #[arg(long)]
+    pub fed_cert: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -80,10 +94,6 @@ pub struct ServeArgs {
     /// Path to unix domain socket for HTTP server (defaults to $XDG_RUNTIME_DIR/xmsg/http.sock; on macOS without it, the Darwin user temp dir)
     #[arg(long, env = "XMSG_HTTP_SOCK")]
     pub http_sock: Option<PathBuf>,
-
-    /// Host label for sender envelope prefix (defaults to hostname)
-    #[arg(long, env = "XMSG_HOST_LABEL")]
-    pub host_label: Option<String>,
 
     /// Path to session metadata directory (repeatable, or separated by ':' in env XMSG_SESSIONS_DIR; defaults to ~/.claude/sessions)
     #[arg(
@@ -231,9 +241,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 run_register_agy(agy_args)?;
             }
         },
+        Commands::CheckPeers(args) => {
+            let own = match &args.fed_cert {
+                Some(cert) => Some(own_node_from_cert_file(cert)?),
+                None => None,
+            };
+            xmsg::fed::PeersMap::load_from_file_for(&args.peers_file, own.as_ref())
+                .map_err(|e| format!("peers file {}: {e}", args.peers_file.display()))?;
+            match own {
+                Some(own) => println!(
+                    "peers file {} loads for node {}",
+                    args.peers_file.display(),
+                    own.name
+                ),
+                None => println!("peers file {} loads", args.peers_file.display()),
+            }
+        }
     }
 
     Ok(())
+}
+
+/// This node's name and pin, from the leaf (first) certificate of a PEM chain.
+fn own_node_from_cert_file(
+    cert_path: &std::path::Path,
+) -> Result<xmsg::fed::OwnNode, Box<dyn std::error::Error>> {
+    use rustls::pki_types::pem::PemObject;
+    let pem = std::fs::read(cert_path)
+        .map_err(|e| format!("failed to read fed cert at {}: {e}", cert_path.display()))?;
+    let leaf = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
+        .next()
+        .ok_or("cert file contains 0 certificates")?
+        .map_err(|e| format!("failed to parse cert pem: {e}"))?;
+    own_node_from_der(&leaf)
+}
+
+fn own_node_from_der(leaf: &[u8]) -> Result<xmsg::fed::OwnNode, Box<dyn std::error::Error>> {
+    let name = xmsg::node::node_name_from_cert(leaf)
+        .map_err(|e| format!("cannot derive this node's name from --fed-cert: {e}"))?;
+    let pin = xmsg::fed::spki_sha256_from_der(leaf)?;
+    Ok(xmsg::fed::OwnNode {
+        name,
+        pin: Some(pin),
+    })
 }
 
 fn run_register_agy(args: RegisterAgyArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -471,9 +521,15 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .with_target(false)
         .init();
 
-    let host_label = args
-        .host_label
-        .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().to_string());
+    // A9: nothing assigns a node name by hand. The flag is gone (clap refuses it); the
+    // environment variable that fed it is refused here rather than silently ignored.
+    if std::env::var_os("XMSG_HOST_LABEL").is_some() {
+        return Err(
+            "XMSG_HOST_LABEL is no longer read: a node's name comes from its federation certificate, or from its user and host"
+                .to_string()
+                .into(),
+        );
+    }
     let sessions_dirs = resolve_sessions_dirs(args.sessions_dirs);
     let db_path = resolve_db_path(args.db_path);
 
@@ -492,7 +548,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         listen = ?args.listen,
         http_sock = %http_sock_path.display(),
-        host_label = %host_label,
         sessions_dirs = ?sessions_dirs,
         db_path = %db_path.display(),
         max_body = args.max_body,
@@ -602,13 +657,25 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             (Vec::new(), Vec::new(), Vec::new())
         };
 
+    // A9 / B5 / D4: the node's own name.
+    let own = if cert_der.is_empty() {
+        None
+    } else {
+        Some(own_node_from_der(&cert_der).map_err(|e| e.to_string())?)
+    };
+    let node_name = match &own {
+        Some(own) => own.name.clone(),
+        None => xmsg::node::local_node_name(),
+    };
+    info!(node_name = %node_name, "node name");
+
     let fed_state = if let Some(peers_file) = args.peers_file {
-        let peers = xmsg::fed::load_peers_file(&peers_file)
+        let peers = xmsg::fed::PeersMap::load_from_file_for(&peers_file, own.as_ref())
             .map_err(|e| format!("failed to load peers file: {e}"))?;
         let peers_arc = Arc::new(peers);
 
         let fs = Arc::new(xmsg::fed::FedState {
-            host_label: host_label.clone(),
+            node_name: node_name.clone(),
             peers: peers_arc.clone(),
             cert_der: cert_der.clone(),
             cert_chain_der: cert_chain_der.clone(),
@@ -678,7 +745,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         pi_notify_tx: pi_notify_tx.clone(),
         svc_store: svc_store.clone(),
         svc_notify_tx: svc_notify_tx.clone(),
-        host_label,
+        node_name,
         max_body: args.max_body,
         request_counter: AtomicU64::new(1),
         db: db.clone(),

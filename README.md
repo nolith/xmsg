@@ -36,9 +36,9 @@ All local IPC in `xmsg` relies on Unix domain sockets located in `$XDG_RUNTIME_D
 - **Fail-Closed Executable Resolution:** Executable path resolution fails closed on deleted binaries (`<path> (deleted)`) and upgraded profile symlinks where the canonical target has changed or no longer exists.
 - **Attested Badges & Harness Binding:** The attested sender badge formats as:
   ```text
-  fromName = "xmsg@" || host_label || " · " || caller.harness || ":" || cleaned_name
+  fromName = "xmsg@" || node_name || " · " || caller.harness || ":" || cleaned_name
   ```
-  The harness (`claude:`, `pi:`, `agy:`) and process binding are cryptographically/kernel-attested by `xmsg`, while the display name is chosen by the session.
+  The harness (`claude:`, `pi:`, `agy:`) and process binding are cryptographically/kernel-attested by `xmsg`, while the display name is chosen by the session. `node_name` is the node's own name (Section 7.0); nothing assigns it by hand.
 - **Ancestor Process Walk:** For calls to `agent.sock` (such as MCP tools spawned in child shells), `xmsg` traverses parent PIDs upwards through `/proc/<pid>/stat` (`proc_pidinfo` on macOS) to identify the originating agent session.
 - **Harness-Bound Reply Authorization:** All stored messages record the recipient harness (`claude`, `agy`, or `pi`). A reply is accepted only when:
   ```text
@@ -325,7 +325,7 @@ Communication over the registration socket uses a JSON-lines streaming protocol:
    The `origin` object provides structured, tamper-proof sender attestation resolved at enqueue time:
 
    - `{"kind": "local", "harness": <harness>, "sessionId": <session_id>}`: For local senders attested on this instance via `agent.sock` or kernel-attested callers in leaf mode.
-   - `{"kind": "fed", "host": <peer_host_label>, "principal": <sender_badge>}`: For inbound messages arriving over mTLS federation from an authenticated peer host. `principal` carries the sender badge asserted by the sending node (e.g. `claude:alice` or `svc:guard`), as verified by the peer host and gated by `principals` filters. It is asserted by the authenticated peer, not proven end to end.
+   - `{"kind": "fed", "host": <node_name>, "principal": <sender_badge>}`: For inbound messages arriving over mTLS federation from an authenticated peer. `host` is the sending node's canonical name (Section 7.0): `<user>.<host>` or `<sa>.<ns>` for a CA peer, the 16-character key-derived name for a pinned peer, never a local nickname. `principal` carries the sender badge asserted by the sending node (e.g. `claude:alice` or `svc:guard`), as verified by the peer host and gated by `principals` filters. It is asserted by the authenticated peer, not proven end to end.
    - `{"kind": "anonymous"}`: For unattested senders (e.g. plain HTTP sends without leaf attestation) or pre-migration rows.
 
    Daemons and services must use `origin` rather than parsing display strings (`fromName` or `envelope`) for security and authorization decisions.
@@ -463,6 +463,16 @@ nix flake check ./ci
 
 `xmsg` supports secure, direct host-to-host messaging across machines over mutual TLS (mTLS) with pinned self-signed Ed25519 certificates and optional source-address bindings.
 
+### 7.0 Node names
+
+A node's name is derived from its identity; nothing assigns it by hand, and `xmsg serve` refuses the old `--host-label` flag (and the `XMSG_HOST_LABEL` variable) by name.
+
+- **CA identity:** from the URI SAN of the node's own leaf certificate (`--fed-cert`). `spiffe://<trust-domain>/host/<host>/user/<user>` is `<user>.<host>` (e.g. `sini.bitstream`); `spiffe://<trust-domain>/ns/<ns>/sa/<sa>` is `<sa>.<ns>` (e.g. `genie-guard.genie`). A `.` inside a user, host, namespace or service-account name is refused.
+- **Pinned key:** a certificate with no URI SAN names its node by its key: the first 16 characters of the lowercase RFC 4648 base32 of the key's SHA-256, which is the pin (e.g. `k5x3q7mzv2ndp4ha`). The name proves itself: only the key's holder can present it.
+- **No federation identity:** a node with no `--fed-cert` is `<user>.<host>` from its uid's user name and the OS host name cut at the first `.` (as `hostname -s` does; macOS commonly reports `<name>.local`). This name never goes on the wire.
+
+**Names on the wire and when typed.** Envelopes carry canonical names: the receiving node attributes a message to the canonical name of the peer entry that authenticated it, and a hub's forward mark (`forwarded.origin_peer`) is the origin's canonical name. A typed `@node` takes either the canonical name or this node's local nickname for the peer (the key of a pinned entry), translated through the local peers file. A message from a peer this node has a nickname for shows `xmsg@<nickname> · ...`; one from a node it has no nickname for shows the canonical name.
+
 ### 7.1 Security Architecture & Identity
 
 Federated connections establish peer identity using cryptographic certificate pinning rather than central Certificate Authorities:
@@ -497,37 +507,36 @@ Federated connections establish peer identity using cryptographic certificate pi
 
 #### Peer entry formats & examples
 
-A peer entry carries **EXACTLY ONE trust mechanism**: either `pin`, or `ca` (path to a PEM bundle of one or more trust anchors) plus `identities` (a non-empty list of URI patterns). Specifying both or neither is an immediate configuration error at load time.
+A peer entry carries **EXACTLY ONE trust mechanism**: either `pin`, or `ca` (path to a PEM bundle of one or more trust anchors) plus `identities` (exactly one concrete identity). Specifying both or neither is an immediate configuration error at load time.
 
 ```json
 {
-  "alpha-pinned": {
+  "laptop": {
     "address": "192.168.1.50:7788",
     "pin": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "allow": ["send", "reply"]
   },
-  "beta-spiffe": {
+  "worker.prod": {
     "address": "10.0.0.12:7788",
     "ca": "/etc/xmsg/spire-bundle.pem",
     "identities": [
       "spiffe://example.org/ns/prod/sa/worker"
     ],
     "allow": ["send", "reply"]
-  },
-  "gamma-wildcard": {
-    "address": "10.0.0.15:7788",
-    "ca": "/etc/xmsg/ca.pem",
-    "identities": [
-      "spiffe://example.org/ns/matrix/*"
-    ],
-    "allow": ["send"]
   }
 }
 ```
 
-- **Exact SPIFFE ID:** `"identities": ["spiffe://example.org/ns/prod/sa/worker"]` matches only that exact URI.
-- **Prefix Wildcard (`/*`):** `"identities": ["spiffe://example.org/ns/matrix/*"]` matches any URI with that prefix base plus at least one additional path segment (e.g. `spiffe://example.org/ns/matrix/bot1` or `spiffe://example.org/ns/matrix/agents/reviewer`), but does NOT match `spiffe://example.org/ns/matrix` or `spiffe://example.org/ns/matrix-other/bot1`. No other wildcard syntax is supported.
+- **Entry keys (Section 7.0):** a CA entry is keyed by the node name its identity derives (`worker.prod` above); any other key is refused at load, naming the derived name. A pinned entry's key is a local nickname for the peer (`laptop`), or the peer's key-derived name itself when this node keeps no nickname for it.
+- **One concrete identity:** a CA entry names one node, so `identities` holds exactly one URI and no `/*` pattern. Patterns, and admitting nodes by pattern, are the hub's (H5).
 - **Hand CA:** Any standard PEM certificate bundle containing one or more X.509 root or intermediate trust anchors may be supplied in `"ca"`.
+
+#### Naming rules the loader enforces
+
+- **Nicknames:** a nickname may not contain `.` and may not be 16 characters of `[a-z2-7]`, so it cannot pass for a certificate-derived or key-derived name.
+- **One namespace:** host names (`<user>.<host>`), pod names (`<sa>.<ns>`) and key-derived names share one namespace with this node's own name, and a collision is refused at load, naming both entries (e.g. host `genie` with user `genie-guard`, and the pod `ns/genie/sa/genie-guard`, are both `genie-guard.genie`). Two nicknames for one pinned key are one name twice, and are refused the same way. Duplicate keys in a JSON object are read as two entries, not collapsed.
+- **One node, one canonical name:** an entry that pins this node's own key is refused at load. Where the loader cannot know (a pin whose key belongs to a CA-named peer), the TLS handshake refuses a CA-authenticated connection, inbound or outbound, that presents a pinned entry's key, and the refusal names both entries.
+- **Validate-only:** `xmsg check-peers <peers.json> [--fed-cert <cert.pem>]` loads a peers file with every rule `serve` applies and exits 0, or non-zero naming the failure. With `--fed-cert` it also checks the file against this node's own name and key.
 
 #### The URI SAN rule
 
@@ -556,29 +565,30 @@ No CRL (Certificate Revocation List) or OCSP (Online Certificate Status Protocol
 
 ### 7.3 Configuration & Operation
 
-- **Peers Map (`--peers-file`):** A JSON dictionary mapping peer hostnames to their configuration options:
+- **Peers Map (`--peers-file`):** A JSON dictionary mapping entry keys (node names or nicknames, Section 7.2) to their configuration options:
 
-  | Field        | Type                    | Description                                                                                  |
-  | ------------ | ----------------------- | -------------------------------------------------------------------------------------------- |
-  | `address`    | string                  | Target endpoint socket address (`host:port`). Required.                                      |
-  | `pin`        | string (optional)       | Expected SHA-256 certificate fingerprint pin (`sha256:...`). Mutually exclusive with `ca`.   |
-  | `ca`         | string (optional)       | Path to PEM trust anchor bundle file. Mutually exclusive with `pin`; requires `identities`.  |
-  | `identities` | list[string] (optional) | Non-empty list of allowed URI SANs or prefix patterns ending in `/*`. Required with `ca`.    |
-  | `allow`      | list[string]            | Permitted operations (`"send"`, `"reply"`, `"list"`).                                        |
-  | `from`       | list[string] (optional) | Permitted source IP CIDR blocks (e.g. `["192.168.1.0/24"]`).                                 |
-  | `leaf`       | bool (optional)         | If true, outbound replies to this peer are not pushed. Default `false`.                      |
-  | `principals` | list[string] (optional) | Sender principal filters (`svc:<name>`, `claude:<name>`, `session:<id>`, `anon:<from>`).     |
-  | `targets`    | list[string] (optional) | Permitted local target principal filters (`svc:<name>`, `<harness>:<name>`, `session:<id>`). |
+  | Field        | Type                    | Description                                                                                 |
+  | ------------ | ----------------------- | ------------------------------------------------------------------------------------------- |
+  | `address`    | string                  | Target endpoint socket address (`host:port`). Required.                                     |
+  | `pin`        | string (optional)       | Expected SHA-256 certificate fingerprint pin (`sha256:...`). Mutually exclusive with `ca`.  |
+  | `ca`         | string (optional)       | Path to PEM trust anchor bundle file. Mutually exclusive with `pin`; requires `identities`. |
+  | `identities` | list[string] (optional) | Exactly one concrete URI SAN; the entry's key is its node name. Required with `ca`.         |
+  | `allow`      | list[string]            | Permitted operations (`"send"`, `"reply"`, `"list"`).                                       |
+  | `from`       | list[string] (optional) | Permitted source IP CIDR blocks (e.g. `["192.168.1.0/24"]`).                                |
+  | `leaf`       | bool (optional)         | If true, outbound replies to this peer are not pushed. Default `false`.                     |
+  | `principals` | list[string] (optional) | Sender filters: a service name, an instance ID, or `anon:<from>`.                           |
+  | `targets`    | list[string] (optional) | Permitted local targets: a service name or an instance ID.                                  |
 
-  - **Target Filtering (`targets`) & Canonical Prefix Stripping:** When `targets` is configured, a federated `send` from that peer is refused with HTTP `403 Forbidden` (`op_denied`, "target not allowed for peer") before rate-limiting or queueing unless the resolved local target matches an entry (`svc:<name>` for a service daemon, `<harness>:<name>` and `session:<id>` for a session). An empty present list (`"targets": []`) refuses all targets. When `targets` is omitted, every local target is reachable. Replies on the federated reply route are not gated by `targets`.
-    - *Target Resolution & Prefix Stripping (P1):* Federated targets frequently specify the destination harness using canonical prefixes (`claude:sess-target`, `agy:sess-id`, `session:sess-id`, `pi:sess-id`). Before querying the local session stores (which index sessions by their bare IDs or directories), `resolve_target_session_fed` strips these harness prefixes. This enables callers across hosts to address sessions using standard harness-qualified target names. This does not bypass policy: the X14 `targets` allowlist evaluation runs immediately after target resolution on the fully resolved target principal and badges.
+  - **Filters (`principals`, `targets`):** an entry is a service name or an instance ID, matched exactly; `principals` also takes `anon:<from>` for an anonymous HTTP sender. Instance labels are never matched, so `targets = ["genie-guard"]` admits the service `genie-guard` and refuses an instance merely labelled `genie-guard`. An entry in the retired kind-qualified form (`svc:`, `session:`, `claude:`, `agy:`, `pi:`, `http:` followed by a name) is refused at load with a message naming the new form; it is never silently ignored.
+  - **Target Filtering (`targets`):** When `targets` is configured, a federated `send` from that peer is refused with HTTP `403 Forbidden` (`op_denied`, "target not allowed for peer") before rate-limiting or queueing unless the resolved local target's service name or instance ID is listed. An empty present list (`"targets": []`) refuses all targets. When `targets` is omitted, every local target is reachable. Replies on the federated reply route are not gated by `targets`.
+    - *Target Resolution & Prefix Stripping (P1):* Federated refs may still carry a harness prefix (`claude:sess-target`, `svc:guard`, `session:sess-id`); `resolve_target_session_fed` strips it before querying the local session stores. This does not bypass policy: the `targets` check runs on the fully resolved target.
 
 - **Federated Session Listing (`GET /fed/v1/sessions` & `GET /v1/sessions?peer=<name>`):**
 
   - **Inbound Route (`GET /fed/v1/sessions`):** Remote peers authenticate over mTLS and must have `"list"` in their configured `allow` list, or requests are refused with HTTP `403 Forbidden` (`op_denied`).
-  - **Target Filtering:** When the peer has `targets` configured, `xmsg` filters local sessions using the exact same badge matching rules as `send` (`target_matches_allowlist`), returning only sessions and service daemons that the peer is permitted to message. When `targets` is omitted, all local sessions are visible.
+  - **Target Filtering:** When the peer has `targets` configured, `xmsg` filters local sessions with the same rule as `send` (`target_matches_allowlist`: service name or instance ID), returning only sessions and service daemons that the peer is permitted to message. When `targets` is omitted, all local sessions are visible.
   - **Minimal Field Set:** To preserve host isolation and privacy, each entry returned on the federated wire route carries only `name`, `sessionId`, `harness`, `kind`, and `status`. Host-internal details (`cwd`, `pid`, timestamps, versions, entrypoints) are stripped.
-  - **Client-Side Query (`GET /v1/sessions?peer=<name>`):** Local clients query remote peer sessions over `http.sock`. `xmsg` looks up `<name>` in the peers map, calls the remote peer's `/fed/v1/sessions` over the outbound mTLS connector, and returns entries with `ref` set to `<sessionId>@<name>` (the exact address format accepted by `send`). If `<name>` is unknown, HTTP `404 Not Found` is returned. If the remote peer refuses or is unreachable, the error status is passed through naming the peer.
+  - **Client-Side Query (`GET /v1/sessions?peer=<name>`):** Local clients query remote peer sessions over `http.sock`. `xmsg` looks up `<name>` (a canonical name or a local nickname) in the peers map, calls the remote peer's `/fed/v1/sessions` over the outbound mTLS connector, and returns entries with `ref` set to `<sessionId>@<name>` (the exact address format accepted by `send`). If `<name>` is unknown, HTTP `404 Not Found` is returned. If the remote peer refuses or is unreachable, the error status is passed through naming the peer.
 
 - **No Forwarding:** Forwarding cross-host (`to.ref` containing `@`) is strictly prohibited; receivers reject forwarded requests with `400 no_forward`.
 
@@ -651,7 +661,7 @@ In a star or multi-node mesh topology, nodes that cannot directly dial one anoth
   ```
   ref@dest@hub
   ```
-  The sending node dials `hub` with target `ref@dest`. The hub splits this target, recognizes `dest` as another known peer, and relays the message to `dest` with target `ref`.
+  The sending node dials `hub` with target `ref@dest`, writing `dest` as its canonical name when the sender has a nickname for it. The hub splits this target, recognizes `dest` (a canonical name or the hub's own nickname for it) as another known peer, and relays the message to `dest` with target `ref`.
 - **Peer Configuration Fields:**
   Forwarding requires explicit permissions configured on both the hub and the final recipient:
   - **On the Forwarder (`allow = ["forward"]`):** The sending peer's entry in the hub's `peers.json` must include `"forward"` in its `allow` list:
@@ -677,7 +687,7 @@ In a star or multi-node mesh topology, nodes that cannot directly dial one anoth
     ```
     If the forwarding node lacks the `"relayed"` capability, the recipient refuses the send with HTTP `403 Forbidden` (`op_denied`).
 - **One-Hop Limit:**
-  Forwarded messages are marked with `forwarded: { origin_peer, origin_principal }`. A node refuses to forward any message that already carries the forward mark (`no_forward`). Multi-hop daisy-chaining is prohibited.
+  Forwarded messages are marked with `forwarded: { origin_peer, origin_principal }`, where `origin_peer` is the origin's canonical node name, never the hub's nickname for it. A node refuses to forward any message that already carries the forward mark (`no_forward`). Multi-hop daisy-chaining is prohibited.
 - **Origin & Attestation (Trust Model):**
   When a recipient receives a forwarded message, the sender origin displayed to local sessions and services (`xmsg@<origin_peer> · <principal>`) is the forwarding node's assertion, **not proven end-to-end**. The recipient trusts the hub to attest accurately to who sent the message. (For end-to-end origin signatures, see Section B of `xmsg-hub-design.md`).
 - **Destination Target Filters:**
