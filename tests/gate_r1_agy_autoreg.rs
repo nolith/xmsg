@@ -50,10 +50,11 @@ fn setup_mock_process(
 
 // ---------------------------------------------------------------------------
 // Oracle 1:
-// --hook: credential-less => exactly one ephemeralMessage naming absolute exe;
+// --hook: credential-less => exactly one userMessage naming absolute exe;
+//         no ephemeralMessage;
 //         credentialed    => {};
 //         malformed stdin => {} with exit 0.
-// Mutant: always inject.
+// Mutant: back to ephemeralMessage => RED; always inject => RED.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -127,7 +128,7 @@ async fn oracle_1_hook_credential_less_and_credentialed_and_malformed() {
     }
     assert!(reg_sock.exists(), "register.sock must be created");
 
-    // Case 1A: credential-less session => exactly one ephemeralMessage naming absolute exe
+    // Case 1A: credential-less session => exactly one userMessage naming absolute exe
     {
         use std::io::Write;
         let mut child = Command::new(bin)
@@ -166,9 +167,13 @@ async fn oracle_1_hook_credential_less_and_credentialed_and_malformed() {
             1,
             "must inject exactly one step for credential-less session"
         );
-        let msg = steps[0]["ephemeralMessage"]
+        let msg = steps[0]["userMessage"]
             .as_str()
-            .expect("ephemeralMessage string must exist");
+            .expect("userMessage string must exist");
+        assert!(
+            steps[0].get("ephemeralMessage").is_none(),
+            "must not contain ephemeralMessage"
+        );
         assert!(
             msg.contains("register agy"),
             "message must tell model to run register agy: {msg}"
@@ -176,6 +181,14 @@ async fn oracle_1_hook_credential_less_and_credentialed_and_malformed() {
         assert!(
             msg.contains(bin),
             "message must name the absolute exe path: {bin} in {msg}"
+        );
+        assert!(
+            msg.contains("automatic registration request"),
+            "message must state it is an automatic registration request: {msg}"
+        );
+        assert!(
+            msg.contains("needs no reply"),
+            "message must state it needs no reply: {msg}"
         );
     }
 

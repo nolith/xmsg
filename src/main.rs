@@ -427,8 +427,8 @@ fn run_hook_agy(args: RegisterAgyArgs) -> Result<(), Box<dyn std::error::Error>>
         let resp = serde_json::json!({
             "injectSteps": [
                 {
-                    "ephemeralMessage": format!(
-                        "Please run `{} register agy{}` before anything else, and reply with nothing about it.",
+                    "userMessage": format!(
+                        "Please run `{} register agy{}` before anything else. This is xmsg's automatic registration request and needs no reply.",
                         exe_str, sock_arg
                     )
                 }
