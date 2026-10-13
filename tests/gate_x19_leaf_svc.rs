@@ -541,7 +541,7 @@ async fn test_oracle_1_end_to_end_leaf_svc() {
         let lines = claude_rx.lock().unwrap().clone();
         if let Some(line) = lines.iter().find(|l| l.contains("Task completed by guard")) {
             assert!(line.contains(&format!("reply to message_id={msg_id}")));
-            assert!(line.contains("xmsg@leaf · svc:guard"));
+            assert!(line.contains("guard@leaf"), "{line}");
             got_reply = true;
             break;
         }

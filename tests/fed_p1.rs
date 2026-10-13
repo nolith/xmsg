@@ -313,7 +313,12 @@ async fn test_oracle_1_attested_cross_host_send() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let inboxes = node_b.inbox_rx.lock().unwrap().clone();
     assert_eq!(inboxes.len(), 1);
-    assert!(inboxes[0].contains("xmsg@host-a · claude:sess-a"));
+    // A12: `id@node`; a label equal to the id is not repeated.
+    assert!(
+        inboxes[0].contains(r#"from-name=\"sess-a@host-a\""#),
+        "{}",
+        inboxes[0]
+    );
     assert!(inboxes[0].contains("Hello federated world from A"));
 }
 
@@ -1216,9 +1221,10 @@ async fn test_oracle_7_root_harness_rejected_and_badge_spoof_sanitized() {
     let inboxes = node_b.inbox_rx.lock().unwrap().clone();
     assert_eq!(
         res_spoof.unwrap().from_name,
-        "xmsg@host-a · claude:x _ claude:y"
+        "s1@host-a",
+        "a label carrying `·` is dropped whole (AM-8)"
     );
-    assert!(inboxes[0].contains("xmsg@host-a · claude:x _ claude:y"));
+    assert!(inboxes[0].contains("s1@host-a"), "{}", inboxes[0]);
     assert!(!inboxes[0].contains(" · claude:y"));
 }
 
@@ -1308,7 +1314,8 @@ async fn test_n4_attested_name_ascii_only_u0387() {
     assert!(res.is_ok());
 
     let resp = res.unwrap();
-    assert_eq!(resp.from_name, "xmsg@host-a · claude:x _ claude:y");
+    // U+0387 is not A12's `·`; it is non-ASCII, so it is cleaned to `_` in the label.
+    assert_eq!(resp.from_name, "x _ claude:y · s1@host-a");
 }
 
 // =============================================================================
@@ -2570,7 +2577,7 @@ async fn test_f3_http_origin_federated_send() {
 
     let inboxes = node_b.inbox_rx.lock().unwrap().clone();
     assert_eq!(inboxes.len(), 1);
-    assert!(inboxes[0].contains("xmsg@host-a · script"));
+    assert!(inboxes[0].contains("script · anon@host-a"));
 }
 
 // =============================================================================

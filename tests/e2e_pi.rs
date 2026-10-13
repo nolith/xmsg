@@ -240,7 +240,7 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
     assert_eq!(delivered_val["action"], "deliver");
     assert_eq!(delivered_val["messageId"], message_id);
     let envelope = delivered_val["envelope"].as_str().unwrap();
-    assert!(envelope.contains("[xmsg] from=xmsg@test-host · alice-orch message_id="));
+    assert!(envelope.contains("[xmsg] from=alice-orch · anon@test-host message_id="));
     assert!(envelope.contains("reply with the xmsg reply tool"));
     assert!(envelope.contains("Hello Pi agent, please run unit tests!"));
 

@@ -633,7 +633,7 @@ async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
         assert_eq!(status, 202, "relay through the hub: {body}");
         let line = wait_line(&bob).await.expect("bob on C receives the relay");
         assert!(
-            line.contains(&format!("xmsg@{l_name} · ci")),
+            line.contains(&format!("ci · anon@{l_name}")),
             "C has no nickname for L, so it sees L's canonical name {l_name}: {line}"
         );
         assert!(
@@ -945,7 +945,7 @@ async fn test_oracle_8_no_hand_assigned_name() {
         let line = wait_line(&inbox).await.expect("local delivery");
         let expected = xmsg::node::local_node_name();
         assert!(
-            line.contains(&format!("xmsg@{expected} · ci")),
+            line.contains(&format!("ci · anon@{expected}")),
             "a node with no certificate is {expected}: {line}"
         );
         // D4: `<user>.<host>`, the host cut at its first `.`; the user name may contain `.`.

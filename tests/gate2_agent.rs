@@ -382,9 +382,17 @@ async fn gate2_identity() {
         .unwrap()
         .to_string();
 
-    assert_eq!(pi_from, "xmsg@h · pi:boss");
-    assert_eq!(cl_from, "xmsg@h · claude:boss");
-    assert_ne!(pi_from, cl_from, "badges must be disambiguated by harness");
+    // A12: the harness is not shown; the attested id disambiguates the two.
+    let pi_id = pi_from
+        .strip_prefix("boss · ")
+        .and_then(|r| r.strip_suffix("@h"))
+        .expect("pi label is `boss · <id>@h`");
+    assert!(xmsg::claim::is_uuid_shaped(pi_id), "{pi_from}");
+    assert_eq!(cl_from, "boss · real-boss@h");
+    assert_ne!(
+        pi_from, cl_from,
+        "labels must be disambiguated by the attested id"
+    );
 
     // ---- Starttime pin: one connection, change fixture starttime mid-connection
     let s = UnixStream::connect(&e.ag).await.unwrap();

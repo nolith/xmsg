@@ -541,7 +541,7 @@ async fn test_oracle_1_full_node_svc_federated_reply() {
             .find(|l| l.contains("Review approved by guard"))
         {
             assert!(line.contains(&format!("reply to message_id={msg_id}")));
-            assert!(line.contains("xmsg@node_b · svc:guard"));
+            assert!(line.contains("guard@node_b"));
             got_reply = true;
             break;
         }

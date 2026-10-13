@@ -224,7 +224,7 @@ async fn test_reply_roundtrip_and_envelope_footer() {
     assert_eq!(res.status(), reqwest::StatusCode::ACCEPTED);
     let delivery: DeliveryResponse = res.json().await.unwrap();
     assert_eq!(delivery.session_id, "sess-recipient-1111");
-    assert_eq!(delivery.from_name, "xmsg@test-host · orchestrator");
+    assert_eq!(delivery.from_name, "orchestrator · anon@test-host");
     assert!(!delivery.message_id.is_empty());
     let message_id = delivery.message_id;
 
@@ -239,7 +239,7 @@ async fn test_reply_roundtrip_and_envelope_footer() {
     assert!(inbox_line
         .message
         .content
-        .contains("from-name=\"xmsg@test-host · orchestrator\""));
+        .contains("from-name=\"orchestrator · anon@test-host\""));
     assert!(
         inbox_line
             .message
@@ -313,7 +313,7 @@ async fn test_reply_roundtrip_and_envelope_footer() {
     let detail: MessageDetailResponse = res.json().await.unwrap();
     assert_eq!(detail.id, message_id);
     assert_eq!(detail.session_id, "sess-recipient-1111");
-    assert_eq!(detail.from_name, "xmsg@test-host · orchestrator");
+    assert_eq!(detail.from_name, "orchestrator · anon@test-host");
     assert_eq!(detail.outcome, "delivered");
     assert_eq!(detail.replies.len(), 1);
     assert_eq!(detail.replies[0], reply);

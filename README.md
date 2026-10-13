@@ -34,11 +34,13 @@ All local IPC in `xmsg` relies on Unix domain sockets located in `$XDG_RUNTIME_D
 - **Service Sessions:** Services register bare names (e.g. `dispatcher`, dropping legacy `svc:` prefixes). Service names are validated: they cannot equal `xmsg`, cannot be UUID-shaped, and cannot contain `@`, `·`, `~`, or `.`.
 - **Process Verification (Pi):** Pi sessions register via Unix domain socket (`register.sock`, mode 0600 in a 0700 runtime directory) and are admitted on the peer UID check alone (`SO_PEERCRED` / `LOCAL_PEERCRED`). Because `register.sock` is accessible only by the owning user, who already possesses permissions to inspect or trace processes on their own bus, executable and script attestation add no trust on a user's own bus. The server verifies that the peer UID matches the server UID, records process starttime for lifecycle tracking, and mints a fresh UUID v4 as `sessionId`.
 - **Fail-Closed Executable Resolution:** Executable path resolution fails closed on deleted binaries (`<path> (deleted)`) and upgraded profile symlinks where the canonical target has changed or no longer exists.
-- **Attested Badges & Harness Binding:** The attested sender badge formats as:
+- **The sender label (A12):** every sender is shown with one render:
   ```text
-  fromName = "xmsg@" || node_name || " · " || caller.harness || ":" || cleaned_name
+  instance:   label · id@node      (id@node alone when it has no label)
+  service:    name@node            (all of it attested)
+  anonymous:  from · anon@node     (an unattested HTTP sender)
   ```
-  The harness (`claude:`, `pi:`, `agy:`) and process binding are cryptographically/kernel-attested by `xmsg`, while the display name is chosen by the session. `node_name` is the node's own name (Section 7.0); nothing assigns it by hand.
+  `id@node` is attested by `xmsg`: `id` is the sender's instance address, a fork's `~n` included (so the `X~2` fork of a conversation sends as `X~2`, never as plain `X`), and `node` is the node's own name (Section 7.0), or the reader's nickname for a peer it has one for. The label is the sender's own description (a Claude session's name, a pi session's name) and is shown apart from it. The harness is not shown. A label containing `@` or `·` is dropped whole, so it can never imitate the attested part; the session stays listed and addressable by its ID, with no label. Only the label is bounded (64 characters); the attested part is always emitted whole, however long the node's name is.
 - **Ancestor Process Walk:** For calls to `agent.sock` (such as MCP tools spawned in child shells), `xmsg` traverses parent PIDs upwards through `/proc/<pid>/stat` (`proc_pidinfo` on macOS) to identify the originating agent session.
 - **Harness-Bound Reply Authorization:** All stored messages record the recipient harness (`claude`, `agy`, or `pi`). A reply is accepted only when:
   ```text
@@ -48,9 +50,9 @@ All local IPC in `xmsg` relies on Unix domain sockets located in `$XDG_RUNTIME_D
 
 ### 1.4 Envelope Sanitization & Breakout Protection
 
-- **Printable-ASCII Sender Enforcement:** HTTP sender names are strictly restricted to printable ASCII characters (`0x20` to `0x7E`) and cannot contain `:` or `/`. Because `:` is prohibited over HTTP, unauthenticated callers can never forge the attested badge separator `:` by mathematical construction.
-- **Attested Visual Badges:** The `xmsg@<host> · <harness>:<name>` badge is strictly generated internally for authenticated socket callers.
-- **Sender Sanitization:** Sender names are stripped of quotes, angle brackets, control characters, and newlines, and capped at 64 characters across all sinks (`assemble_envelope`, inbox headers, and UI titles).
+- **Printable-ASCII Sender Enforcement:** HTTP sender names are strictly restricted to printable ASCII characters (`0x20` to `0x7E`) and cannot contain `:`, `/` or `@`. An unauthenticated caller therefore cannot write an `@`, so its `from` can never imitate an attested `id@node`; its label always ends ` · anon@<node>`.
+- **Attested Labels:** the `id@node` part of a label (Section 1.3) is generated internally from the claim table and the node's name; a sender chooses only its label.
+- **Sender Sanitization:** Labels are stripped of quotes, angle brackets, control characters, and newlines, non-ASCII characters become `_`, and the label (never the attested part) is capped at 64 characters across all sinks (`assemble_envelope`, inbox headers, and UI titles).
 - **XML Breakout Defense:** The transport envelope escapes attribute double quotes (`&quot;`), guaranteeing that the `<cross-session-message>` XML tag cannot be broken out of.
 
 ---
@@ -329,7 +331,7 @@ Communication over the registration socket uses a JSON-lines streaming protocol:
    {
      "action": "deliver",
      "messageId": "01M4FG...",
-     "fromName": "xmsg@host · sender",
+     "fromName": "sender · 6f1c2a7e-...@sini.cortex",
      "origin": {
        "kind": "local",
        "harness": "claude",
@@ -382,6 +384,15 @@ curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/xmsg/http.sock" http:
 - **Default Socket Shift:** `xmsg serve` no longer binds loopback TCP port `7787` by default. Local clients and background daemons (such as `matrix-xmsg` and `xmsg-pi`) connect via Unix domain socket (`http.sock`). TCP (`--listen`) is now only for clients that explicitly configure `XMSG_URL` or run in container/pod environments with isolated namespaces.
 - **Container / Pod Deployments:** In Kubernetes pods or containerized setups where clients and `xmsg` share an isolated pod network namespace and use TCP via `XMSG_URL`, start `xmsg` with `--listen 127.0.0.1:7787` (or `XMSG_LISTEN="127.0.0.1:7787"`) to bind the loopback TCP port.
 
+### How a target resolves
+
+One order, for every surface that takes a target (`/v1/sessions/{ref}/messages`, the `agent.sock` `send` frame, the MCP `send` tool, and a federated send arriving at this node):
+
+1. **An instance ID.** A Claude conversation's `X~n` or bare `X` (or its pid), then an agy or pi session's ID. A bare `X` while the plain ID is free and only `X~n` forks are live is `ambiguous`, listing each fork as `X~n@<node>`; it is never taken as not running.
+2. **A name, among services first.** If a registered service has the name, the send goes to it, whatever any instance is labelled. A session labelled `genie-guard` can never shadow or block the service `genie-guard`; it is reachable only by its ID.
+3. **Instance labels, only when unique.** Only when no service has the name are instance labels (a Claude or pi session's name) considered, and the send resolves only when exactly one live instance carries the label. Two or more give `409 ambiguous`, whose detail lists each candidate as `id@<node>`. Nothing is guessed.
+4. Otherwise `410 gone` (the ID was live here before), or `404 not_found`.
+
 ### Health & Sessions
 
 - `GET /healthz`: Server health check.
@@ -403,7 +414,7 @@ curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/xmsg/http.sock" http:
   ```json
   {
     "sessionId": "live-session-1234",
-    "fromName": "xmsg@hostname · alice-orchestrator",
+    "fromName": "alice-orchestrator · anon@sini.cortex",
     "bytes": 35,
     "messageId": "01J9XYZ..."
   }
@@ -421,6 +432,16 @@ curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/xmsg/http.sock" http:
 
 - `GET /v1/messages/{id}`: Retrieve message metadata and all thread replies.
 - `GET /v1/messages/{id}/replies?after={seq}&wait={seconds}`: Long-poll for replies (bounded to 60s timeout, max 128 concurrent waiters).
+
+### Persisted state and the schema version
+
+The database (`--db-path`; default `$XDG_STATE_HOME/xmsg/xmsg.db`, else `~/.local/state/xmsg/xmsg.db`) records its schema version in `PRAGMA user_version`. This schema is version 1. At startup:
+
+- a database at version 1 is opened as it is, so queued messages, stored replies and outbound records survive a restart;
+- a database below it (every build up to and including the deployed `ee1b6ca`, none of which recorded a version, reads 0) has its message state dropped (`messages`, `outbound`, `replies`, the `*_pending_messages` queues, `idempotency_keys`, `peer_mailbox`, and `forwarded_messages` where it exists) and is recreated at version 1, in one transaction. The claim table is kept;
+- a database above it is refused, naming both versions.
+
+So the first start after the upgrade from `ee1b6ca` loses messages queued before it, and a reply to a message sent before it fails as unknown. To roll back, copy the database before the upgrade and restore it with the previous binary.
 
 ---
 
@@ -489,7 +510,7 @@ A node's name is derived from its identity; nothing assigns it by hand, and `xms
 - **Pinned key:** a certificate with no URI SAN names its node by its key: the first 16 characters of the lowercase RFC 4648 base32 of the SHA-256 of the key's SubjectPublicKeyInfo DER, which is the pin (e.g. `k5x3q7mzv2ndp4ha`). The name proves itself: only the key's holder can present it.
 - **No federation identity:** a node with no `--fed-cert` is `<user>.<host>` from its uid's user name and the OS host name cut at the first `.` (as `hostname -s` does; macOS commonly reports `<name>.local`). This name never goes on the wire.
 
-**Names on the wire and when typed.** Envelopes carry canonical names: the receiving node attributes a message to the canonical name of the peer entry that authenticated it, and a hub's forward mark (`forwarded.origin_peer`) is the origin's canonical name. A typed `@node` takes either the canonical name or this node's local nickname for the peer (the key of a pinned entry), translated through the local peers file. A message from a peer this node has a nickname for shows `xmsg@<nickname> · ...`; one from a node it has no nickname for shows the canonical name.
+**Names on the wire and when typed.** Envelopes carry canonical names: the receiving node attributes a message to the canonical name of the peer entry that authenticated it, and a hub's forward mark (`forwarded.origin_peer`) is the origin's canonical name. A typed `@node` takes either the canonical name or this node's local nickname for the peer (the key of a pinned entry), translated through the local peers file. A message from a peer this node has a nickname for shows `... @<nickname>` in its label; one from a node it has no nickname for shows the canonical name.
 
 ### 7.1 Security Architecture & Identity
 
@@ -608,7 +629,7 @@ No CRL (Certificate Revocation List) or OCSP (Online Certificate Status Protocol
   - **Minimal Field Set:** To preserve host isolation and privacy, each entry returned on the federated wire route carries only `name`, `sessionId`, `harness`, `kind`, and `status`. Host-internal details (`cwd`, `pid`, timestamps, versions, entrypoints) are stripped.
   - **Client-Side Query (`GET /v1/sessions?peer=<name>`):** Local clients query remote peer sessions over `http.sock`. `xmsg` looks up `<name>` (a canonical name or a local nickname) in the peers map, calls the remote peer's `/fed/v1/sessions` over the outbound mTLS connector, and returns entries with `ref` set to `<sessionId>@<entry key>` (the exact address format accepted by `send`), where `<entry key>` is the peer's key in the local peers file: a pinned peer queried by its canonical name comes back under its nickname. If `<name>` is unknown, HTTP `404 Not Found` is returned. If the remote peer refuses or is unreachable, the error status is passed through naming the peer.
 
-- **No Forwarding:** Forwarding cross-host (`to.ref` containing `@`) is strictly prohibited; receivers reject forwarded requests with `400 no_forward`.
+- **No Forwarding by default:** a receiving node delivers only to its own sessions. A `to.ref` that still contains `@` is refused (`no_forward`) unless the sending peer holds the `"forward"` right on this node (Section 7.7, Forwarding through a hub), and a message that already carries a forward mark is never forwarded again.
 
 - **Router Isolation:** Federated TLS listeners only expose `/fed/` routes and strictly isolate local loopback routes (`/healthz`, `/v1/sessions`).
 
@@ -707,7 +728,7 @@ In a star or multi-node mesh topology, nodes that cannot directly dial one anoth
 - **One-Hop Limit:**
   Forwarded messages are marked with `forwarded: { origin_peer, origin_principal }`, where `origin_peer` is the origin's canonical node name, never the hub's nickname for it. A node refuses to forward any message that already carries the forward mark (`no_forward`). Multi-hop daisy-chaining is prohibited.
 - **Origin & Attestation (Trust Model):**
-  When a recipient receives a forwarded message, the sender origin displayed to local sessions and services (`xmsg@<origin_peer> · <principal>`) is the forwarding node's assertion, **not proven end-to-end**. The recipient trusts the hub to attest accurately to who sent the message. (For end-to-end origin signatures, see Section B of `xmsg-hub-design.md`).
+  When a recipient receives a forwarded message, the sender origin displayed to local sessions and services (`label · id@<origin_peer>`, or `name@<origin_peer>` for a service) is the forwarding node's assertion, **not proven end-to-end**. The recipient trusts the hub to attest accurately to who sent the message. (For end-to-end origin signatures, see Section B of `xmsg-hub-design.md`).
 - **Destination Target Filters:**
   The forwarding node checks the destination peer's configured `targets` list against the unpacked `ref`, before resolution, since the target lives on the destination. `svc:<name>` is checked as `<name>` and `session:<id>` as `<id>`; a ref carrying a harness kind (`claude:`, `agy:`, `pi:`, `http:`) never passes a non-empty `targets`. If the destination peer restricts targets and `ref` is not allowed, the hub rejects the send before relaying. **Open:** a bare ref is compared as a string, so a bare instance label equal to a listed entry passes the hub and the destination resolves it to the labelled instance; the hub cannot tell a label from a service name without resolving.
 - **Reply Routing:**

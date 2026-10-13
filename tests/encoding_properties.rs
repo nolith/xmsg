@@ -13,10 +13,10 @@ proptest! {
     ) {
         let from_result = sanitize_from(&host, &raw_from);
         if let Ok(from_name) = from_result {
-            // Invariant 1: the attested prefix is whole; only the label is bounded
-            let expected_prefix = format!("xmsg@{host} · ");
-            prop_assert!(from_name.starts_with(&expected_prefix));
-            prop_assert!(from_name[expected_prefix.len()..].chars().count() <= xmsg::inbox::LABEL_MAX_CHARS);
+            // Invariant 1: the attested suffix is whole; only the label is bounded
+            let expected_suffix = format!(" · anon@{host}");
+            prop_assert!(from_name.ends_with(&expected_suffix));
+            prop_assert!(from_name[..from_name.len() - expected_suffix.len()].chars().count() <= xmsg::inbox::LABEL_MAX_CHARS);
 
             // Invariant 2: no quotes, angle brackets, or control characters in from_name
             for c in from_name.chars() {
@@ -86,10 +86,12 @@ fn test_fixed_edge_cases() {
     // 3. 200-char from string
     let long_from = "a".repeat(200);
     let long_sanitized = sanitize_from(host, &long_from).unwrap();
-    assert!(long_sanitized.starts_with("xmsg@testhost · "));
     assert_eq!(
-        long_sanitized["xmsg@testhost · ".len()..].chars().count(),
-        xmsg::inbox::LABEL_MAX_CHARS
+        long_sanitized,
+        format!(
+            "{} · anon@testhost",
+            "a".repeat(xmsg::inbox::LABEL_MAX_CHARS)
+        )
     );
 
     // 4. Non-ASCII rejection (e.g. emojis / multibyte chars) and separator rejection

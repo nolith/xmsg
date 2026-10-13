@@ -141,15 +141,15 @@ exit 0
     assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
     let resp_body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(resp_body["sessionId"], initial_key);
-    assert_eq!(resp_body["fromName"], "xmsg@test-host · claude-orch");
+    assert_eq!(resp_body["fromName"], "claude-orch · anon@test-host");
     let msg_id = resp_body["messageId"].as_str().unwrap().to_string();
     assert!(!msg_id.is_empty());
 
     // Verify argv: contains session, title, and envelope; NEVER contains csrf_token
     let captured_argv = fs::read_to_string(&argv_log).unwrap();
-    assert!(captured_argv.contains("agentapi send-message --title xmsg@test-host · claude-orch"));
+    assert!(captured_argv.contains("agentapi send-message --title claude-orch · anon@test-host"));
     assert!(captured_argv.contains(conv_id));
-    assert!(captured_argv.contains(&format!("[xmsg] from=xmsg@test-host · claude-orch message_id={msg_id} — reply with the xmsg reply tool\n\nHello Antigravity session!")));
+    assert!(captured_argv.contains(&format!("[xmsg] from=claude-orch · anon@test-host message_id={msg_id} — reply with the xmsg reply tool\n\nHello Antigravity session!")));
     assert!(
         !captured_argv.contains("super-secret-token-xyz"),
         "Security Invariant: CSRF token MUST NOT appear in argv"

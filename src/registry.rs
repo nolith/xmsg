@@ -172,7 +172,8 @@ impl From<SessionFileEntry> for Session {
     fn from(entry: SessionFileEntry) -> Self {
         Self {
             session_id: entry.session_id,
-            name: entry.name,
+            // A label containing `@` or `·` is dropped; the session stays listed (AM-8).
+            name: entry.name.as_deref().and_then(crate::inbox::clean_label),
             pid: entry.pid,
             cwd: entry.cwd,
             status: entry.status,

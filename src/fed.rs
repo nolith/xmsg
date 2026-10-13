@@ -1613,6 +1613,20 @@ pub enum FedPrincipal {
 }
 
 impl FedPrincipal {
+    /// A12's render of this principal as a sender on `node`: `label · id@node` for a
+    /// session, `name@node` for a service, `<from> · anon@node` for an anonymous sender.
+    pub fn label(&self, node: &str) -> String {
+        match self {
+            FedPrincipal::Session {
+                harness,
+                session_id,
+                name,
+            } => inbox::sender_label(node, harness, session_id, Some(name)),
+            FedPrincipal::Service { name } => inbox::sender_label(node, "svc", name, None),
+            FedPrincipal::Anonymous { from } => format!("{from} · anon@{node}"),
+        }
+    }
+
     pub fn badge(&self) -> String {
         match self {
             FedPrincipal::Session { harness, name, .. } if !name.is_empty() => {
@@ -2149,7 +2163,7 @@ async fn fed_send_message_handler(
                 id: envelope.id.clone(),
                 created_at: envelope.created_at,
                 session_id: target_ref.to_string(),
-                from_name: format!("xmsg@{} · {}", peer.name, envelope.principal.badge()),
+                from_name: envelope.principal.label(&peer.name),
                 bytes: envelope.body.len(),
                 outcome: outcome.to_string(),
                 recipient_harness: "fed".to_string(),
@@ -2226,7 +2240,7 @@ async fn fed_send_message_handler(
                         return Err(AppError::BadRequest(format!("invalid harness '{harness}'")));
                     }
                     let sanitized =
-                        inbox::sanitize_attested_from(effective_origin_peer, harness, name);
+                        inbox::sender_label(effective_origin_peer, harness, session_id, Some(name));
                     (sanitized, Some(harness.clone()), Some(session_id.clone()))
                 }
                 FedPrincipal::Service { name } => {
@@ -2236,7 +2250,7 @@ async fn fed_send_message_handler(
                             "invalid service name '{name}'"
                         )));
                     }
-                    let badge = format!("xmsg@{} · svc:{}", effective_origin_peer, name);
+                    let badge = inbox::sender_label(effective_origin_peer, "svc", name, None);
                     (badge, Some("svc".to_string()), Some(name.clone()))
                 }
                 FedPrincipal::Anonymous { from } => {
@@ -2304,7 +2318,8 @@ async fn fed_send_message_handler(
             if !matches!(harness.as_str(), "claude" | "agy" | "pi" | "svc") {
                 return Err(AppError::BadRequest(format!("invalid harness '{harness}'")));
             }
-            let sanitized = inbox::sanitize_attested_from(effective_origin_peer, harness, name);
+            let sanitized =
+                inbox::sender_label(effective_origin_peer, harness, session_id, Some(name));
             (sanitized, Some(harness.clone()), Some(session_id.clone()))
         }
         FedPrincipal::Service { name } => {
@@ -2314,7 +2329,7 @@ async fn fed_send_message_handler(
                     "invalid service name '{name}'"
                 )));
             }
-            let badge = format!("xmsg@{} · svc:{}", effective_origin_peer, name);
+            let badge = inbox::sender_label(effective_origin_peer, "svc", name, None);
             (badge, Some("svc".to_string()), Some(name.clone()))
         }
         FedPrincipal::Anonymous { from } => {
@@ -2803,8 +2818,12 @@ async fn fed_reply_handler(
         let ret_harness = orig_msg.return_harness.unwrap();
         let ret_session_id = orig_msg.return_session_id.unwrap();
 
-        let replier_badge =
-            inbox::sanitize_attested_from(&peer.name, &reply.replier.harness, &reply.replier.name);
+        let replier_badge = inbox::sender_label(
+            &peer.name,
+            &reply.replier.harness,
+            &reply.replier.session_id,
+            Some(&reply.replier.name),
+        );
 
         let push_res = deliver_federated_reply_locally(
             &fed_state,
@@ -3393,25 +3412,7 @@ pub async fn send_federated_message(
     let peer_name = peer.name.as_str();
 
     if peer.leaf {
-        let from_name = match &envelope.principal {
-            FedPrincipal::Session {
-                harness,
-                session_id,
-                name,
-            } => {
-                if !name.is_empty() {
-                    format!("xmsg@{} · {}:{}", fed_state.node_name, harness, name)
-                } else {
-                    format!("xmsg@{} · {}:{}", fed_state.node_name, harness, session_id)
-                }
-            }
-            FedPrincipal::Service { name } => {
-                format!("xmsg@{} · svc:{}", fed_state.node_name, name)
-            }
-            FedPrincipal::Anonymous { from } => {
-                format!("xmsg@{} · {}", fed_state.node_name, from)
-            }
-        };
+        let from_name = envelope.principal.label(&fed_state.node_name);
         return queue_leaf_mailbox_message(
             fed_state,
             peer_name,
@@ -3958,8 +3959,12 @@ pub fn spawn_outbound_reply_poller(
                                 let reply_id = r
                                     .pushed_message_id
                                     .unwrap_or_else(|| format!("{}-{}", message_id, r.seq));
-                                let replier_badge =
-                                    format!("xmsg@{peer_name} · {}", r.replier_session_id);
+                                let replier_badge = inbox::sender_label(
+                                    &peer_name,
+                                    "",
+                                    &r.replier_session_id,
+                                    None,
+                                );
 
                                 match deliver_federated_reply_locally(
                                     &fed_state,

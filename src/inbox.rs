@@ -55,22 +55,23 @@ pub struct DeliveryResponse {
     pub outcome: Option<String>,
 }
 
-/// The most characters of a sender's self-described label that a label shows. Only that
-/// part is bounded: the attested part (`xmsg@<node>`) is always emitted whole (A12).
+/// The longest label shown, in characters. Only the label is cut; the attested
+/// `id@node` part is never truncated.
 pub const LABEL_MAX_CHARS: usize = 64;
 
-/// Sanitizes the `from` parameter for unauthenticated HTTP senders:
-/// - Rejects ':' and '/' outright (returns AppError::BadSender).
+/// Sanitizes the `from` parameter for unauthenticated HTTP senders and renders A12's
+/// anonymous label, `<from> · anon@<node>`:
+/// - Rejects ':', '/' and '@' outright (returns AppError::BadSender); '@' could imitate
+///   the attested part (AM-8), and '·' is already refused as non-ASCII.
 /// - Enforces strictly printable ASCII characters (0x20 to 0x7E).
 /// - Strips quotes (") and angle brackets (<, >).
 /// - Collapses whitespace runs to a single space.
 /// - Trims leading and trailing whitespace.
-/// - Truncates the name to `LABEL_MAX_CHARS` and prefixes `xmsg@<node-name> · `, which is
-///   never cut: the result is at most `LABEL_MAX_CHARS + 8` characters plus the node name.
+/// - Truncates the name to `LABEL_MAX_CHARS` and appends ` · anon@<node-name>`.
 pub fn sanitize_from(node_name: &str, raw_from: &str) -> Result<String, AppError> {
-    if raw_from.contains(':') || raw_from.contains('/') {
+    if raw_from.contains(':') || raw_from.contains('/') || raw_from.contains('@') {
         return Err(AppError::BadSender(
-            "sender name cannot contain ':' or '/'".to_string(),
+            "sender name cannot contain ':', '/' or '@'".to_string(),
         ));
     }
 
@@ -107,20 +108,23 @@ pub fn sanitize_from(node_name: &str, raw_from: &str) -> Result<String, AppError
     }
 
     let label: String = trimmed.chars().take(LABEL_MAX_CHARS).collect();
-    Ok(format!("xmsg@{node_name} · {}", label.trim_end()))
+    Ok(format!("{} · anon@{node_name}", label.trim_end()))
 }
 
-/// Sanitizes an attested caller session name and formats the attested badge:
-/// `xmsg@<node-name> · <harness>:<cleaned_caller_name>`.
-/// - Strips `"`, `<`, `>`, `\n`, `\r`, and Unicode categories Cc, Cf, Cs, Zl, Zp.
-/// - Collapses whitespace runs to a single space.
-/// - Trims leading and trailing whitespace.
-/// - Caps the name to `LABEL_MAX_CHARS`; `xmsg@<node-name> · <harness>:` is never cut.
-pub fn sanitize_attested_from(node_name: &str, harness: &str, caller_name: &str) -> String {
-    let mut cleaned = String::with_capacity(caller_name.len());
+/// A sender's own label, cleaned for display, or `None` when it shows no label.
+/// A label containing `@` or `·` is dropped whole, so it cannot imitate the attested
+/// `id@node` part (AM-8; plan §6 D8). Otherwise it is cleaned: `"`, `<`, `>`, CR and LF
+/// and the Unicode categories Cc, Cf, Cs, Zl and Zp are stripped, any other non-ASCII
+/// character becomes `_`, whitespace runs collapse to one space, the ends are trimmed,
+/// and it is cut to `LABEL_MAX_CHARS`.
+pub fn clean_label(raw: &str) -> Option<String> {
+    if raw.contains('@') || raw.contains('·') {
+        return None;
+    }
+    let mut cleaned = String::with_capacity(raw.len());
     let mut prev_whitespace = false;
 
-    for c in caller_name.chars() {
+    for c in raw.chars() {
         if c == '"' || c == '<' || c == '>' || c == '\n' || c == '\r' {
             continue;
         }
@@ -154,18 +158,30 @@ pub fn sanitize_attested_from(node_name: &str, harness: &str, caller_name: &str)
         }
     }
 
-    let trimmed = cleaned.trim();
-    let name_part = if trimmed.is_empty() { "agent" } else { trimmed };
-    let harness_prefix = format!("{harness}:");
-    let name_stripped = name_part.strip_prefix(&harness_prefix).unwrap_or(name_part);
-    let name_final = if name_stripped.is_empty() {
-        "agent"
+    let capped: String = cleaned.trim().chars().take(LABEL_MAX_CHARS).collect();
+    let capped = capped.trim_end();
+    if capped.is_empty() {
+        None
     } else {
-        name_stripped
-    };
+        Some(capped.to_string())
+    }
+}
 
-    let label: String = name_final.chars().take(LABEL_MAX_CHARS).collect();
-    format!("xmsg@{node_name} · {harness}:{}", label.trim_end())
+/// A12's one render of an attested local sender, as its receiver sees it:
+/// - a service: `name@node`, all of it attested (its `id` is its name);
+/// - an instance: `label · id@node`, where `id` is the instance address, a fork's `~n`
+///   included, and `label` is the sender's own description; `id@node` alone when the
+///   sender has no label, or one `clean_label` drops.
+///
+/// The harness is not shown.
+pub fn sender_label(node_name: &str, harness: &str, id: &str, label: Option<&str>) -> String {
+    if harness == "svc" {
+        return format!("{id}@{node_name}");
+    }
+    match label.and_then(clean_label).filter(|l| l != id) {
+        Some(label) => format!("{label} · {id}@{node_name}"),
+        None => format!("{id}@{node_name}"),
+    }
 }
 
 /// Sanitizes the message body:

@@ -364,8 +364,10 @@ async fn test_gate_probe_b3_attested_name_sanitization_and_envelope_integrity() 
     // Check delivery fromName cap: the attested prefix whole, the name part <= 64 chars
     let from_name = send_resp["delivery"]["fromName"].as_str().unwrap();
     let name_part = from_name
-        .strip_prefix("xmsg@test-host · pi:")
-        .expect("attested prefix whole");
+        .split(" · ")
+        .next()
+        .filter(|_| from_name.ends_with("@test-host"))
+        .expect("label · <id>@test-host, the attested part whole");
     assert!(
         name_part.chars().count() <= xmsg::inbox::LABEL_MAX_CHARS,
         "the attested name part must be <= 64 characters, got {}",

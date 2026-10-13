@@ -153,13 +153,13 @@ async fn test_anonymous_label_keeps_long_node_name_whole() {
     assert_eq!(res.status(), reqwest::StatusCode::ACCEPTED);
 
     let from_name = received_from_name(&node).await;
-    let attested = format!("xmsg@{LONG_NODE} · ");
+    let attested = format!(" · anon@{LONG_NODE}");
     assert!(
-        from_name.starts_with(&attested),
+        from_name.ends_with(&attested),
         "the attested node name must arrive whole: {from_name}"
     );
     assert_eq!(
-        from_name[attested.len()..],
+        from_name[..from_name.len() - attested.len()],
         "a".repeat(LABEL_MAX_CHARS),
         "only the self-described label is bounded"
     );
@@ -180,13 +180,13 @@ async fn test_attested_label_keeps_long_node_name_whole() {
     assert_eq!(resp["status"], "ok", "{resp}");
 
     let from_name = received_from_name(&node).await;
-    let attested = format!("xmsg@{LONG_NODE} · claude:");
+    let attested = format!(" · cap-session@{LONG_NODE}");
     assert!(
-        from_name.starts_with(&attested),
+        from_name.ends_with(&attested),
         "the attested node name must arrive whole: {from_name}"
     );
     assert_eq!(
-        from_name[attested.len()..],
+        from_name[..from_name.len() - attested.len()],
         "b".repeat(LABEL_MAX_CHARS),
         "only the self-described label is bounded"
     );

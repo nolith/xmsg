@@ -300,7 +300,7 @@ async fn test_e2e_post_message_accepted_202() {
     assert_eq!(res.status(), reqwest::StatusCode::ACCEPTED);
     let deliv: serde_json::Value = res.json().await.unwrap();
     assert_eq!(deliv["sessionId"], "live-session-1234");
-    assert_eq!(deliv["fromName"], "xmsg@test-host · claude");
+    assert_eq!(deliv["fromName"], "claude · anon@test-host");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     let lines = harness.received_lines.lock().await;
@@ -314,7 +314,7 @@ async fn test_e2e_post_message_accepted_202() {
     assert!(parsed
         .message
         .content
-        .contains("from-name=\"xmsg@test-host · claude\""));
+        .contains("from-name=\"claude · anon@test-host\""));
 }
 
 #[tokio::test]

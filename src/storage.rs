@@ -123,9 +123,27 @@ pub fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn init_db(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
+/// Schema N: the first schema that records its version (`PRAGMA user_version`).
+/// Neither the deployed `ee1b6ca` nor any build before it set one, so they read 0.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// The tables that hold message state. A database below schema N has them in an
+/// older shape, and the migration drops them with their rows (limited release).
+/// `replies` references `messages`, so it is dropped first: with foreign keys on, dropping
+/// a parent that still has child rows fails.
+const MESSAGE_STATE_TABLES: &[&str] = &[
+    "replies",
+    "messages",
+    "outbound",
+    "pi_pending_messages",
+    "agy_pending_messages",
+    "svc_pending_messages",
+    "idempotency_keys",
+    "peer_mailbox",
+    "forwarded_messages",
+];
+
+const SCHEMA_N: &str = r#"
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
             created_at INTEGER NOT NULL,
@@ -260,109 +278,31 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL,
             PRIMARY KEY (id, pid1, proc_start1, pid2, proc_start2, recipient_pid, recipient_proc_start)
         );
-        "#,
-    )?;
+        "#;
 
-    // Migration check: ensure recipient_harness and return_address columns exist on existing messages tables
-    let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
-    let mut rows = stmt.query([])?;
-    let mut has_recipient_harness = false;
-    let mut has_return_harness = false;
-    let mut has_return_session_id = false;
-    let mut has_push_replies = false;
-    let mut has_thread_id = false;
-    let mut has_return_host = false;
-    let mut has_columns = false;
-    while let Some(row) = rows.next()? {
-        has_columns = true;
-        let col_name: String = row.get(1)?;
-        match col_name.as_str() {
-            "recipient_harness" => has_recipient_harness = true,
-            "return_harness" => has_return_harness = true,
-            "return_session_id" => has_return_session_id = true,
-            "push_replies" => has_push_replies = true,
-            "thread_id" => has_thread_id = true,
-            "return_host" => has_return_host = true,
-            _ => {}
-        }
+/// Opens a database at schema N. A database already at N is used as it is; one below N
+/// (the deployed `ee1b6ca` schema, or none at all) has its message state dropped and is
+/// created at N in one transaction; one above N is refused.
+pub fn init_db(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
     }
-    if has_columns {
-        if !has_recipient_harness {
-            conn.execute(
-                "ALTER TABLE messages ADD COLUMN recipient_harness TEXT NOT NULL DEFAULT 'claude'",
-                [],
-            )?;
-        }
-        if !has_return_harness {
-            conn.execute("ALTER TABLE messages ADD COLUMN return_harness TEXT", [])?;
-        }
-        if !has_return_session_id {
-            conn.execute("ALTER TABLE messages ADD COLUMN return_session_id TEXT", [])?;
-        }
-        if !has_push_replies {
-            conn.execute(
-                "ALTER TABLE messages ADD COLUMN push_replies INTEGER NOT NULL DEFAULT 1",
-                [],
-            )?;
-        }
-        if !has_thread_id {
-            conn.execute(
-                "ALTER TABLE messages ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''",
-                [],
-            )?;
-        }
-        if !has_return_host {
-            conn.execute(
-                "ALTER TABLE messages ADD COLUMN return_host TEXT NOT NULL DEFAULT ''",
-                [],
-            )?;
-        }
+    if version > SCHEMA_VERSION {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+            Some(format!(
+                "database schema version {version} is newer than this xmsg (schema {SCHEMA_VERSION})"
+            )),
+        ));
     }
-
-    // Migration check: ensure push_outcome and pushed_message_id exist on replies table
-    let mut stmt = conn.prepare("PRAGMA table_info(replies)")?;
-    let mut rows = stmt.query([])?;
-    let mut has_push_outcome = false;
-    let mut has_pushed_message_id = false;
-    let mut has_reply_columns = false;
-    while let Some(row) = rows.next()? {
-        has_reply_columns = true;
-        let col_name: String = row.get(1)?;
-        match col_name.as_str() {
-            "push_outcome" => has_push_outcome = true,
-            "pushed_message_id" => has_pushed_message_id = true,
-            _ => {}
-        }
+    let tx = conn.unchecked_transaction()?;
+    for table in MESSAGE_STATE_TABLES {
+        tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
     }
-    if has_reply_columns {
-        if !has_push_outcome {
-            conn.execute("ALTER TABLE replies ADD COLUMN push_outcome TEXT", [])?;
-        }
-        if !has_pushed_message_id {
-            conn.execute("ALTER TABLE replies ADD COLUMN pushed_message_id TEXT", [])?;
-        }
-    }
-
-    // Migration check: ensure origin exists on svc_pending_messages table
-    let mut stmt = conn.prepare("PRAGMA table_info(svc_pending_messages)")?;
-    let mut rows = stmt.query([])?;
-    let mut has_origin = false;
-    let mut has_svc_pending_columns = false;
-    while let Some(row) = rows.next()? {
-        has_svc_pending_columns = true;
-        let col_name: String = row.get(1)?;
-        if col_name == "origin" {
-            has_origin = true;
-        }
-    }
-    if has_svc_pending_columns && !has_origin {
-        conn.execute(
-            "ALTER TABLE svc_pending_messages ADD COLUMN origin TEXT NOT NULL DEFAULT '{\"kind\":\"anonymous\"}'",
-            [],
-        )?;
-    }
-
-    Ok(())
+    tx.execute_batch(SCHEMA_N)?;
+    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    tx.commit()
 }
 
 pub fn insert_message(conn: &Connection, msg: &MessageRecord) -> Result<()> {

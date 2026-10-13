@@ -122,6 +122,15 @@ pub(crate) enum ResolvedTarget {
 }
 
 impl ResolvedTarget {
+    pub(crate) fn session(&self) -> &registry::Session {
+        match self {
+            ResolvedTarget::Claude(s, _)
+            | ResolvedTarget::Agy(s)
+            | ResolvedTarget::Pi(s)
+            | ResolvedTarget::Svc(s) => s,
+        }
+    }
+
     pub(crate) fn from_session(session: registry::Session) -> Self {
         match session.harness.as_str() {
             "svc" => ResolvedTarget::Svc(session),
@@ -132,6 +141,16 @@ impl ResolvedTarget {
     }
 }
 
+/// Local resolution of a send's target (A11, A7, D-4), one order for every surface:
+///
+/// 1. An instance ID: a Claude `X~n`, bare `X` or pid, then an agy or pi ID or pid.
+///    A bare X with only `X~n` forks live is `ambiguous` (D-4).
+/// 2. A name, among services first (A11): a service carrying it wins, whatever any
+///    instance is labelled.
+/// 3. Only when no service has it, instance labels, and only a unique one (A7): two
+///    live instances labelled alike are `ambiguous`, listing each `id@node`.
+/// 4. Otherwise, why nothing live carries it: `gone`, `unregistered` or `not_found`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_target(
     sessions_dirs: &[PathBuf],
     agy_config: &crate::agy::AgyConfig,
@@ -142,69 +161,87 @@ pub(crate) async fn resolve_target(
     node_name: &str,
     ref_str: &str,
 ) -> Result<ResolvedTarget, AppError> {
+    let proc_root = &agy_config.proc_root;
     let claude_ref = ref_str
         .strip_prefix("claude:")
         .or_else(|| ref_str.strip_prefix("session:"))
         .unwrap_or(ref_str);
 
-    let claude_res = crate::claim::resolve_claude_session_and_deliver(
-        db,
-        &agy_config.proc_root,
-        sessions_dirs,
-        node_name,
-        claude_ref,
-    )
-    .await;
+    // One claim scan answers the Claude half of every step.
+    let (claude_by_id, claude_labelled, claude_absence) =
+        crate::claim::with_claims(db, proc_root, sessions_dirs, node_name, |conn, pairs| {
+            (
+                crate::claim::resolve_claude_id_in(conn, pairs, node_name, claude_ref),
+                crate::claim::claude_label_matches(pairs, claude_ref),
+                crate::claim::claude_absence_in(conn, sessions_dirs, claude_ref),
+            )
+        })
+        .await?;
 
-    match claude_res {
-        Ok((session, socket_path)) => Ok(ResolvedTarget::Claude(session, socket_path)),
-        Err(AppError::Gone { session_id, pid }) => {
-            if crate::process::starttime(&agy_config.proc_root, pid).is_ok() {
-                if let Some(session) =
-                    crate::agy::resolve_agy_session(agy_config, agy_store, ref_str)?
-                {
-                    return Ok(ResolvedTarget::Agy(session));
-                }
-                let pi_ref = ref_str.strip_prefix("pi:").unwrap_or(ref_str);
-                if let Some(session) =
-                    crate::pi::resolve_pi_session(&agy_config.proc_root, pi_store, pi_ref)?
-                {
-                    return Ok(ResolvedTarget::Pi(session));
-                }
-                if let Some(session) =
-                    crate::svc::resolve_svc_session(&agy_config.proc_root, svc_store, ref_str)?
-                {
-                    return Ok(ResolvedTarget::Svc(session));
-                }
-                return Err(AppError::Unregistered(pid));
-            }
-            Err(AppError::Gone { session_id, pid })
+    // 1. Instance IDs.
+    if let Some(res) = claude_by_id {
+        return res.map(|(session, sock)| ResolvedTarget::Claude(session, sock));
+    }
+    if let Some(session) = crate::agy::resolve_agy_session(agy_config, agy_store, ref_str)? {
+        return Ok(ResolvedTarget::Agy(session));
+    }
+    let pi_ref = ref_str.strip_prefix("pi:").unwrap_or(ref_str);
+    let pi_sessions =
+        crate::pi::list_pi_sessions(proc_root, pi_store, &registry::SessionsQuery::default());
+    let pi_pid = pi_ref.parse::<u32>().ok();
+    if let Some(session) = pi_sessions
+        .iter()
+        .find(|s| s.session_id.eq_ignore_ascii_case(pi_ref) || Some(s.pid) == pi_pid)
+    {
+        return Ok(ResolvedTarget::Pi(session.clone()));
+    }
+
+    // 2. A name: services first (A11).
+    if let Some(session) = crate::svc::resolve_svc_session(proc_root, svc_store, ref_str)? {
+        return Ok(ResolvedTarget::Svc(session));
+    }
+
+    // 3. Instance labels, unique only (A7).
+    let mut labelled: Vec<ResolvedTarget> = claude_labelled
+        .into_iter()
+        .map(|(session, sock)| ResolvedTarget::Claude(session, sock))
+        .collect();
+    labelled.extend(
+        pi_sessions
+            .into_iter()
+            .filter(|s| {
+                s.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(pi_ref))
+            })
+            .map(ResolvedTarget::Pi),
+    );
+    match labelled.len() {
+        0 => {}
+        1 => return Ok(labelled.remove(0)),
+        _ => {
+            let candidates: Vec<String> = labelled
+                .iter()
+                .map(|t| format!("{}@{node_name}", t.session().session_id))
+                .collect();
+            return Err(AppError::Ambiguous(candidates.join(", ")));
         }
-        Err(AppError::Ambiguous(ids)) => Err(AppError::Ambiguous(ids)),
-        Err(AppError::NotFound(_)) => {
-            if let Some(session) = crate::agy::resolve_agy_session(agy_config, agy_store, ref_str)?
-            {
-                return Ok(ResolvedTarget::Agy(session));
-            }
-            let pi_ref = ref_str.strip_prefix("pi:").unwrap_or(ref_str);
-            if let Some(session) =
-                crate::pi::resolve_pi_session(&agy_config.proc_root, pi_store, pi_ref)?
-            {
-                return Ok(ResolvedTarget::Pi(session));
-            }
-            if let Some(session) =
-                crate::svc::resolve_svc_session(&agy_config.proc_root, svc_store, ref_str)?
-            {
-                return Ok(ResolvedTarget::Svc(session));
-            }
+    }
+
+    // 4. Nothing live carries it.
+    match claude_absence {
+        AppError::Gone { pid, .. } if crate::process::starttime(proc_root, pid).is_ok() => {
+            Err(AppError::Unregistered(pid))
+        }
+        AppError::NotFound(_) => {
             if let Ok(pid) = ref_str.parse::<u32>() {
-                if crate::process::starttime(&agy_config.proc_root, pid).is_ok() {
+                if crate::process::starttime(proc_root, pid).is_ok() {
                     return Err(AppError::Unregistered(pid));
                 }
             }
             Err(AppError::NotFound(ref_str.to_string()))
         }
-        Err(err) => Err(err),
+        other => Err(other),
     }
 }
 
@@ -343,7 +380,7 @@ async fn send_message_handler(
     let (from_name, fed_principal, idempotency_principal) = if state.is_leaf() {
         let p_str = state.leaf_principal().expect("leaf_principal in leaf mode");
         let p = crate::fed::parse_fed_principal(p_str)?;
-        let name = format!("xmsg@{} · {}", state.node_name, p_str);
+        let name = p.label(&state.node_name);
         (name, p, p_str.to_string())
     } else {
         // Sanitize sender name (enforces printable ASCII and rejects ':' and '/')

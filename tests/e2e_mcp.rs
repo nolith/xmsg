@@ -405,7 +405,7 @@ async fn test_mcp_send_and_reply_with_derived_caller() {
     assert_eq!(delivery_json["sessionId"], "sess-target-5000");
     assert_eq!(
         delivery_json["fromName"],
-        "xmsg@test-host · claude:calling-orchestrator"
+        "calling-orchestrator · sess-caller-6000@test-host"
     );
 
     // Check socket delivery to target-agent
@@ -416,7 +416,7 @@ async fn test_mcp_send_and_reply_with_derived_caller() {
     assert!(inbox_line
         .message
         .content
-        .contains("from-name=\"xmsg@test-host · claude:calling-orchestrator\""));
+        .contains("from-name=\"calling-orchestrator · sess-caller-6000@test-host\""));
     assert!(inbox_line
         .message
         .content

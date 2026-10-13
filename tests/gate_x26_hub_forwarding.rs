@@ -411,7 +411,7 @@ async fn test_oracle_1_relay_and_reply() {
         // name, which is what the hub put on the wire.
         let node_a_name = xmsg::node::node_name_from_pin(&pin_a).unwrap();
         assert!(
-            b_msg.contains(&format!("xmsg@{node_a_name} · claude:Alice")),
+            b_msg.contains(&format!("Alice · alice@{node_a_name}")),
             "Bob should see origin showing node-a's canonical name {node_a_name}: {b_msg}"
         );
 
@@ -441,7 +441,7 @@ async fn test_oracle_1_relay_and_reply() {
             "Alice should see reply text: {a_reply}"
         );
         assert!(
-            a_reply.contains("claude:Bob"),
+            a_reply.contains("Bob · bob@"),
             "Alice should see origin of reply from Bob: {a_reply}"
         );
     })

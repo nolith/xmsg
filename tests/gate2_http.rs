@@ -152,7 +152,7 @@ async fn gate2_http_prefix() {
     // 1. Control arm: legitimate ASCII sender
     let (st, v) = post_from(&h.base_url, "claude").await;
     assert_eq!(st, reqwest::StatusCode::ACCEPTED);
-    assert_eq!(v["fromName"], "xmsg@test-host · claude");
+    assert_eq!(v["fromName"], "claude · anon@test-host");
 
     // 2. B1 arms: reserved prefix variations and bypasses
     for from in [

@@ -18,7 +18,7 @@ use xmsg::fed::{
 };
 use xmsg::http::AppState;
 use xmsg::pi::new_pi_store;
-use xmsg::storage::{self, SvcOrigin};
+use xmsg::storage;
 use xmsg::svc::new_svc_store;
 
 fn setup_mock_proc(proc_root: &Path, pid: u32, exe_target: &Path, starttime: &str) {
@@ -738,12 +738,12 @@ async fn test_oracle_3_text_containing_fake_origin_still_reads_fed() {
 }
 
 // =============================================================================
-// Oracle 4: A row queued before the migration is delivered with the default
-// origin ("anonymous"), not dropped.
-// Mutant: no default => RED.
+// Oracle 4 (as amended by XA3's schema N): a row queued before the migration is
+// dropped with the rest of the pre-schema-N message state, and the table comes back
+// with its origin column. Schema N's own oracle is gate_xa3_core oracle 9.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_oracle_4_pre_migration_row_delivered_with_default_anonymous_origin() {
+async fn test_oracle_4_pre_migration_row_dropped_by_schema_n() {
     let temp = tempdir().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
 
@@ -808,138 +808,11 @@ async fn test_oracle_4_pre_migration_row_delivered_with_default_anonymous_origin
         );
     }
 
-    // 4. Retrieve pending message: MUST NOT be dropped, and origin MUST be Anonymous
+    // 4. Schema N (XA3) supersedes this column migration: a database below schema N has
+    //    its message state dropped, so the pre-migration row is gone, not delivered.
     let retrieved = storage::get_next_pending_svc_message(&conn, &target_session_id).unwrap();
     assert!(
-        retrieved.is_some(),
-        "pre-migration row must not be dropped by migration"
-    );
-
-    let msg = retrieved.unwrap();
-    assert_eq!(msg.id, pre_msg_id);
-    assert_eq!(msg.text, "pre-migration text");
-    assert_eq!(
-        msg.origin,
-        SvcOrigin::Anonymous,
-        "pre-migration row must default to SvcOrigin::Anonymous"
-    );
-
-    // 5. Test delivery over register.sock long-poll loop
-    let sock_dir = temp.path().join("xmsg");
-    fs::create_dir_all(&sock_dir).unwrap();
-    fs::set_permissions(&sock_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    let reg_sock = sock_dir.join("register.sock");
-
-    let proc_root = temp.path().join("proc");
-    let sessions_dir = temp.path().join("sessions");
-    let presence_dir = temp.path().join("presence");
-    let proc_locks = temp.path().join("locks");
-
-    fs::create_dir_all(&proc_root).unwrap();
-    fs::create_dir_all(&sessions_dir).unwrap();
-    fs::create_dir_all(&presence_dir).unwrap();
-    fs::write(&proc_locks, "").unwrap();
-
-    let trusted_bin = temp.path().join("trusted_dispatcher");
-    fs::write(&trusted_bin, "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&trusted_bin, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let mut trusted_svc_exes: HashMap<String, PathBuf> = HashMap::new();
-    trusted_svc_exes.insert(service_name.to_string(), trusted_bin.clone());
-
-    let my_pid = std::process::id();
-    let my_uid = current_uid();
-    setup_mock_proc(&proc_root, my_pid, &trusted_bin, "100000");
-
-    let db_arc = Arc::new(Mutex::new(conn));
-    let (pi_notify_tx, _) = tokio::sync::broadcast::channel(16);
-    let (svc_notify_tx, _) = tokio::sync::broadcast::channel(16);
-
-    let agy_config = AgyConfig {
-        presence_dir,
-        proc_locks_path: proc_locks,
-        proc_root,
-        agy_bin: "agy".to_string(),
-        trusted_agy_exes: Vec::new(),
-    };
-    let agy_store = new_agy_store();
-    let pi_store = new_pi_store();
-    let svc_store = new_svc_store();
-
-    let r_sock = reg_sock.clone();
-    let r_cfg = agy_config.clone();
-    let r_ast = agy_store.clone();
-    let r_pst = pi_store.clone();
-    let r_sst = svc_store.clone();
-    let r_db = db_arc.clone();
-    let r_pi_not = pi_notify_tx.clone();
-    let r_svc_not = svc_notify_tx.clone();
-
-    tokio::spawn(async move {
-        let _ = run_register_server(
-            r_sock,
-            r_cfg,
-            r_ast,
-            r_pst,
-            r_db,
-            r_pi_not,
-            Duration::from_secs(3600),
-            my_uid,
-            r_sst,
-            trusted_svc_exes,
-            r_svc_not,
-            None,
-        )
-        .await;
-    });
-
-    for _ in 0..50 {
-        if reg_sock.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    // Connect daemon, register, and poll
-    let (mut daemon_reader, mut daemon_writer) = connect_svc(&reg_sock).await;
-    let reg_frame = serde_json::json!({
-        "harness": "svc",
-        "name": service_name,
-        "cwd": "/workspace"
-    });
-    daemon_writer
-        .write_all(format!("{reg_frame}\n").as_bytes())
-        .await
-        .unwrap();
-    let reg_resp = read_json_line(&mut daemon_reader).await;
-    assert_eq!(reg_resp.get("status").and_then(|s| s.as_str()), Some("ok"));
-
-    let poll_req = serde_json::json!({
-        "action": "poll",
-        "waitSecs": 5
-    });
-    daemon_writer
-        .write_all(format!("{poll_req}\n").as_bytes())
-        .await
-        .unwrap();
-
-    let deliver_frame = read_json_line(&mut daemon_reader).await;
-    assert_eq!(
-        deliver_frame.get("action").and_then(|a| a.as_str()),
-        Some("deliver")
-    );
-    assert_eq!(
-        deliver_frame.get("messageId").and_then(|m| m.as_str()),
-        Some(pre_msg_id)
-    );
-
-    // Origin delivered to client is Anonymous
-    let origin = deliver_frame
-        .get("origin")
-        .expect("deliver frame MUST contain 'origin' field");
-    assert_eq!(
-        origin.get("kind").and_then(|k| k.as_str()),
-        Some("anonymous"),
-        "origin kind must be 'anonymous' for pre-migration row"
+        retrieved.is_none(),
+        "a row from before schema N must be dropped by the migration"
     );
 }

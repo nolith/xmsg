@@ -259,22 +259,32 @@ async fn agent_rpc(agent_sock: &Path, payload: &serde_json::Value) -> serde_json
 
 #[test]
 fn test_u8_badge_formatting_invariants() {
-    // 1. Pi registration with no name yields a badge with exactly one `pi:`
-    let badge_no_name =
-        xmsg::inbox::sanitize_attested_from("bitstream", "pi", "pi:3022755:61971591");
-    assert_eq!(badge_no_name, "xmsg@bitstream · pi:3022755:61971591");
+    // A12's one render (XA3): `label · id@node` for an instance, `name@node` for a
+    // service. The harness is not shown.
+    let id = "6f1c2a7e-0b1d-4c2e-9a55-3d2f1e0c9b8a";
 
-    // 2. Pi registration with cwd display name
-    let badge_with_name = xmsg::inbox::sanitize_attested_from("bitstream", "pi", "nix-config");
-    assert_eq!(badge_with_name, "xmsg@bitstream · pi:nix-config");
+    // 1. An instance with no label shows its attested address alone.
+    let badge_no_name = xmsg::inbox::sender_label("bitstream", "pi", id, None);
+    assert_eq!(badge_no_name, format!("{id}@bitstream"));
 
-    // 3. Pi registration where name already had pi:
-    let badge_prefixed = xmsg::inbox::sanitize_attested_from("bitstream", "pi", "pi:nix-config");
-    assert_eq!(badge_prefixed, "xmsg@bitstream · pi:nix-config");
+    // 2. A label is shown apart from the attested address.
+    let badge_with_name = xmsg::inbox::sender_label("bitstream", "pi", id, Some("nix-config"));
+    assert_eq!(badge_with_name, format!("nix-config · {id}@bitstream"));
 
-    // 4. Claude badge
-    let badge_claude = xmsg::inbox::sanitize_attested_from("bitstream", "claude", "sess-123");
-    assert_eq!(badge_claude, "xmsg@bitstream · claude:sess-123");
+    // 3. A label carrying `@` or `·` is dropped whole (AM-8).
+    for spoof in ["x · y@z", "evil@bitstream", "a · b"] {
+        let badge = xmsg::inbox::sender_label("bitstream", "pi", id, Some(spoof));
+        assert_eq!(badge, format!("{id}@bitstream"), "{spoof}");
+    }
+
+    // 4. A Claude fork shows its `~n` address.
+    let badge_claude =
+        xmsg::inbox::sender_label("bitstream", "claude", &format!("{id}~2"), Some("sess"));
+    assert_eq!(badge_claude, format!("sess · {id}~2@bitstream"));
+
+    // 5. A service is `name@node`, all of it attested.
+    let badge_svc = xmsg::inbox::sender_label("bitstream", "svc", "genie-guard", None);
+    assert_eq!(badge_svc, "genie-guard@bitstream");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -338,7 +348,7 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         .unwrap();
     let b_msg: serde_json::Value = serde_json::from_str(&line_b).unwrap();
     let content_b = b_msg["message"]["content"].as_str().unwrap();
-    assert!(content_b.contains("from-name=\"xmsg@test-host · claude:alice\""));
+    assert!(content_b.contains("from-name=\"alice · sess-claude-a@test-host\""));
     assert!(content_b.contains("Hello Bob from Alice"));
 
     // Verify DB stored derived return address
@@ -384,7 +394,7 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         .unwrap();
     let a_msg: serde_json::Value = serde_json::from_str(&line_a).unwrap();
     let content_a = a_msg["message"]["content"].as_str().unwrap();
-    assert!(content_a.contains("from-name=\"xmsg@test-host · claude:bob\""));
+    assert!(content_a.contains("from-name=\"bob · sess-claude-b@test-host\""));
     let expected_header = format!(
         "[xmsg] reply to message_id={orig_msg_id} — message_id={pushed_msg_id}; reply with the xmsg reply tool\n\nHi Alice, loud and clear!"
     );
@@ -437,7 +447,7 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         .unwrap();
     let b_msg2: serde_json::Value = serde_json::from_str(&line_b2).unwrap();
     let content_b2 = b_msg2["message"]["content"].as_str().unwrap();
-    assert!(content_b2.contains("from-name=\"xmsg@test-host · claude:alice\""));
+    assert!(content_b2.contains("from-name=\"alice · sess-claude-a@test-host\""));
     let expected_b_header = format!(
         "[xmsg] reply to message_id={pushed_msg_id} — message_id={second_pushed_id}; reply with the xmsg reply tool\n\nGreat, conversation complete."
     );
@@ -859,7 +869,7 @@ async fn test_u8_cross_harness_push() {
         .await
         .unwrap()
         .unwrap();
-    assert!(line_b.contains("pi:pi-worker"));
+    assert!(line_b.contains("pi-worker · "));
 
     // Switch our test process to Claude B
     act_as_session(
@@ -1010,7 +1020,7 @@ async fn test_u8_cross_harness_claude_to_agy() {
         .await
         .unwrap()
         .unwrap();
-    assert!(line_a.contains("agy:conv-agy-88"));
+    assert!(line_a.contains("conv-agy-88@test-host"));
     assert!(line_a.contains("Hello Claude from Antigravity"));
 
     let _ = agy_child.kill();

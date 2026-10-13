@@ -367,9 +367,10 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let delivery: DeliveryResponse = resp.json().await.unwrap();
 
-    // Oracle 2 assertion: delivery from_name must be attributed to svc:matrix, NOT claude:impostor
+    // Oracle 2 assertion: delivery from_name must be attributed to the service matrix
+    // (A12: `matrix@<node>`), NOT claude:impostor
     assert!(
-        delivery.from_name.contains("svc:matrix"),
+        delivery.from_name.starts_with("matrix@"),
         "Oracle 2 violation: from_name must be attributed to svc:matrix, got: {}",
         delivery.from_name
     );

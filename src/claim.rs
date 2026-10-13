@@ -517,119 +517,167 @@ pub async fn sync_claims(
     .await
 }
 
-/// Resolves a Claude session reference against one scan's live pairs.
-pub fn resolve_claude_in(
+/// One live Claude instance, as resolution returns it: its session under its instance
+/// address, and its messaging socket.
+pub type ClaudeTarget = (Session, PathBuf);
+
+fn claude_target(claim: &InstanceClaim, entry: &SessionFileEntry) -> ClaudeTarget {
+    let mut session: Session = entry.clone().into();
+    session.session_id = claim.address();
+    (session, PathBuf::from(&entry.messaging_socket_path))
+}
+
+/// Resolves `ref_str` as a Claude instance ID against one scan's live pairs: `X~n`, a
+/// bare `X`, or a pid. `None` when it names no live or recorded Claude instance by ID.
+///
+/// A bare X while the plain ID is free and only `X~n` forks are live is `ambiguous`,
+/// listing each fork as `X~n@node` (D-4); it is never taken as not running.
+pub fn resolve_claude_id_in(
     conn: &Connection,
-    sessions_dirs: &(impl SessionDirs + ?Sized),
     active_pairs: &[(InstanceClaim, SessionFileEntry)],
+    node_name: &str,
     ref_str: &str,
-) -> Result<(Session, PathBuf), AppError> {
-    // 1. Check if ref_str specifies a fork suffix e.g. "X~2"
+) -> Option<Result<ClaudeTarget, AppError>> {
+    // 1. A fork address, "X~n".
     if let Some((base_id, suffix_str)) = ref_str.split_once('~') {
         if let Ok(suffix) = suffix_str.parse::<u32>() {
-            for (claim, entry) in active_pairs {
-                if claim.id == base_id && claim.suffix == suffix {
-                    let mut session: Session = entry.clone().into();
-                    session.session_id = claim.address();
-                    return Ok((session, PathBuf::from(&entry.messaging_socket_path)));
-                }
+            if let Some((claim, entry)) = active_pairs
+                .iter()
+                .find(|(c, _)| c.id == base_id && c.suffix == suffix)
+            {
+                return Some(Ok(claude_target(claim, entry)));
             }
-
-            // Check if it was ever registered and is now gone
-            let mut stmt = conn
-                .prepare("SELECT pid, released FROM instance_claims WHERE id = ?1 AND suffix = ?2 ORDER BY created_at DESC LIMIT 1")
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            let mut rows = stmt
-                .query(params![base_id, suffix])
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            if let Some(row) = rows.next().map_err(|e| AppError::Internal(e.to_string()))? {
-                let pid: u32 = row.get(0).map_err(|e| AppError::Internal(e.to_string()))?;
-                return Err(AppError::Gone {
+            // Recorded and released: the fork is gone.
+            let recorded = conn
+                .query_row(
+                    "SELECT pid FROM instance_claims WHERE id = ?1 AND suffix = ?2 ORDER BY created_at DESC LIMIT 1",
+                    params![base_id, suffix],
+                    |r| r.get::<_, u32>(0),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(AppError::Internal(e.to_string())),
+                });
+            return match recorded {
+                Ok(Some(pid)) => Some(Err(AppError::Gone {
                     session_id: ref_str.to_string(),
                     pid,
-                });
-            }
-
-            return Err(AppError::NotFound(ref_str.to_string()));
+                })),
+                Ok(None) => Some(Err(AppError::NotFound(ref_str.to_string()))),
+                Err(e) => Some(Err(e)),
+            };
         }
     }
 
-    // 2. Check for bare ID match
+    // 2. A bare ID.
     let id_matches: Vec<&(InstanceClaim, SessionFileEntry)> = active_pairs
         .iter()
         .filter(|(claim, entry)| claim.id == ref_str || entry.session_id == ref_str)
         .collect();
-
     if !id_matches.is_empty() {
-        if let Some((plain_claim, plain_entry)) = id_matches.iter().find(|(c, _)| c.suffix == 1) {
-            let mut session: Session = plain_entry.clone().into();
-            session.session_id = plain_claim.address();
-            return Ok((session, PathBuf::from(&plain_entry.messaging_socket_path)));
-        } else {
-            // Suffix 1 is free/dead, but active forks exist: ambiguous!
-            let candidates: Vec<String> = id_matches.iter().map(|(c, _)| c.address()).collect();
-            return Err(AppError::Ambiguous(candidates.join(", ")));
+        if let Some((claim, entry)) = id_matches.iter().find(|(c, _)| c.suffix == 1) {
+            return Some(Ok(claude_target(claim, entry)));
         }
+        let candidates: Vec<String> = id_matches
+            .iter()
+            .map(|(c, _)| format!("{}@{node_name}", c.address()))
+            .collect();
+        return Some(Err(AppError::Ambiguous(candidates.join(", "))));
     }
 
-    // 3. Check for PID match
+    // 3. A pid.
     if let Ok(pid) = ref_str.parse::<u32>() {
-        for (claim, entry) in active_pairs {
-            if entry.pid == pid {
-                let mut session: Session = entry.clone().into();
-                session.session_id = claim.address();
-                return Ok((session, PathBuf::from(&entry.messaging_socket_path)));
+        if let Some((claim, entry)) = active_pairs.iter().find(|(_, e)| e.pid == pid) {
+            return Some(Ok(claude_target(claim, entry)));
+        }
+    }
+    None
+}
+
+/// The live Claude instances whose label is `ref_str`. A label `inbox::clean_label`
+/// drops carries no name, so nothing resolves by it (AM-8).
+pub fn claude_label_matches(
+    active_pairs: &[(InstanceClaim, SessionFileEntry)],
+    ref_str: &str,
+) -> Vec<ClaudeTarget> {
+    active_pairs
+        .iter()
+        .filter(|(_, entry)| {
+            entry
+                .name
+                .as_deref()
+                .and_then(inbox::clean_label)
+                .as_deref()
+                == Some(ref_str)
+        })
+        .map(|(claim, entry)| claude_target(claim, entry))
+        .collect()
+}
+
+/// Why `ref_str` names no live Claude instance: `Gone` when it was claimed before or a
+/// dead session file still names it, `NotFound` otherwise.
+pub fn claude_absence_in(
+    conn: &Connection,
+    sessions_dirs: &(impl SessionDirs + ?Sized),
+    ref_str: &str,
+) -> AppError {
+    let recorded = conn.query_row(
+        "SELECT pid FROM instance_claims WHERE id = ?1 ORDER BY created_at DESC LIMIT 1",
+        params![ref_str],
+        |r| r.get::<_, u32>(0),
+    );
+    match recorded {
+        Ok(pid) => {
+            return AppError::Gone {
+                session_id: ref_str.to_string(),
+                pid,
             }
         }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(e) => return AppError::Internal(e.to_string()),
     }
 
-    // 4. Check for session name match
-    let name_matches: Vec<&(InstanceClaim, SessionFileEntry)> = active_pairs
-        .iter()
-        .filter(|(_, entry)| entry.name.as_deref() == Some(ref_str))
-        .collect();
-
-    if name_matches.len() == 1 {
-        let (claim, entry) = name_matches[0];
-        let mut session: Session = entry.clone().into();
-        session.session_id = claim.address();
-        return Ok((session, PathBuf::from(&entry.messaging_socket_path)));
-    } else if name_matches.len() > 1 {
-        let candidates: Vec<String> = name_matches.iter().map(|(c, _)| c.address()).collect();
-        return Err(AppError::Ambiguous(candidates.join(", ")));
-    }
-
-    // 5. If not active, check if this ID had a previous claim that is now gone
-    let mut stmt = conn
-        .prepare("SELECT pid FROM instance_claims WHERE id = ?1 ORDER BY created_at DESC LIMIT 1")
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let mut rows = stmt
-        .query(params![ref_str])
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    if let Some(row) = rows.next().map_err(|e| AppError::Internal(e.to_string()))? {
-        let pid: u32 = row.get(0).map_err(|e| AppError::Internal(e.to_string()))?;
-        return Err(AppError::Gone {
-            session_id: ref_str.to_string(),
-            pid,
-        });
-    }
-
-    // Check dead session files on disk
-    let raw_entries = registry::read_session_entries(sessions_dirs);
     let ref_pid = ref_str.parse::<u32>().ok();
-    for entry in raw_entries {
+    for entry in registry::read_session_entries(sessions_dirs) {
         if entry.session_id == ref_str
             || entry.name.as_deref() == Some(ref_str)
             || Some(entry.pid) == ref_pid
         {
-            return Err(AppError::Gone {
+            return AppError::Gone {
                 session_id: entry.session_id,
                 pid: entry.pid,
-            });
+            };
         }
     }
 
-    Err(AppError::NotFound(ref_str.to_string()))
+    AppError::NotFound(ref_str.to_string())
+}
+
+/// Resolves a Claude session reference against one scan's live pairs: by instance ID,
+/// then by a unique label, else why it is absent.
+pub fn resolve_claude_in(
+    conn: &Connection,
+    sessions_dirs: &(impl SessionDirs + ?Sized),
+    active_pairs: &[(InstanceClaim, SessionFileEntry)],
+    node_name: &str,
+    ref_str: &str,
+) -> Result<ClaudeTarget, AppError> {
+    if let Some(res) = resolve_claude_id_in(conn, active_pairs, node_name, ref_str) {
+        return res;
+    }
+    let mut labelled = claude_label_matches(active_pairs, ref_str);
+    match labelled.len() {
+        0 => Err(claude_absence_in(conn, sessions_dirs, ref_str)),
+        1 => Ok(labelled.remove(0)),
+        _ => Err(AppError::Ambiguous(
+            labelled
+                .iter()
+                .map(|(s, _)| format!("{}@{node_name}", s.session_id))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )),
+    }
 }
 
 pub async fn resolve_claude_session_and_deliver(
@@ -640,7 +688,7 @@ pub async fn resolve_claude_session_and_deliver(
     ref_str: &str,
 ) -> Result<(Session, PathBuf), AppError> {
     with_claims(db, proc_root, sessions_dirs, node_name, |conn, pairs| {
-        resolve_claude_in(conn, sessions_dirs, pairs, ref_str)
+        resolve_claude_in(conn, sessions_dirs, pairs, node_name, ref_str)
     })
     .await?
 }

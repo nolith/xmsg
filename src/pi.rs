@@ -78,7 +78,11 @@ pub fn list_pi_sessions(proc_root: &Path, store: &PiStore, query: &SessionsQuery
         }
         let session = Session {
             session_id: info.session_id.clone(),
-            name: info.name.clone().or_else(|| Some(info.session_id.clone())),
+            name: info
+                .name
+                .as_deref()
+                .and_then(crate::inbox::clean_label)
+                .or_else(|| Some(info.session_id.clone())),
             pid: info.pid,
             cwd: info.cwd.clone(),
             status: "idle".to_string(),

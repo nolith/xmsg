@@ -723,12 +723,11 @@ pub async fn run_agent_server(
                                 (Some(outcome_str.to_string()), Some(new_message_id))
                             } else {
                                 let new_message_id = ulid::Ulid::new().to_string();
-                                let replier_name =
-                                    caller.name.as_deref().unwrap_or(&caller.session_id);
-                                let replier_badge = inbox::sanitize_attested_from(
+                                let replier_badge = inbox::sender_label(
                                     &state_clone.node_name,
                                     &caller.harness,
-                                    replier_name,
+                                    &caller.session_id,
+                                    caller.name.as_deref(),
                                 );
 
                                 let push_res: Result<(), &'static str> = match ret_harness {
@@ -1152,12 +1151,14 @@ pub async fn run_agent_server(
                             continue;
                         }
 
-                        // Derive from_name: xmsg@<host> · <harness>:<name> (sanitized and capped to 64)
+                        // A12: `label · id@node`; the id is the caller's instance address, a
+                        // fork's `~n` included (D-5), never its session name.
                         let caller_name = caller.name.as_deref().unwrap_or(&caller.session_id);
-                        let from_name = inbox::sanitize_attested_from(
+                        let from_name = inbox::sender_label(
                             &state_clone.node_name,
                             &caller.harness,
-                            caller_name,
+                            &caller.session_id,
+                            caller.name.as_deref(),
                         );
 
                         // Check if target is cross-host
