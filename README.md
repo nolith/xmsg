@@ -181,14 +181,17 @@ Antigravity (`agy`) session credentials (`ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_
 
 #### Linux In-Process Command Watcher (Arm A) & Darwin Fallback (Arm B′)
 
-On Linux, `xmsg` registers `agy` conversations itself by actively watching descendant processes spawned by the attested `agy` process holding the conversation's presence lock. Because Antigravity injects `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN` solely into the environment of the tool commands executed by the model (`run_command`), and offers no other credential publication channel, `xmsg` monitors `/proc/<pid>/environ` of attested `agy` descendants on a 100ms interval.
+On Linux, `xmsg` registers `agy` conversations itself by actively watching descendant processes spawned by the attested `agy` process holding the conversation's presence lock. Because Antigravity injects `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN` solely into the environment of the tool commands executed by the model (`run_command`), and offers no other credential publication channel, `xmsg` reads `/proc/<pid>/environ` of the attested `agy` process's descendants.
+
+The watcher runs only for an armed conversation: one whose presence lock is held by the attested `agy` and that has no credentials, armed when `xmsg serve` starts and whenever the hook's check finds it unregistered. While nothing is armed it does no work. An armed conversation's subtree is scanned every 100ms until it registers or its lock is released; 100ms catches every command that runs at least that long, and a missed shorter command costs one turn, after which the hook request fires.
 
 Strict scope rules are enforced in code:
 
-- **Ancestry Boundary:** `xmsg` never inspects or reads a process outside the attested `agy` process's subtree.
+- **Subtree Boundary:** `xmsg` descends from the attested `agy` process through `/proc/<pid>/task/<tid>/children`. Per scan it reads `/proc/locks`, the attested `agy`'s `exe`, `fd/` and `stat`, and for each process in its subtree `task/*/children`, `stat` and `environ`; verification then reads `stat`, `exe` and `fd/` along the chain from the supplying process up to the attested `agy`. No other process is read. On a kernel without the `children` file (`CONFIG_PROC_CHILDREN` off) it says so once in the log and falls back to listing `/proc` and walking each process's parent chain, which reads `stat` of processes outside the subtree, but `environ` only inside it.
 - **Variable Whitelist:** `xmsg` reads *only* `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN`, ignoring all other environment variables.
 - **Zero Logging/Persistence:** Credential values are passed directly into registration memory and are never written to logs or disk.
-- **PID Recycling Guard:** Process start times are validated immediately before and after reading `/proc/<pid>/environ` and verified against the presence lock holder to ensure recycled PIDs are rejected.
+- **PID Recycling Guard:** A process's start time is read before its ancestry is checked and again after its `environ` is read, and the attested `agy`'s start time is re-checked, so a recycled PID is never read past its ancestry check nor trusted.
+- **Unreadable `environ`:** where `/proc/<pid>/environ` cannot be read (a sandbox, EACCES), `xmsg` logs it once per conversation at debug level, without values, and leaves the conversation to the hook request.
 
 On Darwin and in sandboxes without accessible `/proc`, `xmsg` falls back to the PreInvocation hook request (Arm B′). While Arm A is actively watching an unregistered conversation on Linux, the PreInvocation hook stands down on the first turn (emitting `{}`), allowing Arm A to register silently when the model's first command executes. If the conversation remains unregistered on later turns (e.g. no command was run or `/proc` was unreadable), or if Arm A is not watching (Darwin/sandboxes), the hook injects a `userMessage` asking the model to run `xmsg register agy`.
 

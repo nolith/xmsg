@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1011,10 +1011,14 @@ pub fn default_register_sock_path() -> Result<PathBuf, AppError> {
     crate::agent::default_register_sock_path()
 }
 
-/// Interval between process scans when watching eligible unregistered agy sessions.
-/// Set to 100ms so that transient tool commands (such as those run via `run_command`
-/// which typically complete in 150ms-2s) are observed before exiting, while introducing
-/// zero idle overhead once all sessions are registered.
+/// Interval between subtree scans of an ARMED conversation (live, presence lock held by the
+/// attested agy, no credentials); nothing is scanned while no conversation is armed.
+///
+/// The credentials exist only while one of agy's `run_command` commands is running, so the
+/// interval bounds the shortest command that is always seen: 100ms catches every command that
+/// runs 100ms or longer, and a shorter one with probability (duration / 100ms). A missed command
+/// costs one turn, because the hook request then fires. One scan of a live agy subtree measures
+/// well under a millisecond, so 100ms keeps an armed conversation's cost below 1% of a core.
 pub const AGY_PROC_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Checks whether `pid` is a strict descendant of `ancestor_pid` within `proc_root`.
@@ -1096,252 +1100,343 @@ pub fn is_conversation_proc_watched(config: &AgyConfig, conv_id: &str) -> bool {
     true
 }
 
-/// Scans procfs descendants of attested agy processes holding presence locks for unregistered
-/// conversations, reading ONLY `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN` from
-/// `/proc/<pid>/environ`.
+/// Per-watcher memory. Holds conversation ids only, never a credential value.
+#[derive(Debug, Default)]
+pub struct AgyProcWatch {
+    /// Conversations whose unreadable `environ` has already been logged.
+    unreadable_logged: HashSet<String>,
+    /// Whether the ppid-scan fallback has been announced.
+    fallback_logged: bool,
+}
+
+fn trusted_canons(config: &AgyConfig) -> Vec<PathBuf> {
+    config
+        .trusted_agy_exes
+        .iter()
+        .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect()
+}
+
+/// The attested agy holding `conv_id`'s presence lock, with its start time, when the conversation
+/// is eligible for the watcher: no non-stale credentials registered, and the lock held by a trusted
+/// agy executable that has the lock file open.
+fn eligible_holder(
+    config: &AgyConfig,
+    trusted_canons: &[PathBuf],
+    store: &AgyStore,
+    conv_id: &str,
+) -> Option<(u32, String)> {
+    let already_registered = store.read().unwrap().values().any(|info| {
+        (info.conversation_id == conv_id || info.session_key == conv_id)
+            && info.credentials.as_ref().is_some_and(|c| !c.is_stale)
+    });
+    if already_registered {
+        return None;
+    }
+
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(config.presence_dir.join(format!("{conv_id}.lock"))).ok()?;
+    let (target_dev, target_ino) = (meta.dev(), meta.ino());
+    let holder_pid = find_lock_holder(
+        &config.proc_locks_path,
+        dev_major(target_dev),
+        dev_minor(target_dev),
+        target_ino,
+    )
+    .ok()??;
+
+    let exe = crate::process::exe_path(&config.proc_root, holder_pid).ok()?;
+    if !trusted_canons.contains(&fs::canonicalize(&exe).unwrap_or(exe)) {
+        return None;
+    }
+    let ids = crate::process::open_file_ids(&config.proc_root, holder_pid).ok()?;
+    if !ids.contains(&(target_dev, target_ino)) {
+        return None;
+    }
+    let st = crate::process::starttime(&config.proc_root, holder_pid).ok()?;
+    Some((holder_pid, st))
+}
+
+/// Every conversation in `presence_dir` that is eligible for the watcher now. The watcher runs this
+/// once at start, so a conversation already live when `xmsg serve` (re)starts is watched without
+/// waiting for its next turn.
+pub fn eligible_agy_conversations(config: &AgyConfig, store: &AgyStore) -> Vec<String> {
+    let canons = trusted_canons(config);
+    let Ok(entries) = fs::read_dir(&config.presence_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("lock") {
+                return None;
+            }
+            let conv_id = path.file_stem()?.to_str()?.to_string();
+            eligible_holder(config, &canons, store, &conv_id).map(|_| conv_id)
+        })
+        .collect()
+}
+
+/// The children of `pid`, from `/proc/<pid>/task/<tid>/children` over all of its threads (a child
+/// is listed under the thread that forked it). `None` where the kernel provides no such file
+/// (`CONFIG_PROC_CHILDREN` off) or the process is gone.
+fn proc_children(proc_root: &Path, pid: u32) -> Option<Vec<u32>> {
+    let tasks = fs::read_dir(proc_root.join(pid.to_string()).join("task")).ok()?;
+    let mut found = false;
+    let mut kids = Vec::new();
+    for task in tasks.flatten() {
+        if let Ok(s) = fs::read_to_string(task.path().join("children")) {
+            found = true;
+            kids.extend(s.split_whitespace().filter_map(|t| t.parse::<u32>().ok()));
+        }
+    }
+    found.then_some(kids)
+}
+
+/// Reads ONLY `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN` from an `environ` image.
+fn agy_credentials_from_environ(bytes: &[u8]) -> Option<(String, String)> {
+    let mut ls_address = None;
+    let mut csrf_token = None;
+    for chunk in bytes.split(|&b| b == 0) {
+        if let Some(val) = chunk.strip_prefix(b"ANTIGRAVITY_LS_ADDRESS=") {
+            ls_address = std::str::from_utf8(val).ok().filter(|v| !v.is_empty());
+        } else if let Some(val) = chunk.strip_prefix(b"ANTIGRAVITY_CSRF_TOKEN=") {
+            csrf_token = std::str::from_utf8(val).ok().filter(|v| !v.is_empty());
+        }
+    }
+    Some((ls_address?.to_string(), csrf_token?.to_string()))
+}
+
+/// Looks for the credentials in the subtree of the attested agy `holder_pid` and registers
+/// `conv_id` from the first process carrying both. Returns whether it registered.
+///
+/// Only the subtree is read: the walk descends from the holder through
+/// `/proc/<pid>/task/<tid>/children`. Where the kernel lacks that file it falls back, once
+/// announced, to listing `/proc` and walking each pid's parent chain (at most 32 hops), which reads
+/// `stat` of processes outside the subtree but `environ` only inside it.
+#[allow(clippy::too_many_arguments)]
+async fn register_from_subtree(
+    config: &AgyConfig,
+    store: &AgyStore,
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    my_uid: u32,
+    conv_id: &str,
+    holder_pid: u32,
+    holder_st: &str,
+    watch: &mut AgyProcWatch,
+) -> Result<bool, AppError> {
+    let proc_root = &config.proc_root;
+    let st_of = |pid: u32| crate::process::starttime(proc_root, pid).ok();
+
+    // (pid, the parent it was listed under, that parent's pinned start time)
+    let mut queue: VecDeque<(u32, u32, String)> = VecDeque::new();
+    let fallback = match proc_children(proc_root, holder_pid) {
+        Some(kids) => {
+            queue.extend(
+                kids.into_iter()
+                    .map(|c| (c, holder_pid, holder_st.to_string())),
+            );
+            false
+        }
+        None => {
+            if !watch.fallback_logged {
+                watch.fallback_logged = true;
+                tracing::info!(
+                    "agy proc watcher: /proc/<pid>/task/<tid>/children is absent; falling back to a ppid scan of /proc"
+                );
+            }
+            if let Ok(entries) = fs::read_dir(proc_root) {
+                let mut pids: Vec<u32> = entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str()?.parse().ok())
+                    .collect();
+                pids.sort_unstable();
+                queue.extend(
+                    pids.into_iter()
+                        .map(|p| (p, holder_pid, holder_st.to_string())),
+                );
+            }
+            true
+        }
+    };
+
+    let mut seen = HashSet::new();
+    while let Some((p, parent, parent_st)) = queue.pop_front() {
+        if p <= 1 || p == holder_pid || !seen.insert(p) {
+            continue;
+        }
+
+        // Pin p's start time BEFORE the ancestry check, so one bracket covers the ancestry
+        // check, the environ read and the re-read: a pid recycled anywhere inside it fails the
+        // re-read and is never trusted.
+        let Some(st_before) = st_of(p) else {
+            continue;
+        };
+
+        // Scope rule: p must be in the attested agy's subtree.
+        let in_subtree = if fallback {
+            is_descendant_of(proc_root, p, holder_pid)
+        } else {
+            crate::process::parent_pid(proc_root, p) == Some(parent)
+                && st_of(parent).as_deref() == Some(parent_st.as_str())
+        };
+        if !in_subtree {
+            continue;
+        }
+
+        let creds = match fs::read(proc_root.join(p.to_string()).join("environ")) {
+            Ok(bytes) => agy_credentials_from_environ(&bytes),
+            Err(e) => {
+                // Fallback rule: an unreadable environ leaves the conversation to the hook
+                // request. Logged once per conversation, never with values.
+                if watch.unreadable_logged.insert(conv_id.to_string()) {
+                    tracing::debug!(
+                        conversation_id = %conv_id,
+                        pid = p,
+                        "cannot read environ of an agy descendant ({e}); the hook request covers this conversation"
+                    );
+                }
+                None
+            }
+        };
+
+        // Start-time re-read: a recycled pid is never trusted, nor descended into.
+        if st_of(p).as_deref() != Some(st_before.as_str()) {
+            continue;
+        }
+        if st_of(holder_pid).as_deref() != Some(holder_st) {
+            return Ok(false);
+        }
+
+        if let Some((ls_address, csrf_token)) = creds {
+            let req = AgyRegisterRequest {
+                conversation_id: conv_id.to_string(),
+                ls_address,
+                csrf_token,
+            };
+            // The same verification `xmsg register agy` gets, with the process that supplied the
+            // credentials as the peer: its ancestry must reach the lock-holding agy.
+            match verify_registration(
+                proc_root,
+                &config.proc_locks_path,
+                &config.presence_dir,
+                &config.trusted_agy_exes,
+                my_uid,
+                my_uid,
+                p,
+                &req,
+            ) {
+                Ok(reg) => {
+                    let session_info = AgySessionInfo::new_with_credentials(
+                        conv_id.to_string(),
+                        reg.pid,
+                        reg.starttime,
+                        AgyCredentials {
+                            ls_address: req.ls_address,
+                            csrf_token: req.csrf_token,
+                            is_stale: false,
+                        },
+                    );
+                    store
+                        .write()
+                        .unwrap()
+                        .insert(reg.session_key.clone(), session_info);
+                    flush_agy_queue(config, store, db, &reg.session_key, conv_id).await;
+                    return Ok(true);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        conversation_id = %conv_id,
+                        "verify_registration failed during proc scan: {e}"
+                    );
+                }
+            }
+        }
+
+        if !fallback {
+            if let Some(kids) = proc_children(proc_root, p) {
+                queue.extend(kids.into_iter().map(|c| (c, p, st_before.clone())));
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Scans the attested agy's process subtree for each conversation in `conv_ids` that is eligible
+/// (presence lock held by the attested agy, no credentials), reading ONLY `ANTIGRAVITY_LS_ADDRESS`
+/// and `ANTIGRAVITY_CSRF_TOKEN` from `/proc/<pid>/environ`, and registers each one found through
+/// [`verify_registration`]. Returns the conversations still eligible after the scan, which the
+/// watcher keeps watching; a registered or ineligible conversation drops out.
 pub async fn scan_and_register_agy_proc(
     config: &AgyConfig,
     store: &AgyStore,
     db: &Arc<Mutex<rusqlite::Connection>>,
     my_uid: u32,
-) -> Result<usize, AppError> {
-    if !locks_supported(&config.proc_locks_path) {
-        return Ok(0);
+    conv_ids: &[String],
+    watch: &mut AgyProcWatch,
+) -> Result<Vec<String>, AppError> {
+    if !locks_supported(&config.proc_locks_path) || config.trusted_agy_exes.is_empty() {
+        return Ok(Vec::new());
     }
-    if config.trusted_agy_exes.is_empty() {
-        return Ok(0);
-    }
-
-    let trusted_canons: Vec<PathBuf> = config
-        .trusted_agy_exes
-        .iter()
-        .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
-        .collect();
-
-    let lock_entries = match fs::read_dir(&config.presence_dir) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(0),
-    };
-
-    let mut eligible = Vec::new();
-    for entry in lock_entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("lock") {
-            continue;
-        }
-        let Some(conv_id) = path.file_stem().and_then(|s| s.to_str()) else {
+    let canons = trusted_canons(config);
+    let mut still_eligible = Vec::new();
+    for conv_id in conv_ids {
+        let Some((holder_pid, holder_st)) = eligible_holder(config, &canons, store, conv_id) else {
             continue;
         };
-
-        // Skip if already registered with valid credentials
-        let already_registered = {
-            let store_lock = store.read().unwrap();
-            store_lock.values().any(|info| {
-                (info.conversation_id == conv_id || info.session_key == conv_id)
-                    && info
-                        .credentials
-                        .as_ref()
-                        .map(|c| !c.is_stale)
-                        .unwrap_or(false)
-            })
-        };
-        if already_registered {
-            continue;
-        }
-
-        let Ok(meta) = fs::metadata(&path) else {
-            continue;
-        };
-        use std::os::unix::fs::MetadataExt;
-        let target_dev = meta.dev();
-        let target_ino = meta.ino();
-        let maj = dev_major(target_dev);
-        let min = dev_minor(target_dev);
-
-        let holder_pid = match find_lock_holder(&config.proc_locks_path, maj, min, target_ino) {
-            Ok(Some(pid)) => pid,
-            _ => continue,
-        };
-
-        let exe_matches = match crate::process::exe_path(&config.proc_root, holder_pid) {
-            Ok(exe) => {
-                let exe_canon = fs::canonicalize(&exe).unwrap_or(exe);
-                trusted_canons.contains(&exe_canon)
-            }
-            Err(_) => false,
-        };
-        if !exe_matches {
-            continue;
-        }
-
-        let has_file_open = match crate::process::open_file_ids(&config.proc_root, holder_pid) {
-            Ok(ids) => ids.contains(&(target_dev, target_ino)),
-            Err(_) => false,
-        };
-        if !has_file_open {
-            continue;
-        }
-
-        let Ok(holder_st) = crate::process::starttime(&config.proc_root, holder_pid) else {
-            continue;
-        };
-
-        eligible.push((conv_id.to_string(), holder_pid, holder_st));
-    }
-
-    if eligible.is_empty() {
-        return Ok(0);
-    }
-
-    let proc_entries = match fs::read_dir(&config.proc_root) {
-        Ok(e) => e,
-        Err(_) => return Ok(0),
-    };
-
-    let mut candidate_pids = Vec::new();
-    for entry in proc_entries.flatten() {
-        if let Some(pid_str) = entry.file_name().to_str() {
-            if let Ok(pid) = pid_str.parse::<u32>() {
-                candidate_pids.push(pid);
-            }
-        }
-    }
-    candidate_pids.sort_unstable();
-
-    let mut registered_count = 0;
-
-    for (conv_id, holder_pid, holder_st) in eligible {
-        if crate::process::starttime(&config.proc_root, holder_pid)
-            .ok()
-            .as_deref()
-            != Some(&holder_st)
+        if !register_from_subtree(
+            config, store, db, my_uid, conv_id, holder_pid, &holder_st, watch,
+        )
+        .await?
         {
-            continue;
-        }
-
-        for &p in &candidate_pids {
-            if p == holder_pid || p <= 1 {
-                continue;
-            }
-
-            // Scope rule: never read a process outside the attested agy's subtree
-            if !is_descendant_of(&config.proc_root, p, holder_pid) {
-                continue;
-            }
-
-            // Start-time check before reading
-            let Ok(st_before) = crate::process::starttime(&config.proc_root, p) else {
-                continue;
-            };
-
-            let environ_path = config.proc_root.join(p.to_string()).join("environ");
-            let bytes = match fs::read(&environ_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::debug!(
-                        conversation_id = %conv_id,
-                        pid = p,
-                        "cannot read environ for agy descendant: {e}"
-                    );
-                    continue;
-                }
-            };
-
-            // Start-time check after reading to reject recycled PIDs
-            let Ok(st_after) = crate::process::starttime(&config.proc_root, p) else {
-                continue;
-            };
-            if st_before != st_after {
-                continue;
-            }
-
-            // Re-verify holder starttime has not changed
-            if crate::process::starttime(&config.proc_root, holder_pid)
-                .ok()
-                .as_deref()
-                != Some(&holder_st)
-            {
-                break;
-            }
-
-            // Scope rule: read ONLY ANTIGRAVITY_LS_ADDRESS and ANTIGRAVITY_CSRF_TOKEN
-            // Never read any other variable; never log or persist the values
-            let mut ls_address = None;
-            let mut csrf_token = None;
-
-            for chunk in bytes.split(|&b| b == 0) {
-                if let Ok(s) = std::str::from_utf8(chunk) {
-                    if let Some(val) = s.strip_prefix("ANTIGRAVITY_LS_ADDRESS=") {
-                        if !val.is_empty() {
-                            ls_address = Some(val.to_string());
-                        }
-                    } else if let Some(val) = s.strip_prefix("ANTIGRAVITY_CSRF_TOKEN=") {
-                        if !val.is_empty() {
-                            csrf_token = Some(val.to_string());
-                        }
-                    }
-                }
-            }
-
-            if let (Some(ls), Some(csrf)) = (ls_address, csrf_token) {
-                let req = AgyRegisterRequest {
-                    conversation_id: conv_id.clone(),
-                    ls_address: ls,
-                    csrf_token: csrf,
-                };
-                match verify_registration(
-                    &config.proc_root,
-                    &config.proc_locks_path,
-                    &config.presence_dir,
-                    &config.trusted_agy_exes,
-                    my_uid,
-                    my_uid,
-                    holder_pid,
-                    &req,
-                ) {
-                    Ok(reg) => {
-                        let session_info = AgySessionInfo::new_with_credentials(
-                            conv_id.clone(),
-                            reg.pid,
-                            reg.starttime,
-                            AgyCredentials {
-                                ls_address: req.ls_address,
-                                csrf_token: req.csrf_token,
-                                is_stale: false,
-                            },
-                        );
-                        {
-                            let mut store_lock = store.write().unwrap();
-                            store_lock.insert(reg.session_key.clone(), session_info);
-                        }
-                        flush_agy_queue(config, store, db, &reg.session_key, &conv_id).await;
-                        registered_count += 1;
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            conversation_id = %conv_id,
-                            "verify_registration failed during proc scan: {e}"
-                        );
-                    }
-                }
-            }
+            still_eligible.push(conv_id.clone());
         }
     }
-
-    Ok(registered_count)
+    Ok(still_eligible)
 }
 
-/// Runs the continuous background watcher polling agy descendants on a 100ms interval.
+/// The watcher behind [`run_register_server`]. It watches only ARMED conversations: those eligible
+/// when it starts, and those the hook's `check` reports as watched. With nothing armed it blocks on
+/// `arm_rx` and does no work at all; an armed conversation is scanned every
+/// [`AGY_PROC_WATCH_INTERVAL`] until it registers or stops being eligible.
 pub async fn run_agy_proc_watcher(
     config: AgyConfig,
     store: AgyStore,
     db: Arc<Mutex<rusqlite::Connection>>,
     my_uid: u32,
+    mut arm_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
+    if !locks_supported(&config.proc_locks_path) || config.trusted_agy_exes.is_empty() {
+        tracing::info!(
+            "agy proc watcher off (no /proc/locks on this platform, or no trusted agy executable); agy conversations register through the hook request"
+        );
+        return;
+    }
+    let mut watch = AgyProcWatch::default();
+    let mut armed: HashSet<String> = eligible_agy_conversations(&config, &store)
+        .into_iter()
+        .collect();
     loop {
-        tokio::time::sleep(AGY_PROC_WATCH_INTERVAL).await;
-        let _ = scan_and_register_agy_proc(&config, &store, &db, my_uid).await;
+        if armed.is_empty() {
+            let Some(conv_id) = arm_rx.recv().await else {
+                return;
+            };
+            armed.insert(conv_id);
+        } else {
+            tokio::time::sleep(AGY_PROC_WATCH_INTERVAL).await;
+        }
+        while let Ok(conv_id) = arm_rx.try_recv() {
+            armed.insert(conv_id);
+        }
+        let ids: Vec<String> = armed.drain().collect();
+        match scan_and_register_agy_proc(&config, &store, &db, my_uid, &ids, &mut watch).await {
+            Ok(still) => armed.extend(still),
+            Err(e) => {
+                tracing::debug!("agy proc scan failed: {e}");
+                armed.extend(ids);
+            }
+        }
     }
 }
 
@@ -1397,11 +1492,12 @@ pub async fn run_register_server(
     let stand_down_counts: Arc<tokio::sync::RwLock<HashMap<String, u32>>> =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
+    let (arm_tx, arm_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let watcher_config = config.clone();
     let watcher_store = store.clone();
     let watcher_db = db.clone();
     tokio::spawn(async move {
-        run_agy_proc_watcher(watcher_config, watcher_store, watcher_db, my_uid).await;
+        run_agy_proc_watcher(watcher_config, watcher_store, watcher_db, my_uid, arm_rx).await;
     });
 
     loop {
@@ -1434,6 +1530,7 @@ pub async fn run_register_server(
         let svc_notify_tx_clone = svc_notify_tx.clone();
         let fed_state_clone = fed_state.clone();
         let stand_down_counts_clone = stand_down_counts.clone();
+        let arm_tx_clone = arm_tx.clone();
 
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1521,6 +1618,9 @@ pub async fn run_register_server(
                         } else {
                             let is_watched = is_conversation_proc_watched(&config_clone, conv_id);
                             if is_watched {
+                                // Arm the watcher: this turn's commands are where the
+                                // credentials appear.
+                                let _ = arm_tx_clone.send(conv_id.to_string());
                                 let mut counts = stand_down_counts_clone.write().await;
                                 let count = counts.entry(conv_id.to_string()).or_insert(0);
                                 *count += 1;
