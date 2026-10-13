@@ -344,11 +344,11 @@ in
         };
         skills.xmsg = skill;
         # The tools are authorized explicitly: allowed calls skip the auto-mode classifier.
-        # XH1b: add mcp__xmsg__replies with the new tool surface.
         settings.permissions.allow = [
           "mcp__xmsg__list"
           "mcp__xmsg__send"
           "mcp__xmsg__reply"
+          "mcp__xmsg__replies"
         ];
       };
     })

@@ -180,6 +180,7 @@ in
           "mcp__xmsg__list"
           "mcp__xmsg__send"
           "mcp__xmsg__reply"
+          "mcp__xmsg__replies"
         ];
       };
     };
@@ -216,6 +217,49 @@ in
         skill = builtins.readFile ../../nix/modules/skills/xmsg/SKILL.md;
       };
     };
+    # Oracle 7: the installed skill teaches A13's four tools, A12's labels and the error
+    # vocabulary, and the http.sock limits (A15, HA2); nothing of the retired surface or of an
+    # owner's hosts. `builtins.split` searches without a `.*` regex over the file.
+    test-skill =
+      let
+        text = builtins.readFile "${linux.programs.claude-code.skills.xmsg}/SKILL.md";
+        has = t: builtins.length (builtins.split (lib.escapeRegex t) text) > 1;
+      in
+      {
+        expr = {
+          missing = lib.filter (t: !has t) [
+            "`list`"
+            "`send`"
+            "`reply`"
+            "`replies`"
+            "label · id@node"
+            "id~n@node"
+            "`delivered`"
+            "`queued`"
+            "`not_found`"
+            "`ambiguous`"
+            "`unavailable`"
+            "`denied`"
+            "`gone`"
+            "`bad_request`"
+            "http.sock"
+            "<from> · anon@node"
+            "opencode or hermes process"
+          ];
+          present = lib.filter has [
+            "svc:"
+            "/v1/sessions"
+            "bitstream"
+            "cortex"
+            "json64"
+          ];
+        };
+        expected = {
+          missing = [ ];
+          present = [ ];
+        };
+      };
+
     # C3: the module owns hooks.json. A second `.text` is refused by assertion; a second
     # `.source` conflicts in the option's merge (a throw, read as data).
     test-agy-hooks-owned = {

@@ -748,7 +748,9 @@ In a star or multi-node mesh topology, nodes that cannot directly dial one anoth
 The flake ships `homeManagerModules.xmsg` (also `homeManagerModules.default`) for everything per user, and
 `nixosModules.xmsg` (also `nixosModules.default`) for the one root-only part, the federation port. Both are
 evaluated in this repository's CI (`ci/tests/module.nix`, `ci/tests/peers-check.nix`) against home-manager at
-nix-config's pin, for `x86_64-linux` and `aarch64-darwin` (nixpkgs 26.11 dropped `x86_64-darwin`).
+nix-config's pin, for `x86_64-linux` and `aarch64-darwin` (nixpkgs 26.11 dropped `x86_64-darwin`). On Linux, CI
+also runs what the module installs (`ci/tests/harness-checks.nix`): the agy hook against a real `xmsg serve`
+(`checks.agy-hook`), and the pi extension's own tests (`checks.pi-extension`, `checks.pi-paths`).
 
 ### 8.1 Minimal home-manager import
 
@@ -778,12 +780,15 @@ Each switch installs that harness's pieces, through the harness's own home-manag
 option, so it composes with the rest of your configuration:
 
 - `programs.xmsg.harnesses.claude.enable`: the `xmsg mcp` server in `programs.claude-code.mcpServers`, the `xmsg`
-  skill in `programs.claude-code.skills`, and `mcp__xmsg__list`, `mcp__xmsg__send` and `mcp__xmsg__reply` in
-  `programs.claude-code.settings.permissions.allow`. Needs `programs.claude-code.enable`.
+  skill in `programs.claude-code.skills`, and `mcp__xmsg__list`, `mcp__xmsg__send`, `mcp__xmsg__reply` and
+  `mcp__xmsg__replies` in `programs.claude-code.settings.permissions.allow`. Needs `programs.claude-code.enable`.
 - `programs.xmsg.harnesses.agy.enable`: the server in `programs.antigravity-cli.mcpServers`, the skill in
   `programs.antigravity-cli.skills`, and the PreInvocation hook `xmsg register agy --hook` (Section 3.3).
   Needs `programs.antigravity-cli.enable`. **Cost:** `programs.antigravity-cli` has no hook option, so the module
-  writes the whole `~/.gemini/config/hooks.json`; any other definition of that file fails evaluation.
+  writes the whole `~/.gemini/config/hooks.json`; any other definition of that file fails evaluation. CI runs
+  the hook command the module renders: a fake agy (a process holding a conversation's presence lock, as agy does)
+  runs it for its turn against a real `xmsg serve` of the same revision, and the conversation registers and is
+  listed under its own ID.
 - `programs.xmsg.harnesses.pi.enable`: the extension (`extensions/pi/index.ts`) as
   `~/.pi/agent/extensions/xmsg-pi.ts`, and the skill as `~/.pi/agent/skills/xmsg/SKILL.md`. pi loads everything
   under `~/.pi/agent/extensions` whether or not `settings.json` lists `extensions`: plain entries there add to the
@@ -791,6 +796,11 @@ option, so it composes with the rest of your configuration:
 
 A Claude or agy switch whose harness module is off fails evaluation, naming the option it needs, rather than
 installing nothing.
+
+The skill (`nix/modules/skills/xmsg/SKILL.md`, the same file for every harness) teaches the four tools (`list`,
+`send`, `reply`, `replies`), addresses and sender labels (`label · id[~n]@node`, `name@node`,
+`<from> · anon@node`), the send outcomes and the error vocabulary, and the `http.sock` API with its limits: an
+untraced caller is anonymous and cannot `reply`, and a call from an opencode or hermes process is anonymous.
 
 ### 8.3 Federation and peers
 
