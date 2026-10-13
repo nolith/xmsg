@@ -2410,14 +2410,16 @@ pub async fn deliver_federated_reply_locally(
 /// Federated reply authorization: is `replier` the recipient `outbound` records (A7)?
 /// - A peer that answered the send resolved the reference first, so the record holds the
 ///   instance ID or service name it reported, and only that key may reply.
-/// - A send queued for a dial-out client is resolved there, later, so the record holds the
-///   reference as typed. The replier must be what that reference resolves to by the
-///   resolver's own steps: its ID, its service name, or its label.
+/// - A send queued in a dial-out client's mailbox by a typed reference is resolved there,
+///   later, so the record holds the reference as typed. The replier must be what that
+///   reference resolves to by the resolver's own steps: its ID, its service name, or its
+///   label.
 /// - A send queued in a dial-out client's mailbox may instead get the client's own
 ///   `not_found` error reply, which a service sends (the leaf principal, or `system`),
 ///   never the recipient. Only a reply that is exactly that error object is admitted on
-///   that ground. A send the peer resolved and holds for its recipient's ack also reads
-///   `queued`, but its recipient is known, so it takes no such reply.
+///   that ground.
+/// - A send the peer resolved and holds for its recipient's ack also reads `queued`, but
+///   the record holds its recipient, so it takes replies by key only.
 fn replier_is_recipient(
     o: &storage::OutboundRecord,
     replier: &storage::Origin,
@@ -2428,8 +2430,9 @@ fn replier_is_recipient(
         return true;
     }
     o.outcome == "queued"
+        && o.via_mailbox
         && ((!o.resolved && replier.id.is_some() && replier.label.as_deref() == Some(typed))
-            || (o.via_mailbox && replier.service.is_some() && is_not_found_reply(text)))
+            || (replier.service.is_some() && is_not_found_reply(text)))
 }
 
 /// `{"error": "not_found", "detail": …}` and nothing else: a dial-out client's answer

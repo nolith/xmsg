@@ -1319,3 +1319,39 @@ async fn test_oracle_20_a_peer_resolved_queued_send_takes_no_service_error() {
     })
     .await;
 }
+
+// =============================================================================
+// Oracle 21 (XA5's reply rule, after delivered-on-ack). `H@sini.w` names its node, so
+// `sini.a` does not resolve it; `sini.w` resolves it and holds it for its harness's ack
+// (`queued`), and the record holds H as `sini.w` reported it. No dial-out client resolves
+// it later, so an instance on `sini.w` merely labelled H is refused, and H is taken.
+// Mutant: admit by label on any unresolved `queued` record, mailbox or not => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_21_a_peer_resolved_queued_send_takes_no_label() {
+    run_with_port_retry(|| async {
+        let ca = Ca::new();
+        let (ca_a, ca_w) = (ca.issue("sini.a"), ca.issue("sini.w"));
+        let pa = prepare(&ca);
+        let (port_w, _, _) =
+            stub(&ca_w, &[&ca_a.pin], listing(vec![inst(H, "live", "sini")])).await;
+        let w_entry = ca_entry(port_w, &pa.ca_file(), "sini.w", ALL);
+        let a = start(pa, &ca_a, json!({ "sini.w": w_entry }), None).await;
+        let w = Origin {
+            cert_der: &ca_w.cert_der,
+            key_der: &ca_w.key_der,
+        };
+        let (pin, port) = (ca_a.pin.as_str(), a.fed_port);
+
+        let (status, sent) = http_send(&a, &format!("{H}@sini.w"), "for h").await;
+        assert_eq!(status, 202, "{sent}");
+        assert_eq!(sent["outcome"], "queued", "{sent}");
+        assert_eq!(sent["address"], format!("{H}@sini.w"), "{sent}");
+        let id = sent["message_id"].as_str().unwrap().to_string();
+        let impostor = json!({ "id": "other", "node": "x", "label": H });
+        assert_eq!(fed_reply(&w, pin, port, &id, impostor, "forged").await, 403);
+        let h = json!({ "id": H, "node": "x" });
+        assert_eq!(fed_reply(&w, pin, port, &id, h, "from h").await, 200);
+    })
+    .await;
+}
