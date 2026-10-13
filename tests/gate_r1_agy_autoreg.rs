@@ -737,3 +737,70 @@ fn oracle_4_non_agy_ancestor_gets_no_identity_at_mcp_start() {
         other => panic!("expected Ok for valid agy ancestor, got {other:?}"),
     }
 }
+
+/// A15 ordering: the MCP-start walk to the agy ancestor steps to a parent only when that
+/// parent started no later than its child, and an unreadable start time ends it.
+#[test]
+fn attest_mcp_caller_refuses_parent_younger_than_child_or_unreadable_start() {
+    let tmp = tempdir().unwrap();
+    let proc_root = tmp.path().join("proc");
+    let proc_locks = tmp.path().join("locks");
+    let presence_dir = tmp.path().join("presence");
+    fs::create_dir_all(&presence_dir).unwrap();
+    let lock_file = presence_dir.join("conv-order.lock");
+    fs::write(&lock_file, "lock").unwrap();
+    let meta = fs::metadata(&lock_file).unwrap();
+    fs::write(
+        &proc_locks,
+        format!(
+            "1: FLOCK ADVISORY WRITE 6000 {:02x}:{:02x}:{} 0 EOF\n",
+            dev_major(meta.dev()),
+            dev_minor(meta.dev()),
+            meta.ino()
+        ),
+    )
+    .unwrap();
+    let trusted_agy = tmp.path().join("trusted_agy");
+    fs::write(&trusted_agy, "binary").unwrap();
+    let trusted_exes = vec![trusted_agy.clone()];
+    let attest = || {
+        attest_mcp_caller(
+            &proc_root,
+            &proc_locks,
+            &presence_dir,
+            &trusted_exes,
+            1000,
+            1000,
+            6001,
+        )
+    };
+
+    setup_mock_process(
+        &proc_root,
+        6000,
+        1,
+        Some(&trusted_agy),
+        Some(&lock_file),
+        "100",
+    );
+
+    // Control: the caller started after its parent.
+    setup_mock_process(&proc_root, 6001, 6000, None, None, "200");
+    assert_eq!(attest().expect("ordered chain").1, "conv-order");
+
+    // The caller "started" before its parent: 6000 is a reused PID.
+    setup_mock_process(&proc_root, 6001, 6000, None, None, "50");
+    assert!(
+        matches!(attest(), Err(AppError::NotRecipient(_))),
+        "a younger parent must refuse: {:?}",
+        attest()
+    );
+
+    // The caller's stat carries no start time.
+    fs::write(proc_root.join("6001").join("stat"), "6001 (proc) S 6000\n").unwrap();
+    assert!(
+        matches!(attest(), Err(AppError::NotRecipient(_))),
+        "an unreadable start must refuse: {:?}",
+        attest()
+    );
+}

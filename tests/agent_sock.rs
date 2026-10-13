@@ -264,6 +264,76 @@ fn test_resolve_caller_session_ancestor_walk() {
     }
 }
 
+/// The A15 walk over a synthetic chain 3000 -> 2000 -> 1000 (a live Claude session), with
+/// 2000's start time `parent_start`; 1000 started at 100 and 3000 at 300.
+fn resolve_through_middle_link(parent_start: &str) -> Result<xmsg::registry::Session, AppError> {
+    let tmp = tempdir().unwrap();
+    let proc_root = tmp.path().join("proc");
+    let sessions_dir = tmp.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let agy_config = AgyConfig {
+        presence_dir: tmp.path().join("presence"),
+        proc_locks_path: tmp.path().join("locks"),
+        proc_root: proc_root.clone(),
+        agy_bin: "agy".to_string(),
+        trusted_agy_exes: Vec::new(),
+    };
+    let stat = |pid: u32, ppid: u32, start: &str| {
+        let dir = proc_root.join(pid.to_string());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("stat"),
+            format!("{pid} (p) S {ppid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {start} 0 0\n"),
+        )
+        .unwrap();
+    };
+    stat(1000, 1, "100");
+    stat(2000, 1000, parent_start);
+    stat(3000, 2000, "300");
+    let session = serde_json::json!({
+        "pid": 1000, "sessionId": "sess-a", "cwd": "/", "status": "idle",
+        "kind": "interactive", "startedAt": 1, "updatedAt": 1, "procStart": "100",
+        "messagingSocketPath": "/tmp/dummy.sock",
+    });
+    fs::write(sessions_dir.join("1000.json"), session.to_string()).unwrap();
+    resolve_caller_session(
+        &proc_root,
+        &sessions_dir,
+        &agy_config,
+        &new_agy_store(),
+        &new_pi_store(),
+        &xmsg::svc::new_svc_store(),
+        None,
+        3000,
+    )
+}
+
+/// A15: a link whose parent started after its child is a PID reused mid-walk, so the walk
+/// fails closed to anonymous instead of attributing the caller to whatever owns the new PID.
+#[test]
+fn test_resolve_caller_session_rejects_parent_younger_than_child() {
+    // Control: 2000 started before its child 3000, so the chain is the session's.
+    assert_eq!(
+        resolve_through_middle_link("200").unwrap().session_id,
+        "sess-a"
+    );
+    // 2000 "started" after its child 3000: a reused PID, so the caller is anonymous.
+    match resolve_through_middle_link("400") {
+        Err(AppError::NotRecipient(msg)) => assert!(msg.contains("not older"), "{msg}"),
+        other => panic!("expected NotRecipient for a parent younger than its child: {other:?}"),
+    }
+}
+
+/// A15: a start time that cannot be read as a number cannot show the parent is older, so the
+/// walk fails closed rather than stepping past it.
+#[test]
+fn test_resolve_caller_session_fails_closed_on_unreadable_start() {
+    match resolve_through_middle_link("unreadable") {
+        Err(AppError::NotRecipient(msg)) => assert!(msg.contains("not older"), "{msg}"),
+        other => panic!("expected NotRecipient for an unreadable start time: {other:?}"),
+    }
+}
+
 fn get_self_proc_start() -> String {
     xmsg::process::starttime(
         std::path::Path::new(xmsg::process::LIVE_PROC_ROOT),

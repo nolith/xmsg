@@ -379,14 +379,14 @@ async fn test_mcp_send_and_reply_with_derived_caller() {
 
     // Configure ancestor hierarchy for current process:
     // PID my_pid -> PPID caller_pid (6000) -> PPID 1
-    write_proc_stat(&harness.proc_root, my_pid, caller_pid, "start_curr");
-    write_proc_stat(&harness.proc_root, caller_pid, 1, "start_6000");
+    write_proc_stat(&harness.proc_root, my_pid, caller_pid, "200");
+    write_proc_stat(&harness.proc_root, caller_pid, 1, "100");
     write_session_file(
         &harness.sessions_dir,
         caller_pid,
         "sess-caller-6000",
         "calling-orchestrator",
-        "start_6000",
+        "100",
         &dummy_sock,
     );
 
@@ -447,7 +447,7 @@ async fn test_mcp_send_and_reply_with_derived_caller() {
         caller_pid,
         "sess-target-5000",
         "target-agent",
-        "start_6000",
+        "100",
         &target_sock,
     );
 

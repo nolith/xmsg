@@ -527,13 +527,8 @@ pub fn verify_registration(
         // Read starttime first at top of iteration before checks
         let st1 = match crate::process::starttime(proc_root, curr_pid) {
             Ok(st) => st,
-            Err(_) => {
-                let Some(ppid) = crate::process::parent_pid(proc_root, curr_pid) else {
-                    break;
-                };
-                curr_pid = ppid;
-                continue;
-            }
+            // Unreadable, so no link above it can be shown to be the caller's (fail closed).
+            Err(_) => break,
         };
 
         // (a) EXECUTABLE check: kernel-reported executable path matches a trusted exe
@@ -561,6 +556,9 @@ pub fn verify_registration(
         let Some(ppid) = crate::process::parent_pid(proc_root, curr_pid) else {
             break;
         };
+        if !crate::process::started_no_later(proc_root, ppid, curr_pid) {
+            break;
+        }
         curr_pid = ppid;
     }
 
@@ -682,13 +680,8 @@ pub fn attest_mcp_caller(
 
         let st1 = match crate::process::starttime(proc_root, curr_pid) {
             Ok(st) => st,
-            Err(_) => {
-                let Some(ppid) = crate::process::parent_pid(proc_root, curr_pid) else {
-                    break;
-                };
-                curr_pid = ppid;
-                continue;
-            }
+            // Unreadable, so no link above it can be shown to be the caller's (fail closed).
+            Err(_) => break,
         };
 
         // (a) EXECUTABLE check: kernel-reported executable path matches a trusted exe
@@ -730,6 +723,9 @@ pub fn attest_mcp_caller(
         let Some(ppid) = crate::process::parent_pid(proc_root, curr_pid) else {
             break;
         };
+        if !crate::process::started_no_later(proc_root, ppid, curr_pid) {
+            break;
+        }
         curr_pid = ppid;
     }
 

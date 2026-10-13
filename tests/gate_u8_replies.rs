@@ -105,12 +105,20 @@ fn spawn_live_session(
     }
 }
 
+/// Grafts this test process under `session_pid` in the synthetic /proc. A child cannot start
+/// before its parent, so the graft records the later of the two start times (the session is
+/// often spawned after the test process began).
 fn act_as_session(proc_root: &Path, my_pid: u32, my_proc_start: &str, session_pid: u32) {
+    let parent_start: u64 = xmsg::process::starttime(proc_root, session_pid)
+        .expect("the session's synthetic stat is written before the graft")
+        .parse()
+        .expect("numeric session start time");
+    let start = parent_start.max(my_proc_start.parse().expect("numeric test start time"));
     let pid_dir = proc_root.join(my_pid.to_string());
     fs::create_dir_all(&pid_dir).unwrap();
     fs::write(
         pid_dir.join("stat"),
-        format!("{my_pid} (test) S {session_pid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {my_proc_start} 0 0\n"),
+        format!("{my_pid} (test) S {session_pid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {start} 0 0\n"),
     )
     .unwrap();
 }
@@ -1021,4 +1029,44 @@ async fn test_u8_cross_harness_claude_to_agy() {
 
     let _ = agy_child.kill();
     let _ = agy_child.wait();
+}
+
+/// A15 ordering on mcp_start's Claude arm: the walk from the caller to a claimed session
+/// steps to a parent only when that parent started no later than its child.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_u8_mcp_start_claude_walk_refuses_parent_younger_than_child() {
+    let env = setup_test_env().await;
+    let session_a = spawn_live_session(
+        &env.sessions_dir,
+        &env.proc_root,
+        env._tmp.path(),
+        "sess-claude-a",
+        "alice",
+    );
+    let mcp_start = serde_json::json!({ "action": "mcp_start" });
+
+    // Control: the test process grafted under session A, started no earlier than it.
+    act_as_session(
+        &env.proc_root,
+        env.my_pid,
+        &env.my_proc_start,
+        session_a.pid,
+    );
+    let ok = agent_rpc(&env.agent_sock, &mcp_start).await;
+    assert_eq!(ok["status"], "ok", "{ok}");
+
+    // The test process "started" before session A: A's PID is a reused one.
+    let parent_start: u64 = session_a.proc_start.parse().unwrap();
+    fs::write(
+        env.proc_root.join(env.my_pid.to_string()).join("stat"),
+        format!(
+            "{} (test) S {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {} 0 0\n",
+            env.my_pid,
+            session_a.pid,
+            parent_start - 1
+        ),
+    )
+    .unwrap();
+    let refused = agent_rpc(&env.agent_sock, &mcp_start).await;
+    assert_eq!(refused["error"], "unattested", "{refused}");
 }

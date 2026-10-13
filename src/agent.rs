@@ -271,6 +271,11 @@ pub fn resolve_caller_session(
         if ppid <= 1 {
             break;
         }
+        if !crate::process::started_no_later(proc_root, ppid, curr_pid) {
+            return Err(AppError::NotRecipient(format!(
+                "peer PID {peer_pid}: parent {ppid} of {curr_pid} is not older than it"
+            )));
+        }
 
         curr_pid = ppid;
     }
@@ -515,7 +520,13 @@ pub async fn run_agent_server(
                                         &state_clone.agy_config.proc_root,
                                         curr,
                                     )?;
-                                    if ppid <= 1 {
+                                    if ppid <= 1
+                                        || !process::started_no_later(
+                                            &state_clone.agy_config.proc_root,
+                                            ppid,
+                                            curr,
+                                        )
+                                    {
                                         break;
                                     }
                                     curr = ppid;

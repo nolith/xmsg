@@ -8,7 +8,8 @@
 //! Start times are opaque strings compared for equality: on Linux the
 //! `/proc/<pid>/stat` field 22 (clock ticks since boot), on macOS the process
 //! start as microseconds since the epoch. Both only identify a process together
-//! with its PID, so a reused PID never matches a stored start time.
+//! with its PID, so a reused PID never matches a stored start time. Both are also
+//! numbers that grow with time, which is what [`started_no_later`] orders by.
 
 use std::fs;
 use std::io;
@@ -46,6 +47,19 @@ pub fn starttime(proc_root: &Path, pid: u32) -> io::Result<String> {
         .get(19)
         .cloned()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat too short"))
+}
+
+/// Whether `parent` started no later than `child`, as every real parent did. An ancestry
+/// walk that attributes identity takes a step only when this holds: a parent that started
+/// after its child is a reused PID read between the two stats, and an unreadable or
+/// non-numeric start time proves nothing, so both fail closed.
+pub fn started_no_later(proc_root: &Path, parent: u32, child: u32) -> bool {
+    let start = |pid| {
+        starttime(proc_root, pid)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+    };
+    matches!((start(parent), start(child)), (Some(p), Some(c)) if p <= c)
 }
 
 /// Returns the parent PID of `pid`, or `None` when the process cannot be read.

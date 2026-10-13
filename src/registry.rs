@@ -301,7 +301,7 @@ pub fn find_ancestor_session_in_dirs(
             break;
         };
 
-        if ppid <= 1 {
+        if ppid <= 1 || !process::started_no_later(proc_root, ppid, curr_pid) {
             break;
         }
 

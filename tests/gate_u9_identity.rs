@@ -512,3 +512,78 @@ fn test_live_macos_agy_probe() {
         expected_id.1
     );
 }
+
+/// A15 ordering: the walk to the agy ancestor steps to a parent only when that parent started
+/// no later than its child, and a link whose start time cannot be read ends it (fail closed).
+#[test]
+fn cell_parent_younger_than_child_or_unreadable_start_is_refused() {
+    let tmp = tempdir().unwrap();
+    let proc_root = tmp.path().join("proc");
+    let proc_locks = tmp.path().join("locks");
+    let presence_dir = tmp.path().join("presence");
+    fs::create_dir_all(&presence_dir).unwrap();
+    let lock_file = presence_dir.join("conv-order.lock");
+    fs::write(&lock_file, "lock").unwrap();
+    let meta = fs::metadata(&lock_file).unwrap();
+    fs::write(
+        &proc_locks,
+        format!(
+            "1: FLOCK ADVISORY WRITE 2000 {:02x}:{:02x}:{} 0 EOF\n",
+            dev_major(meta.dev()),
+            dev_minor(meta.dev()),
+            meta.ino()
+        ),
+    )
+    .unwrap();
+    let dummy_agy = tmp.path().join("trusted_agy");
+    fs::write(&dummy_agy, "binary").unwrap();
+    let trusted_exes = vec![dummy_agy.clone()];
+    let req = AgyRegisterRequest {
+        conversation_id: "conv-order".to_string(),
+        ls_address: "127.0.0.1:4000".to_string(),
+        csrf_token: "secret".to_string(),
+    };
+    let verify = || {
+        verify_registration(
+            &proc_root,
+            &proc_locks,
+            &presence_dir,
+            &trusted_exes,
+            1000,
+            1000,
+            3000,
+            &req,
+        )
+    };
+
+    // Peer 3000 -> agy 2000 (started at 1000) -> 1
+    setup_mock_process(
+        &proc_root,
+        2000,
+        1,
+        Some(&dummy_agy),
+        Some(&lock_file),
+        "1000",
+        None,
+    );
+
+    // Control: the peer started after its parent.
+    setup_mock_process(&proc_root, 3000, 2000, None, None, "2000", None);
+    assert_eq!(verify().expect("ordered chain").pid, 2000);
+
+    // The peer "started" before its parent: 2000 is a reused PID.
+    setup_mock_process(&proc_root, 3000, 2000, None, None, "500", None);
+    assert!(
+        matches!(verify(), Err(AppError::NotRecipient(_))),
+        "a younger parent must refuse: {:?}",
+        verify()
+    );
+
+    // The peer's stat carries no start time: nothing shows 2000 is its parent.
+    fs::write(proc_root.join("3000").join("stat"), "3000 (proc) S 2000\n").unwrap();
+    assert!(
+        matches!(verify(), Err(AppError::NotRecipient(_))),
+        "an unreadable start must refuse: {:?}",
+        verify()
+    );
+}

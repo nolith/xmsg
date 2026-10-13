@@ -47,20 +47,14 @@ fn test_ancestor_walk_skips_intermediate_wrappers() {
     fs::create_dir_all(&sessions_dir).unwrap();
 
     // PID 100: Session process (parent is init / 1)
-    write_proc_stat(&proc_root, 100, 1, "start_100");
-    write_session_file(
-        &sessions_dir,
-        100,
-        "sess-alpha-100",
-        "worker-1",
-        "start_100",
-    );
+    write_proc_stat(&proc_root, 100, 1, "100");
+    write_session_file(&sessions_dir, 100, "sess-alpha-100", "worker-1", "100");
 
     // PID 101: Wrapper process (parent is 100), no session file
-    write_proc_stat(&proc_root, 101, 100, "start_101");
+    write_proc_stat(&proc_root, 101, 100, "101");
 
     // PID 102: MCP process (parent is 101)
-    write_proc_stat(&proc_root, 102, 101, "start_102");
+    write_proc_stat(&proc_root, 102, 101, "102");
 
     let result = find_ancestor_session_in(&proc_root, &sessions_dir, 102);
     assert!(result.is_ok(), "expected ancestor session found");
@@ -79,7 +73,7 @@ fn test_ancestor_walk_terminates_at_pid_1() {
     fs::create_dir_all(&sessions_dir).unwrap();
 
     // PID 50: Process whose parent is 1, no session file for 1 or 50
-    write_proc_stat(&proc_root, 50, 1, "start_50");
+    write_proc_stat(&proc_root, 50, 1, "50");
 
     let result = find_ancestor_session_in(&proc_root, &sessions_dir, 50);
     assert!(result.is_err(), "expected error when reaching PID 1");
@@ -93,18 +87,12 @@ fn test_ancestor_walk_rejects_recycled_or_dead_session() {
     fs::create_dir_all(&proc_root).unwrap();
     fs::create_dir_all(&sessions_dir).unwrap();
 
-    // PID 200: Session file says procStart="start_old", but proc stat has "start_recycled"
-    write_proc_stat(&proc_root, 200, 1, "start_recycled");
-    write_session_file(
-        &sessions_dir,
-        200,
-        "sess-dead-200",
-        "dead-worker",
-        "start_old",
-    );
+    // PID 200: Session file says procStart="150", but proc stat has "250"
+    write_proc_stat(&proc_root, 200, 1, "250");
+    write_session_file(&sessions_dir, 200, "sess-dead-200", "dead-worker", "150");
 
     // PID 201: MCP process whose parent is 200
-    write_proc_stat(&proc_root, 201, 200, "start_201");
+    write_proc_stat(&proc_root, 201, 200, "260");
 
     let result = find_ancestor_session_in(&proc_root, &sessions_dir, 201);
     assert!(result.is_err(), "expected dead ancestor to not match");
@@ -119,27 +107,58 @@ fn test_ancestor_walk_multi_level_intermediate_wrappers() {
     fs::create_dir_all(&sessions_dir).unwrap();
 
     // PID 300: Session process
-    write_proc_stat(&proc_root, 300, 1, "start_300");
-    write_session_file(
-        &sessions_dir,
-        300,
-        "sess-root-300",
-        "root-agent",
-        "start_300",
-    );
+    write_proc_stat(&proc_root, 300, 1, "300");
+    write_session_file(&sessions_dir, 300, "sess-root-300", "root-agent", "300");
 
     // PID 301 -> PID 300 (e.g. bash subshell)
-    write_proc_stat(&proc_root, 301, 300, "start_301");
+    write_proc_stat(&proc_root, 301, 300, "301");
     // PID 302 -> PID 301 (e.g. nix-shell wrapper)
-    write_proc_stat(&proc_root, 302, 301, "start_302");
+    write_proc_stat(&proc_root, 302, 301, "302");
     // PID 303 -> PID 302 (e.g. env wrapper)
-    write_proc_stat(&proc_root, 303, 302, "start_303");
+    write_proc_stat(&proc_root, 303, 302, "303");
     // PID 304 -> PID 303 (actual xmsg mcp process)
-    write_proc_stat(&proc_root, 304, 303, "start_304");
+    write_proc_stat(&proc_root, 304, 303, "304");
 
     let result = find_ancestor_session_in(&proc_root, &sessions_dir, 304);
     assert!(result.is_ok());
     let session = result.unwrap();
     assert_eq!(session.session_id, "sess-root-300");
     assert_eq!(session.pid, 300);
+}
+
+/// A link whose parent started after its child is a PID reused between the two reads, so the
+/// walk stops there instead of attributing the caller to the session that owns the new PID.
+#[test]
+fn test_ancestor_walk_refuses_parent_younger_than_child() {
+    let temp = tempdir().expect("tempdir");
+    let proc_root = temp.path().join("proc");
+    let sessions_dir = temp.path().join("sessions");
+    fs::create_dir_all(&proc_root).unwrap();
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    // 402 -> 401 -> 400 (a live session)
+    write_proc_stat(&proc_root, 400, 1, "400");
+    write_session_file(&sessions_dir, 400, "sess-400", "worker", "400");
+    write_proc_stat(&proc_root, 402, 401, "402");
+
+    // Control: 401 started before its child 402.
+    write_proc_stat(&proc_root, 401, 400, "401");
+    let found = find_ancestor_session_in(&proc_root, &sessions_dir, 402);
+    assert_eq!(found.expect("ordered chain").session_id, "sess-400");
+
+    // 401 "started" after its child 402.
+    write_proc_stat(&proc_root, 401, 400, "403");
+    let refused = find_ancestor_session_in(&proc_root, &sessions_dir, 402);
+    assert!(
+        refused.is_err(),
+        "a younger parent must end the walk: {refused:?}"
+    );
+
+    // An unreadable start proves nothing either.
+    write_proc_stat(&proc_root, 401, 400, "unreadable");
+    let refused = find_ancestor_session_in(&proc_root, &sessions_dir, 402);
+    assert!(
+        refused.is_err(),
+        "an unreadable start must end the walk: {refused:?}"
+    );
 }
