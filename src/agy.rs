@@ -1011,6 +1011,340 @@ pub fn default_register_sock_path() -> Result<PathBuf, AppError> {
     crate::agent::default_register_sock_path()
 }
 
+/// Interval between process scans when watching eligible unregistered agy sessions.
+/// Set to 100ms so that transient tool commands (such as those run via `run_command`
+/// which typically complete in 150ms-2s) are observed before exiting, while introducing
+/// zero idle overhead once all sessions are registered.
+pub const AGY_PROC_WATCH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Checks whether `pid` is a strict descendant of `ancestor_pid` within `proc_root`.
+pub fn is_descendant_of(proc_root: &Path, pid: u32, ancestor_pid: u32) -> bool {
+    if pid == ancestor_pid || pid <= 1 {
+        return false;
+    }
+    let mut curr = pid;
+    for _ in 0..32 {
+        let Some(ppid) = crate::process::parent_pid(proc_root, curr) else {
+            return false;
+        };
+        if ppid == ancestor_pid {
+            return true;
+        }
+        if ppid <= 1 || ppid == curr {
+            return false;
+        }
+        curr = ppid;
+    }
+    false
+}
+
+/// Checks whether Arm A is actively watching `conv_id` (Linux, locks supported, presence lock
+/// held by an attested agy process, and /proc readable).
+pub fn is_conversation_proc_watched(config: &AgyConfig, conv_id: &str) -> bool {
+    if !locks_supported(&config.proc_locks_path) {
+        return false;
+    }
+    if config.trusted_agy_exes.is_empty() {
+        return false;
+    }
+    let lock_path = config.presence_dir.join(format!("{conv_id}.lock"));
+    let Ok(meta) = fs::metadata(&lock_path) else {
+        return false;
+    };
+    use std::os::unix::fs::MetadataExt;
+    let target_dev = meta.dev();
+    let target_ino = meta.ino();
+    let maj = dev_major(target_dev);
+    let min = dev_minor(target_dev);
+
+    let Ok(Some(holder_pid)) = find_lock_holder(&config.proc_locks_path, maj, min, target_ino)
+    else {
+        return false;
+    };
+
+    let trusted_canons: Vec<PathBuf> = config
+        .trusted_agy_exes
+        .iter()
+        .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+
+    let exe_matches = match crate::process::exe_path(&config.proc_root, holder_pid) {
+        Ok(exe) => {
+            let exe_canon = fs::canonicalize(&exe).unwrap_or(exe);
+            trusted_canons.contains(&exe_canon)
+        }
+        Err(_) => false,
+    };
+    if !exe_matches {
+        return false;
+    }
+
+    let has_file_open = match crate::process::open_file_ids(&config.proc_root, holder_pid) {
+        Ok(ids) => ids.contains(&(target_dev, target_ino)),
+        Err(_) => false,
+    };
+    if !has_file_open {
+        return false;
+    }
+
+    // Verify /proc is readable for the holder process
+    let holder_dir = config.proc_root.join(holder_pid.to_string());
+    if fs::metadata(&holder_dir).is_err() {
+        return false;
+    }
+
+    true
+}
+
+/// Scans procfs descendants of attested agy processes holding presence locks for unregistered
+/// conversations, reading ONLY `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN` from
+/// `/proc/<pid>/environ`.
+pub async fn scan_and_register_agy_proc(
+    config: &AgyConfig,
+    store: &AgyStore,
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    my_uid: u32,
+) -> Result<usize, AppError> {
+    if !locks_supported(&config.proc_locks_path) {
+        return Ok(0);
+    }
+    if config.trusted_agy_exes.is_empty() {
+        return Ok(0);
+    }
+
+    let trusted_canons: Vec<PathBuf> = config
+        .trusted_agy_exes
+        .iter()
+        .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+
+    let lock_entries = match fs::read_dir(&config.presence_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(0),
+    };
+
+    let mut eligible = Vec::new();
+    for entry in lock_entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("lock") {
+            continue;
+        }
+        let Some(conv_id) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+
+        // Skip if already registered with valid credentials
+        let already_registered = {
+            let store_lock = store.read().unwrap();
+            store_lock.values().any(|info| {
+                (info.conversation_id == conv_id || info.session_key == conv_id)
+                    && info
+                        .credentials
+                        .as_ref()
+                        .map(|c| !c.is_stale)
+                        .unwrap_or(false)
+            })
+        };
+        if already_registered {
+            continue;
+        }
+
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        use std::os::unix::fs::MetadataExt;
+        let target_dev = meta.dev();
+        let target_ino = meta.ino();
+        let maj = dev_major(target_dev);
+        let min = dev_minor(target_dev);
+
+        let holder_pid = match find_lock_holder(&config.proc_locks_path, maj, min, target_ino) {
+            Ok(Some(pid)) => pid,
+            _ => continue,
+        };
+
+        let exe_matches = match crate::process::exe_path(&config.proc_root, holder_pid) {
+            Ok(exe) => {
+                let exe_canon = fs::canonicalize(&exe).unwrap_or(exe);
+                trusted_canons.contains(&exe_canon)
+            }
+            Err(_) => false,
+        };
+        if !exe_matches {
+            continue;
+        }
+
+        let has_file_open = match crate::process::open_file_ids(&config.proc_root, holder_pid) {
+            Ok(ids) => ids.contains(&(target_dev, target_ino)),
+            Err(_) => false,
+        };
+        if !has_file_open {
+            continue;
+        }
+
+        let Ok(holder_st) = crate::process::starttime(&config.proc_root, holder_pid) else {
+            continue;
+        };
+
+        eligible.push((conv_id.to_string(), holder_pid, holder_st));
+    }
+
+    if eligible.is_empty() {
+        return Ok(0);
+    }
+
+    let proc_entries = match fs::read_dir(&config.proc_root) {
+        Ok(e) => e,
+        Err(_) => return Ok(0),
+    };
+
+    let mut candidate_pids = Vec::new();
+    for entry in proc_entries.flatten() {
+        if let Some(pid_str) = entry.file_name().to_str() {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                candidate_pids.push(pid);
+            }
+        }
+    }
+    candidate_pids.sort_unstable();
+
+    let mut registered_count = 0;
+
+    for (conv_id, holder_pid, holder_st) in eligible {
+        if crate::process::starttime(&config.proc_root, holder_pid)
+            .ok()
+            .as_deref()
+            != Some(&holder_st)
+        {
+            continue;
+        }
+
+        for &p in &candidate_pids {
+            if p == holder_pid || p <= 1 {
+                continue;
+            }
+
+            // Scope rule: never read a process outside the attested agy's subtree
+            if !is_descendant_of(&config.proc_root, p, holder_pid) {
+                continue;
+            }
+
+            // Start-time check before reading
+            let Ok(st_before) = crate::process::starttime(&config.proc_root, p) else {
+                continue;
+            };
+
+            let environ_path = config.proc_root.join(p.to_string()).join("environ");
+            let bytes = match fs::read(&environ_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(
+                        conversation_id = %conv_id,
+                        pid = p,
+                        "cannot read environ for agy descendant: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            // Start-time check after reading to reject recycled PIDs
+            let Ok(st_after) = crate::process::starttime(&config.proc_root, p) else {
+                continue;
+            };
+            if st_before != st_after {
+                continue;
+            }
+
+            // Re-verify holder starttime has not changed
+            if crate::process::starttime(&config.proc_root, holder_pid)
+                .ok()
+                .as_deref()
+                != Some(&holder_st)
+            {
+                break;
+            }
+
+            // Scope rule: read ONLY ANTIGRAVITY_LS_ADDRESS and ANTIGRAVITY_CSRF_TOKEN
+            // Never read any other variable; never log or persist the values
+            let mut ls_address = None;
+            let mut csrf_token = None;
+
+            for chunk in bytes.split(|&b| b == 0) {
+                if let Ok(s) = std::str::from_utf8(chunk) {
+                    if let Some(val) = s.strip_prefix("ANTIGRAVITY_LS_ADDRESS=") {
+                        if !val.is_empty() {
+                            ls_address = Some(val.to_string());
+                        }
+                    } else if let Some(val) = s.strip_prefix("ANTIGRAVITY_CSRF_TOKEN=") {
+                        if !val.is_empty() {
+                            csrf_token = Some(val.to_string());
+                        }
+                    }
+                }
+            }
+
+            if let (Some(ls), Some(csrf)) = (ls_address, csrf_token) {
+                let req = AgyRegisterRequest {
+                    conversation_id: conv_id.clone(),
+                    ls_address: ls,
+                    csrf_token: csrf,
+                };
+                match verify_registration(
+                    &config.proc_root,
+                    &config.proc_locks_path,
+                    &config.presence_dir,
+                    &config.trusted_agy_exes,
+                    my_uid,
+                    my_uid,
+                    holder_pid,
+                    &req,
+                ) {
+                    Ok(reg) => {
+                        let session_info = AgySessionInfo::new_with_credentials(
+                            conv_id.clone(),
+                            reg.pid,
+                            reg.starttime,
+                            AgyCredentials {
+                                ls_address: req.ls_address,
+                                csrf_token: req.csrf_token,
+                                is_stale: false,
+                            },
+                        );
+                        {
+                            let mut store_lock = store.write().unwrap();
+                            store_lock.insert(reg.session_key.clone(), session_info);
+                        }
+                        flush_agy_queue(config, store, db, &reg.session_key, &conv_id).await;
+                        registered_count += 1;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            conversation_id = %conv_id,
+                            "verify_registration failed during proc scan: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(registered_count)
+}
+
+/// Runs the continuous background watcher polling agy descendants on a 100ms interval.
+pub async fn run_agy_proc_watcher(
+    config: AgyConfig,
+    store: AgyStore,
+    db: Arc<Mutex<rusqlite::Connection>>,
+    my_uid: u32,
+) {
+    loop {
+        tokio::time::sleep(AGY_PROC_WATCH_INTERVAL).await;
+        let _ = scan_and_register_agy_proc(&config, &store, &db, my_uid).await;
+    }
+}
+
 /// Runs the registration Unix domain socket server multiplexing agy and pi harnesses.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_register_server(
@@ -1060,6 +1394,16 @@ pub async fn run_register_server(
         )
     })?;
 
+    let stand_down_counts: Arc<tokio::sync::RwLock<HashMap<String, u32>>> =
+        Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+    let watcher_config = config.clone();
+    let watcher_store = store.clone();
+    let watcher_db = db.clone();
+    tokio::spawn(async move {
+        run_agy_proc_watcher(watcher_config, watcher_store, watcher_db, my_uid).await;
+    });
+
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(s) => s,
@@ -1089,6 +1433,7 @@ pub async fn run_register_server(
         let trusted_svc_exes_clone = trusted_svc_exes.clone();
         let svc_notify_tx_clone = svc_notify_tx.clone();
         let fed_state_clone = fed_state.clone();
+        let stand_down_counts_clone = stand_down_counts.clone();
 
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1170,10 +1515,28 @@ pub async fn run_register_server(
                                         .unwrap_or(false)
                             })
                         };
+                        let (watching, stand_down) = if has_creds {
+                            stand_down_counts_clone.write().await.remove(conv_id);
+                            (false, false)
+                        } else {
+                            let is_watched = is_conversation_proc_watched(&config_clone, conv_id);
+                            if is_watched {
+                                let mut counts = stand_down_counts_clone.write().await;
+                                let count = counts.entry(conv_id.to_string()).or_insert(0);
+                                *count += 1;
+                                (true, *count == 1)
+                            } else {
+                                stand_down_counts_clone.write().await.remove(conv_id);
+                                (false, false)
+                            }
+                        };
                         let resp = serde_json::json!({
                             "status": "ok",
                             "hasCredentials": has_creds,
                             "has_credentials": has_creds,
+                            "watching": watching,
+                            "stand_down": stand_down,
+                            "standDown": stand_down,
                         });
                         let _ = writer.write_all(format!("{resp}\n").as_bytes()).await;
                     }
@@ -1268,6 +1631,10 @@ pub async fn run_register_server(
                                         let mut store_lock = store_clone.write().unwrap();
                                         store_lock.insert(reg.session_key.clone(), session_info);
                                     }
+                                    stand_down_counts_clone
+                                        .write()
+                                        .await
+                                        .remove(&req.conversation_id);
                                     let resp = serde_json::json!({
                                         "status": "ok",
                                         "sessionId": reg.session_key,

@@ -347,11 +347,18 @@ fn run_register_agy(args: RegisterAgyArgs) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionCheckResult {
+    pub has_credentials: bool,
+    pub watching: bool,
+    pub stand_down: bool,
+}
+
 fn check_session_has_credentials(
     sock_path: &std::path::Path,
     conv_id: &str,
     url: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<SessionCheckResult, Box<dyn std::error::Error>> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
@@ -368,13 +375,22 @@ fn check_session_has_credentials(
             let mut resp = String::new();
             if reader.read_line(&mut resp).is_ok() {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
-                    if let Some(b) = v
+                    let has_creds = v
                         .get("hasCredentials")
                         .or_else(|| v.get("has_credentials"))
                         .and_then(|v| v.as_bool())
-                    {
-                        return Ok(b);
-                    }
+                        .unwrap_or(false);
+                    let watching = v.get("watching").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let stand_down = v
+                        .get("stand_down")
+                        .or_else(|| v.get("standDown"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    return Ok(SessionCheckResult {
+                        has_credentials: has_creds,
+                        watching,
+                        stand_down,
+                    });
                 }
             }
         }
@@ -389,7 +405,11 @@ fn check_session_has_credentials(
                 if status.is_success() {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
                         if let Some(reg) = val.get("registered").and_then(|r| r.as_bool()) {
-                            return Ok(reg);
+                            return Ok(SessionCheckResult {
+                                has_credentials: reg,
+                                watching: false,
+                                stand_down: false,
+                            });
                         }
                     }
                 }
@@ -405,11 +425,15 @@ fn check_session_has_credentials(
     if resp.status().is_success() {
         let val: serde_json::Value = resp.json()?;
         if let Some(reg) = val.get("registered").and_then(|r| r.as_bool()) {
-            return Ok(reg);
+            return Ok(SessionCheckResult {
+                has_credentials: reg,
+                watching: false,
+                stand_down: false,
+            });
         }
     }
 
-    Ok(false)
+    Ok(SessionCheckResult::default())
 }
 
 fn run_hook_agy(args: RegisterAgyArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -456,8 +480,8 @@ fn run_hook_agy(args: RegisterAgyArgs) -> Result<(), Box<dyn std::error::Error>>
         },
     };
 
-    let has_credentials = match check_session_has_credentials(&sock_path, &conv_id, &args.url) {
-        Ok(has) => has,
+    let check = match check_session_has_credentials(&sock_path, &conv_id, &args.url) {
+        Ok(res) => res,
         Err(e) => {
             eprintln!("xmsg register agy notice: failed to check credentials: {e}");
             println!("{{}}");
@@ -465,7 +489,7 @@ fn run_hook_agy(args: RegisterAgyArgs) -> Result<(), Box<dyn std::error::Error>>
         }
     };
 
-    if has_credentials {
+    if check.has_credentials || check.stand_down {
         println!("{{}}");
     } else {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("xmsg"));

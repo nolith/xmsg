@@ -177,7 +177,20 @@ TypeScript extension for Pi (`@earendil-works/pi-coding-agent`):
 
 ### 3.3 Antigravity Integration: Automatic Registration & Hooks
 
-Antigravity (`agy`) session credentials (`ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN`, `ANTIGRAVITY_CONVERSATION_ID`) exist only inside the interactive harness process and in the tool subshells spawned by its language server. Neither MCP server children nor external hook commands inherit these variables directly.
+Antigravity (`agy`) session credentials (`ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN`, `ANTIGRAVITY_CONVERSATION_ID`) exist only inside the interactive harness process and in the tool subshells spawned by its language server. Neither MCP server children nor external hook commands inherit these variables directly, and no on-disk credential publication exists.
+
+#### Linux In-Process Command Watcher (Arm A) & Darwin Fallback (Arm B′)
+
+On Linux, `xmsg` registers `agy` conversations itself by actively watching descendant processes spawned by the attested `agy` process holding the conversation's presence lock. Because Antigravity injects `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN` solely into the environment of the tool commands executed by the model (`run_command`), and offers no other credential publication channel, `xmsg` monitors `/proc/<pid>/environ` of attested `agy` descendants on a 100ms interval.
+
+Strict scope rules are enforced in code:
+
+- **Ancestry Boundary:** `xmsg` never inspects or reads a process outside the attested `agy` process's subtree.
+- **Variable Whitelist:** `xmsg` reads *only* `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN`, ignoring all other environment variables.
+- **Zero Logging/Persistence:** Credential values are passed directly into registration memory and are never written to logs or disk.
+- **PID Recycling Guard:** Process start times are validated immediately before and after reading `/proc/<pid>/environ` and verified against the presence lock holder to ensure recycled PIDs are rejected.
+
+On Darwin and in sandboxes without accessible `/proc`, `xmsg` falls back to the PreInvocation hook request (Arm B′). While Arm A is actively watching an unregistered conversation on Linux, the PreInvocation hook stands down on the first turn (emitting `{}`), allowing Arm A to register silently when the model's first command executes. If the conversation remains unregistered on later turns (e.g. no command was run or `/proc` was unreadable), or if Arm A is not watching (Darwin/sandboxes), the hook injects a `userMessage` asking the model to run `xmsg register agy`.
 
 `xmsg` implements a two-stage automatic registration lifecycle:
 
@@ -203,11 +216,13 @@ Antigravity (`agy`) session credentials (`ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_
    On each turn, `agy` passes hook JSON on stdin containing `conversationId`.
 
    - If that session already has push credentials registered, `xmsg` prints `{}`.
-   - If push credentials are not yet registered, `xmsg` emits an `ephemeralMessage` instructing the model to run `xmsg register agy` before anything else.
+   - If push credentials are not yet registered:
+     - When Arm A is watching and this is the first turn since becoming unregistered, `xmsg` prints `{}` (stand-down).
+     - If still unregistered on subsequent turns, or when Arm A is not watching (Darwin/sandboxes), `xmsg` emits a `userMessage` instructing the model to run `xmsg register agy` before anything else.
    - On any error (malformed stdin, missing fields, or connection failure), `xmsg` logs a notice to stderr, prints `{}`, and exits 0 to ensure model execution is never blocked.
 
 3. **Credential Registration & FIFO Queue Flush:**
-   The model executes `<exe_path> register agy` via its first tool call (`run_command`). In that tool subshell, the environment contains `ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN`, and `ANTIGRAVITY_CONVERSATION_ID`. `xmsg register agy` connects to `register.sock` and supplies the credentials. As soon as credentials register, all queued messages are flushed to the session in FIFO order (`outcome: "delivered"`). Subsequent turns find credentials active and emit `{}`.
+   Credentials can register either automatically via Arm A's proc watcher or via the model running `<exe_path> register agy`. In both paths, credentials are authenticated through `verify_registration`. As soon as credentials register, all queued messages are flushed to the session in FIFO order (`outcome: "delivered"`). Subsequent turns find credentials active and emit `{}`.
 
 4. **Error Reporting Invariance:**
    Sending to a live PID that has no attested agent session returns `unregistered` (`process <pid> has no attested agent session`). The outdated text `"process exited"` appears nowhere for live processes.
