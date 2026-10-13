@@ -645,7 +645,8 @@ pub async fn run_leaf_inbox_task(
                     session_id: target_session_id.clone(),
                     from_name: from_name.clone(),
                     bytes: msg.body.len(),
-                    outcome: "delivered".to_string(),
+                    // `delivered` once the service acks it: `storage::ack_svc_message`.
+                    outcome: "queued".to_string(),
                     recipient_harness: "svc".to_string(),
                     return_harness,
                     return_session_id,

@@ -469,7 +469,8 @@ Communication over the registration socket uses a JSON-lines streaming protocol:
    { "action": "ack", "messageId": "01M4FG..." }
    ```
 
-   Server responds: `{"status": "ok"}`.
+   Server responds: `{"status": "ok"}`. The message's record then reads `delivered`: a send to a service answers
+   `queued` until its ack (Section 4, Delivery and the queue).
 
    A reply is `{ "action": "reply", "messageId": "01M4FG...", "text": "...", "idempotencyKey": "..." }` (the key optional, Section 4, Idempotency); the server responds `{"status": "ok", "messageId": <the pushed reply's ID, or null>}`.
 
@@ -533,7 +534,7 @@ A `to` with `@node` is resolved by that node alone (`@` this node: the steps abo
 
 ### Delivery and the queue (A14)
 
-- **Outcomes.** A send returns `delivered` (it reached a live recipient) or `queued` (it is held for an instance that is not running, or for a live pi or plugin session (opencode, hermes) until its harness acks it, HA3). A held message's record (`GET /v1/messages/{id}`, and a keyed send's replay) reads `delivered` once it is delivered or acked. Across nodes, the receiving node's record follows the ack; the sending node's stays at the answer it got, since no `/fed/v2` exchange reports a later delivery.
+- **Outcomes.** A send returns `delivered` (it reached a live recipient) or `queued` (it is held for an instance that is not running, or for a live pi or plugin session (opencode, hermes) or a registered service until its harness or the service acks it, HA3). A held message's record (`GET /v1/messages/{id}`, and a keyed send's replay) reads `delivered` once it is delivered or acked. Across nodes, the receiving node's record follows the ack; the sending node's stays at the answer it got, since no `/fed/v2` exchange reports a later delivery.
 - **What queues.** A send to an instance ID this node has observed, while it is not running: a closed Claude conversation, or an agy conversation between turns. "Observed" is the claim table (a Claude process presenting the ID) plus agy registrations. A pi ID, a released or closed plugin session's address (opencode, hermes) and an exited `X~n` are `gone`, never queue and are never listed `parked`.
 - **How long.** A message is held for the reply TTL (`--reply-ttl`, 7 days by default) and dropped unread after it. The ID stays parked, so sends to it queue, for the reply TTL after the conversation was last live, or as long as its queue holds a message, whichever is longer; after that it is `not_found` (D-1's lifetime). Discovery is on demand, so for Claude "last live" is the scan that found the conversation gone, and for agy its last registration.
 - **Delivery.** The queue drains when the conversation is next observed: a new Claude process presenting the ID (the next scan of the session files, which every `list`, `send` and MCP start runs), or an agy registration. Each message is delivered once, in the order sent, and shows when it was sent: `[xmsg] message_id=<id> sent=<RFC 3339 UTC time>`. Its outcome then reads `delivered`.

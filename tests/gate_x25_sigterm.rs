@@ -409,7 +409,7 @@ async fn test_oracle_3_unacked_message_persists_across_sigterm_restart() {
         .await
         .unwrap();
     let send_resp = read_json_line(&mut send_reader).await;
-    assert_eq!(send_resp["outcome"], "delivered");
+    assert_eq!(send_resp["outcome"], "queued");
     let sent_msg_id = send_resp["message_id"]
         .as_str()
         .expect("messageId")

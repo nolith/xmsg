@@ -556,7 +556,8 @@ pub(crate) async fn deliver(
                 }
             }
             let _ = local.svc_notify_tx.send(session.session_id.clone());
-            Ok((session.session_id.clone(), "svc", "delivered"))
+            // `delivered` once the service acks it: `storage::ack_svc_message`.
+            Ok((session.session_id.clone(), "svc", "queued"))
         }
     }
 }

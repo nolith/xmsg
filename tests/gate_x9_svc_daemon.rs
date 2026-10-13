@@ -311,7 +311,7 @@ async fn test_oracle_1_trusted_exe_registered_and_addressable() {
     let send_val: Value = send_resp.json().await.unwrap();
     assert_eq!(
         send_val.get("outcome").and_then(|v| v.as_str()),
-        Some("delivered")
+        Some("queued")
     );
     assert_eq!(
         send_val.get("address").and_then(|v| v.as_str()),

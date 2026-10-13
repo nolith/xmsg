@@ -483,7 +483,7 @@ async fn test_oracle_1_full_node_svc_federated_reply() {
     )
     .await;
     assert_eq!(send_resp["status"], "ok");
-    assert_eq!(send_resp["outcome"], "delivered");
+    assert_eq!(send_resp["outcome"], "queued");
     let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
 
     // 3. On B, guard polls the message

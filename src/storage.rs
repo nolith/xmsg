@@ -983,12 +983,16 @@ pub fn get_next_pending_svc_message(
     }
 }
 
+/// The service took the message: its queue row is stamped and its record reads `delivered`.
 pub fn ack_svc_message(conn: &Connection, session_id: &str, message_id: &str) -> Result<bool> {
     let now = now_epoch_secs();
     let count = conn.execute(
         "UPDATE svc_pending_messages SET delivered_at = ?1 WHERE id = ?2 AND session_id = ?3 AND delivered_at IS NULL",
         params![now, message_id, session_id],
     )?;
+    if count > 0 {
+        update_message_outcome(conn, message_id, "delivered")?;
+    }
     Ok(count > 0)
 }
 

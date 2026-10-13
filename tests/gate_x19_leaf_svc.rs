@@ -517,6 +517,14 @@ async fn test_oracle_1_end_to_end_leaf_svc() {
     assert_eq!(deliver_resp["action"], "deliver");
     assert_eq!(deliver_resp["messageId"], msg_id);
     assert_eq!(deliver_resp["text"], "Task request for guard");
+    let leaf_outcome = || {
+        let conn = leaf.db.lock().unwrap();
+        xmsg::storage::get_message(&conn, &msg_id)
+            .unwrap()
+            .map(|m| m.outcome)
+    };
+    // The leaf's record follows the service's ack, as a local service's does.
+    assert_eq!(leaf_outcome().as_deref(), Some("queued"), "before the ack");
 
     // Ack message
     let ack_frame = serde_json::json!({
@@ -530,6 +538,11 @@ async fn test_oracle_1_end_to_end_leaf_svc() {
 
     let ack_resp = read_json_line(&mut reader).await;
     assert_eq!(ack_resp["status"], "ok");
+    assert_eq!(
+        leaf_outcome().as_deref(),
+        Some("delivered"),
+        "after the ack"
+    );
 
     // Reply to message
     let reply_frame = serde_json::json!({

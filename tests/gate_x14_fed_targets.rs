@@ -413,7 +413,7 @@ async fn test_oracle_1_peer_with_targets_delivers_to_allowed_target() {
     );
     assert_eq!(
         send_resp.get("outcome").and_then(|o| o.as_str()),
-        Some("delivered")
+        Some("queued")
     );
 
     // 3. Verify daemon received the message
@@ -901,14 +901,14 @@ async fn test_oracle_4_refused_target_does_not_consume_rate_limit_or_create_stor
         res_allowed
     );
 
-    // Assert: allowed message IS stored in DB with delivered outcome
+    // Assert: allowed message IS stored in DB, queued for the service until its ack
     let db = node_b.db.lock().unwrap();
     let stored_allowed = storage::get_message(&db, allowed_id).unwrap();
     assert!(
         stored_allowed.is_some(),
         "allowed message must be stored in the messages table"
     );
-    assert_eq!(stored_allowed.as_ref().unwrap().outcome, "delivered");
+    assert_eq!(stored_allowed.as_ref().unwrap().outcome, "queued");
 
     // And refused message is STILL not in store
     assert!(storage::get_message(&db, refused_id).unwrap().is_none());

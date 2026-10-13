@@ -227,7 +227,7 @@ async fn test_oracle_1_local_attested_session_origin() {
     assert_eq!(send_resp.get("status").and_then(|s| s.as_str()), Some("ok"));
     assert_eq!(
         send_resp.get("outcome").and_then(|o| o.as_str()),
-        Some("delivered")
+        Some("queued")
     );
 
     // 3. Daemon polls register.sock
@@ -571,7 +571,7 @@ async fn test_oracle_2_federated_message_origin() {
     );
     assert_eq!(
         send_resp.get("outcome").and_then(|o| o.as_str()),
-        Some("delivered")
+        Some("queued")
     );
 
     // 3. Daemon on node_b polls register.sock
