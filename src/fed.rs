@@ -110,17 +110,12 @@ pub(crate) fn target_matches_allowlist(
     targets.iter().any(|t| t == key)
 }
 
-/// Before resolution: could `target_ref` name an allowed target? `svc:<n>` names the
-/// service `<n>` and `session:<id>` the instance `<id>`. A harness kind (`claude:`, `agy:`,
-/// `pi:`, `http:`) prefixes a label or an instance the unresolved ref cannot prove, so it
-/// never passes a non-empty `targets`.
+/// Before resolution: could `target_ref` name an allowed target? The ref is read in the
+/// destination's grammar (`http::resolve_target`): an instance ID or a name, with no kind
+/// prefix (A3, B4). A `svc:`, `session:` or harness-prefixed ref is not a ref there, so it
+/// matches no entry here (an entry carrying such a prefix is refused at load).
 pub(crate) fn target_ref_could_match(target_ref: &str, targets: &[String]) -> bool {
-    let bare = match target_ref.split_once(':') {
-        Some(("svc" | "session", rest)) => rest,
-        Some((kind, _)) if RETIRED_FILTER_KINDS.contains(&kind) => return false,
-        _ => target_ref,
-    };
-    targets.iter().any(|t| t == bare)
+    targets.iter().any(|t| t == target_ref)
 }
 
 /// Does a `principals` filter admit this sender? It matches the service name, the

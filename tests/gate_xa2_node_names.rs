@@ -662,6 +662,74 @@ async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
 }
 
 // =============================================================================
+// Oracle 3a (the hub leg of oracle 3): H knows L as `laptop` and C as `cnode`; a hop from
+// L reaches C carrying L's canonical name, never H's nickname for it nor H's own name. The
+// hop is posted to H by an in-process client holding L's credentials (tests/hop_client);
+// L itself is not run. Oracle 3 keeps the origin-side legs (XA5).
+// Mutant M3: put the nickname on the wire (the hub's forward mark) => RED.
+// Mutant M3b: drop the forward mark (`forwarded: None`) => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_3a_hub_forwards_canonical_origin() {
+    run_with_port_retry(|| async {
+        let (l_cert, l_key, l_pin) = generate_self_signed_ed25519("laptop-host").unwrap();
+        let c_creds = pinned_creds("c-host");
+        let h_creds = pinned_creds("hub-host");
+        let l_name = node_name_from_pin(&l_pin).unwrap();
+        let c_name = node_name_from_pin(&c_creds.pin).unwrap();
+        let h_name = node_name_from_pin(&h_creds.pin).unwrap();
+        let h_fed = get_free_port();
+        let c = start(
+            NodeSpec {
+                creds: Some(c_creds.clone()),
+                peers: Some(
+                    json!({ "hub": pin_entry(&addr(h_fed), &h_creds.pin, &["send", "reply", "relayed"]) })
+                        .to_string(),
+                ),
+                fed: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let h_peers = json!({
+            "laptop": pin_entry(&addr(get_free_port()), &l_pin, &["send", "reply", "forward"]),
+            "cnode": pin_entry(&addr(c.fed_port), &c_creds.pin, &["send", "reply"]),
+        })
+        .to_string();
+        let h_pin = h_creds.pin.clone();
+        let mut h_spec = NodeSpec {
+            creds: Some(h_creds),
+            peers: Some(h_peers),
+            ..Default::default()
+        };
+        h_spec
+            .extra_args
+            .extend(["--fed-listen".to_string(), addr(h_fed)]);
+        let _h = start(h_spec, None).await;
+        let bob = claude_session(&c.sessions_dir, "bob", "Bob");
+
+        let origin = Origin {
+            cert_der: &l_cert,
+            key_der: &l_key,
+        };
+        let r = format!("bob@{c_name}");
+        let (status, body) = hop_send(&origin, &h_pin, h_fed, &r, "via the hub").await;
+        assert_eq!(status, 202, "{r} through the hub: {body}");
+        let line = wait_line(&bob).await.expect("bob on C receives the relay");
+        assert!(
+            line.contains(&format!("alice@{l_name}")),
+            "C has no nickname for L, so it sees L's canonical name {l_name}: {line}"
+        );
+        assert!(
+            !line.contains("laptop") && !line.contains("@hub") && !line.contains(&h_name),
+            "neither H's nickname for L nor H's own name stands for the origin: {line}"
+        );
+    })
+    .await;
+}
+
+// =============================================================================
 // Oracle 3b (split from oracle 3 by XA3): a direct send by nickname. H knows L as `laptop`;
 // `alice@laptop` typed on H resolves through H's peers file and reaches alice on L.
 // =============================================================================
@@ -1006,15 +1074,16 @@ async fn test_oracle_8_no_hand_assigned_name() {
 // =============================================================================
 // Oracle 7b: Filters at a hub (xa2-verify-v0 C1). A -> H -> D; on H, D's entry has
 // `targets = ["genie-guard", "sess-label"]`, and D has no service, only a Claude instance
-// labelled `genie-guard` (id `sess-label`). The hub checks the unresolved ref: a ref with
-// a harness kind (`claude:`) never passes, even naming a listed ID; `svc:`/`session:` map
-// to the name. The bare-label case (`genie-guard@D@hub`) is open by design, not asserted.
+// labelled `genie-guard` (id `sess-label`). The hub checks the unresolved ref in the
+// destination's grammar (A3, B4): a ref is an ID or a name, so a kind-prefixed ref
+// (`session:`, `claude:`) never passes, even naming a listed ID. The bare-label case
+// (`genie-guard@D@hub`) is open by design, not asserted.
 // The hop is posted to H by an in-process client holding A's credentials (tests/hop_client):
 // nothing in xmsg originates one until XA5's routing; A itself is not run.
 // Mutant M7c: strip every retired kind prefix from the ref => RED.
+// Mutant M7d: map `svc:`/`session:` to the bare name in `target_ref_could_match` => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA3 finding, disposition owed: H's targets filter admits session:sess-label@D, and D answers 404 not_found because kind prefixes left the grammar (A3, B4)"]
 async fn test_oracle_7b_hub_targets_refuse_harness_kind_refs() {
     run_with_port_retry(|| async {
         let (a_cert, a_key, a_pin) = generate_self_signed_ed25519("a").unwrap();
@@ -1056,7 +1125,7 @@ async fn test_oracle_7b_hub_targets_refuse_harness_kind_refs() {
 
         for (r, want) in [
             (format!("sess-label@{d_name}"), 202),
-            (format!("session:sess-label@{d_name}"), 202),
+            (format!("session:sess-label@{d_name}"), 403),
             (format!("claude:genie-guard@{d_name}"), 403),
             (format!("claude:sess-label@{d_name}"), 403),
         ] {
@@ -1076,8 +1145,11 @@ async fn test_oracle_7b_hub_targets_refuse_harness_kind_refs() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let got = inbox.lock().unwrap().clone();
         assert!(
-            got.len() == 2 && got.iter().all(|l| !l.contains("to claude:")),
-            "only the two admitted sends reach the labelled instance: {got:?}"
+            got.len() == 1
+                && got
+                    .iter()
+                    .all(|l| !l.contains("to session:") && !l.contains("to claude:")),
+            "only the bare-ID send reaches the labelled instance: {got:?}"
         );
     })
     .await;
