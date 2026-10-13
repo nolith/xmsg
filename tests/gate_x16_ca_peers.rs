@@ -12,8 +12,8 @@ use tokio::net::{TcpListener, UnixListener};
 use xmsg::agy::{new_agy_store, AgyConfig};
 use xmsg::error::AppError;
 use xmsg::fed::{
-    parse_ca_bundle_pem, run_fed_listener, send_federated_message, FedEnvelope, FedPrincipal,
-    FedState, FedTarget, PeerConfig, PeersMap, RateLimiter,
+    parse_ca_bundle_pem, run_fed_listener, send_federated_message, FedEnvelope, FedState,
+    FedTarget, PeerConfig, PeersMap, RateLimiter,
 };
 use xmsg::pi::new_pi_store;
 use xmsg::storage;
@@ -143,6 +143,8 @@ async fn create_test_node(
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let fed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -210,12 +212,13 @@ fn create_claude_session_fixture(
 
 fn make_envelope(target: &str, body: &str) -> FedEnvelope {
     FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: format!("msg-{}", ulid::Ulid::new()),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "test-sess".to_string(),
-            name: "test-sender".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("test-sess".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("test-sender".to_string()),
         },
         to: FedTarget {
             r#ref: target.to_string(),

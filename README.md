@@ -435,7 +435,7 @@ One vocabulary on every surface, as `{"error": <code>, "detail": …}` (HTTP) or
 ### Routes
 
 - `GET /healthz`: Server health check.
-- `GET /v1/recipients?name=&node=&kind=`: the recipients the caller may see: `[{"address","kind","label"?,"status","node"}]`. `address` is `id@node` for an instance and `name@node` for a service; `kind` is `service` or `instance`; `label` is an instance's own description (none for a service, and none for a label containing `@` or `·`); `status` is `live`. `name` matches a label or a service name, `kind` filters by kind, and `node` lists a federated peer (by canonical name or local nickname) instead of this node.
+- `GET /v1/recipients?name=&node=&kind=`: the recipients the caller may see on this node and on every peer (A4): `{"recipients": [{"address","kind","label"?,"status","node","user"}], "nodes": [{"node","status","detail"?}]}`. `address` is `id@node` for an instance and `name@node` for a service; `kind` is `service` or `instance`; `label` is an instance's own description (none for a service, and none for a label containing `@` or `·`); `status` is `live`, or `parked` for an instance observed here that is not running now and would be queued for (A14); `user` is the user the recipient belongs to (A16, Section 7.3). `nodes` says how each node asked answered: `ok`, `unreachable`, `timeout` (it did not answer within the 5 s list timeout) or `denied` (its entry for this node withholds `list`); a node that did not answer `ok` contributes no recipients. `name` matches a label or a service name, `kind` filters by kind, and `node` asks only that node (this one, or a peer by canonical name or local nickname). The `agent.sock` `list` frame answers `{"status":"ok","recipients","nodes"}`.
 - `POST /v1/messages`: send.
   ```json
   {
@@ -539,7 +539,7 @@ A node's name is derived from its identity; nothing assigns it by hand, and `xms
 - **Pinned key:** a certificate with no URI SAN names its node by its key: the first 16 characters of the lowercase RFC 4648 base32 of the SHA-256 of the key's SubjectPublicKeyInfo DER, which is the pin (e.g. `k5x3q7mzv2ndp4ha`). The name proves itself: only the key's holder can present it.
 - **No federation identity:** a node with no `--fed-cert` is `<user>.<host>` from its uid's user name and the OS host name cut at the first `.` (as `hostname -s` does; macOS commonly reports `<name>.local`). This name never goes on the wire.
 
-**Names on the wire and when typed.** Envelopes carry canonical names: the receiving node attributes a message to the canonical name of the peer entry that authenticated it, and a hub's forward mark (`forwarded.origin_peer`) is the origin's canonical name. A typed `@node` takes either the canonical name or this node's local nickname for the peer (the key of a pinned entry), translated through the local peers file. A message from a peer this node has a nickname for shows `... @<nickname>` in its label; one from a node it has no nickname for shows the canonical name.
+**Names on the wire and when typed.** Envelopes carry canonical names. The receiving node attests the sender's node itself (N-2): it attributes a message to the canonical name of the peer entry that authenticated it, whatever node the envelope's origin claims. Only a forwarded envelope's origin node is read, and it is the forwarding hub's attestation (Section 7.7). A typed `@node` takes either the canonical name or this node's local nickname for the peer (the key of a pinned entry), translated through the local peers file. A message from a peer this node has a nickname for shows `... @<nickname>` in its label; one from a node it has no nickname for shows the canonical name.
 
 ### 7.1 Security Architecture & Identity
 
@@ -562,7 +562,22 @@ Federated connections establish peer identity using cryptographic certificate pi
   - **Source Validation (`from` present):** When `from` is configured, after the peer's certificate pin matches, the connection's remote IP is checked against the configured CIDRs. If the source IP falls outside all listed CIDRs, the request is immediately rejected with HTTP `403 Forbidden` (`peer_rejected`) and 0 bytes are delivered.
   - **Empty `from` Disallowed:** Configuring `"from": []` is invalid and causes an immediate configuration load error naming the peer.
   - **Stale `no_whois` Rejected:** Previous WhoIs configurations containing `"no_whois"` are rejected at load time naming the obsolete field.
-  - **Inbound Listener Enforcement:** Source address validation applies uniformly to all inbound federated routes (`/fed/v1/messages`, `/fed/v1/replies`, and `/fed/v1/sessions`).
+  - **Inbound Listener Enforcement:** Source address validation applies uniformly to all inbound federated routes (`/fed/v2/*`).
+
+#### The wire (`/fed/v2`)
+
+Nodes talk over `/fed/v2`, and every envelope carries `"v": 2`. The `/fed/v1` routes are gone with no alias (A1; plan §6 D2), so a node on this release and one on an older release refuse each other with `404` in both directions: a message is refused, never half-read. An envelope's sender is one origin shape for every sender, `{"id" | "service", "node", "label"?}` (A12): an instance ID or a service name, which the sending node attests, and the sender's own label; an anonymous HTTP sender has neither and its label is its `from`. The wire carries no harness. A reply's replier has the same shape. The receiving node attests the node part (N-2, Section 7.0).
+
+| route                                     | method    | does                                                                          |
+| ----------------------------------------- | --------- | ----------------------------------------------------------------------------- |
+| `/fed/v2/messages`                        | POST      | a send (or, with the `forward` right, a hop through this node, Section 7.7)   |
+| `/fed/v2/replies`                         | POST      | a reply to a message this node sent                                           |
+| `/fed/v2/messages/{id}/replies`           | GET       | the replies stored for a message the asker sent (an undialable sender's pull) |
+| `/fed/v2/sessions`                        | GET       | this node's `list` for the asker (Section 7.3)                                |
+| `/fed/v2/inbox`, `/fed/v2/inbox/{id}/ack` | GET, POST | a dial-out client's mailbox (Sections 7.5, 7.6)                               |
+| `/fed/v2/list/{query}`                    | POST      | a dial-out client's answer to a `list` query from its mailbox                 |
+
+**Replies return to the origin (A-2).** A reply always travels back to the node the message came from, and that node decides how it reaches the sender, by the sender's kind: pushed to a session or a service, which have inboxes, and stored for an anonymous HTTP caller, who reads it there with `replies`. The receiving node never decides it. The outbound reply poller of a node that dials out is armed the same way, by the sender's kind.
 
 ### 7.2 Trust models: pinned and CA-signed
 
@@ -651,12 +666,13 @@ No CRL (Certificate Revocation List) or OCSP (Online Certificate Status Protocol
   - **Target Filtering (`targets`):** When `targets` is configured, a federated `send` from that peer is refused with HTTP `403 Forbidden` (`denied`, "target not allowed for peer") before rate-limiting or queueing unless the resolved local target's service name or instance ID is listed. An empty present list (`"targets": []`) refuses all targets. When `targets` is omitted, every local target is reachable. Replies on the federated reply route are not gated by `targets`.
     - *Target Resolution (P1):* A federated ref is read in the local grammar, an instance ID or a name, compared exactly; `resolve_target_session_fed` runs the local resolver on it unchanged, so a kind- or harness-prefixed ref (`claude:x`, `svc:guard`, `session:x`) names nothing and is `not_found`. The `targets` check runs on the resolved target.
 
-- **Federated Session Listing (`GET /fed/v1/sessions` & `GET /v1/recipients?node=<name>`):**
+- **The mesh `list` (A4, A-1):** `list` (`GET /v1/recipients`, the MCP and `agent.sock` `list`) asks this node and every peer in the peers file, concurrently, and returns everything the caller may see. The peers file is the path until hub routing (H6). Nothing keeps a central directory; each node answers for itself.
 
-  - **Inbound Route (`GET /fed/v1/sessions`):** Remote peers authenticate over mTLS and must have `"list"` in their configured `allow` list, or requests are refused with HTTP `403 Forbidden` (`denied`).
-  - **Target Filtering:** When the peer has `targets` configured, `xmsg` filters local sessions with the same rule as `send` (`target_matches_allowlist`: service name or instance ID), returning only sessions and service daemons that the peer is permitted to message. When `targets` is omitted, all local sessions are visible.
-  - **Minimal Field Set:** To preserve host isolation and privacy, each entry returned on the federated wire route carries only `name`, `sessionId`, `harness`, `kind`, and `status`. Host-internal details (`cwd`, `pid`, timestamps, versions, entrypoints) are stripped.
-  - **Client-Side Query (`GET /v1/recipients?node=<name>`):** Local clients query remote peer sessions over `http.sock`. `xmsg` looks up `<name>` (a canonical name or a local nickname) in the peers map, calls the remote peer's `/fed/v1/sessions` over the outbound mTLS connector, and returns entries with `ref` set to `<sessionId>@<entry key>` (the exact address format accepted by `send`), where `<entry key>` is the peer's key in the local peers file: a pinned peer queried by its canonical name comes back under its nickname. If `<name>` is unknown, HTTP `404 Not Found` is returned. If the remote peer refuses or is unreachable, the error status is passed through naming the peer.
+  - **A direct peer** (one this node dials, an outbound hub included) is asked over `GET /fed/v2/sessions`. It applies its own rights for the asker: unless its entry for the asker has `"list"` in `allow`, it refuses with `403 Forbidden` (`denied`), and the asker reports that node `denied` in `nodes`.
+  - **A dial-out client** (an entry with `"leaf": true`: a leaf, or a full node on an outbound link) cannot be called. The asker puts a `list` query in its mailbox, which wakes its waiting long-poll; the client answers on `POST /fed/v2/list/{query}`, applying its own entry for the asker, and a client whose entry withholds `list` answers `denied` (gate v1 AM-1).
+  - **The list timeout is 5 s per node** (plan §6 D14). A node that does not answer within it is `timeout`, one that cannot be connected is `unreachable`, and the rest of the result still comes back. A disconnected dial-out client is `timeout`: nobody collects its query.
+  - **Entries.** Each entry on the wire is `{"id","kind","label"?,"status","user"}`; the asker adds its address, `id@<entry key>`, the key under which this node knows the peer, which `send` accepts. Host-internal details (`cwd`, `pid`, harness, timestamps) never cross the wire. A peer's `targets` narrows what it is shown, with the same rule as `send` (a service name or an instance ID).
+  - **Users (A16, P-3).** Every entry carries the user its instance belongs to: the user part of the listing node's certificate (`<user>` of `<user>.<host>`), a pod's node name `<sa>.<ns>` (D-8), a pinned node's key-derived name (a user of its own), and for a node with no federation identity its OS user. The asker drops any entry whose user is not the user of the certificate the listing node presented. That is the honest node's rule and all a receiver can enforce: nothing binds an ID to a user, so a node can still list another user's ID under its own user.
 
 - **No Forwarding by default:** a receiving node delivers only to its own sessions. A `to.ref` that still contains `@` is refused (`denied`) unless the sending peer holds the `"forward"` right on this node (Section 7.7, Forwarding through a hub), and a message that already carries a forward mark is never forwarded again.
 
@@ -678,11 +694,12 @@ For workloads running inside containers or Kubernetes pods (e.g. `genie-guard` o
 - **Leaf Server (`--leaf`):** Serves loopback HTTP and additionally binds `$XDG_RUNTIME_DIR/xmsg/register.sock` (configurable via `--leaf-register-sock`, mode `0600`).
 - **Admission Invariant:** Daemons registering on `register.sock` in leaf mode must match the configured `--leaf-principal` (`svc:<name>`) and run under the same UID as `xmsg` (`SO_PEERCRED`). Because containers in a pod do not share a PID namespace, `/proc/<pid>/exe` attestation is omitted; `--svc-exe` is refused at startup when combined with `--leaf` naming both flags.
 - **Hub-Side Durable Mailbox:** When any local or federated sender addresses `<ref>@<leaf-peer>` where `<leaf-peer>` is marked `"leaf": true`, the hub does not push over TCP. Instead, after gating against the peer's `targets` filter, the hub stores the message in a durable `peer_mailbox` (subject to body TTL).
-- **Federated Inbox Routes (`/fed/v1/inbox`):**
-  - `GET /fed/v1/inbox?wait=<s>`: Long-polls the hub (clamped between 0 and 60 seconds), returning at most one pending message with its `id`, `origin`, and `body`. Non-leaf peers receive HTTP `403 Forbidden` (`denied`).
-  - `POST /fed/v1/inbox/{id}/ack`: Removes the message from the peer's mailbox upon explicit acknowledgment. Returns HTTP `404 Not Found` if the ID does not exist in that peer's mailbox. Unacknowledged messages remain queued and are returned on the next poll. Mailboxes are strictly isolated per peer.
-- **Strict Acknowledgment Ordering:** A leaf background task long-polls the hub inbox, enqueues inbound messages into the local `svc` inbox, and forwards `POST /fed/v1/inbox/{id}/ack` to the hub **only after** the local service daemon explicitly acknowledges the delivery over `register.sock`. If the daemon terminates before acknowledging, the unacknowledged message is redelivered when the daemon reconnects.
-- **Reply Routing & Attribution:** Svc replies sent over `register.sock` (`action: "reply"`) route back to the originating hub over `/fed/v1/replies`, attributed to the leaf principal.
+- **Federated Inbox Routes (`/fed/v2/inbox`):**
+  - `GET /fed/v2/inbox?wait=<s>`: Long-polls the hub (clamped between 0 and 60 seconds), returning at most one pending item: `{"kind":"message","id","origin","body","to"}`, or `{"kind":"list","query"}`, a `list` query the leaf answers on `POST /fed/v2/list/{query}` (Section 7.3). A waiting `list` query comes before messages. Non-leaf peers receive HTTP `403 Forbidden` (`denied`).
+  - `POST /fed/v2/inbox/{id}/ack`: Removes the message from the peer's mailbox upon explicit acknowledgment. Returns HTTP `404 Not Found` if the ID does not exist in that peer's mailbox. Unacknowledged messages remain queued and are returned on the next poll. Mailboxes are strictly isolated per peer.
+- **Strict Acknowledgment Ordering:** A leaf background task long-polls the hub inbox, enqueues inbound messages into the local `svc` inbox, and forwards `POST /fed/v2/inbox/{id}/ack` to the hub **only after** the local service daemon explicitly acknowledges the delivery over `register.sock`. If the daemon terminates before acknowledging, the unacknowledged message is redelivered when the daemon reconnects.
+- **`list` from the hub:** the leaf answers a `list` query from its hub's mailbox with its own recipients (its principal), under its own user (a pod's is `<sa>.<ns>`), when its entry for the hub has `"list"` in `allow`, and `denied` otherwise.
+- **Reply Routing & Attribution:** Svc replies sent over `register.sock` (`action: "reply"`) route back to the originating hub over `/fed/v2/replies`, attributed to the leaf principal.
 
 ### 7.6 Outbound links (for a node that can't be dialled)
 
@@ -708,15 +725,16 @@ An **outbound link** allows a full `xmsg` node to connect to a dialable hub node
 - **Pull Loop on Full Node:**
   For each peer configured with `"dial": "outbound"`, the full node automatically spawns a dedicated background pull loop at startup:
   - Logs `starting outbound link pull loop` for the peer.
-  - Long-polls `/fed/v1/inbox` from the hub.
+  - Long-polls `/fed/v2/inbox` from the hub.
+  - Answers a `list` query from the hub's mailbox (Section 7.3), applying its own entry for the hub.
   - Resolves target references across all supported harness kinds (`claude`, `agy`, `pi`, `svc`).
-  - Delivers resolved messages locally and executes `POST /fed/v1/inbox/{id}/ack` at the hub.
+  - Delivers resolved messages locally and executes `POST /fed/v2/inbox/{id}/ack` at the hub.
   - Pull delivery is idempotent by message ID; duplicate messages already present in the database are acknowledged at the hub and discarded.
 - **Unresolvable Targets:**
-  Unlike leaf nodes (which reject non-principal targets), an outbound-linked full node serves all target kinds. If a target is unresolvable (`not_found`, `gone`, `ambiguous`), the message is acknowledged at the hub and an error reply with status `not_found` and detail `no live session matches '<target>'` is posted back to the hub over `/fed/v1/replies`, matching direct send error responses.
+  Unlike leaf nodes (which reject non-principal targets), an outbound-linked full node serves all target kinds. If a target is unresolvable (`not_found`, `gone`, `ambiguous`), the message is acknowledged at the hub and an error reply with status `not_found` and detail `no live session matches '<target>'` is posted back to the hub over `/fed/v2/replies`, matching direct send error responses.
 - **Outbound Link Reply Routing:**
-  - **Inbound message replies:** When local sessions or services on the undialable node reply to an inbound message from an outbound-linked peer, they post the reply back to the dialable hub via `POST /fed/v1/replies`.
-  - **Outbound send replies:** When local sessions on the undialable node send a message to a dialable hub, the remote hub cannot dial back to push replies. Senders automatically spawn a background reply poller using `poll_federated_replies` (`GET /fed/v1/messages/{id}/replies?after=<seq>&wait=<s>`), pulling owed replies and delivering them locally to the caller's session.
+  - **Inbound message replies:** When local sessions or services on the undialable node reply to an inbound message from an outbound-linked peer, they post the reply back to the dialable hub via `POST /fed/v2/replies`.
+  - **Outbound send replies:** When a sender with an inbox (a session or a service) on the undialable node sends a message to a dialable hub, the remote hub cannot dial back to push replies, so a background reply poller is armed by the sender's kind (A-2): `poll_federated_replies` (`GET /fed/v2/messages/{id}/replies?after=<seq>&wait=<s>`) pulls owed replies and pushes them to the sender. An anonymous sender has no inbox and reads its replies with `replies`.
 - **Default State:**
   Outbound link pull loops are strictly opt-in and off unless configured. If no peer specifies `"dial": "outbound"`, no pull loop is spawned.
 
@@ -724,7 +742,7 @@ An **outbound link** allows a full `xmsg` node to connect to a dialable hub node
 
 In a star or multi-node mesh topology, nodes that cannot directly dial one another (e.g. edge nodes behind NAT or in separate networks) can route messages through an intermediate forwarding node (hub). Forwarding is strictly opt-in and off by default.
 
-- **The hop is node-to-node only (A3, B4):** a client address has at most one `@`, and a client `to` of the form `x@dest@hub` is refused `bad_request`. The hop survives only between nodes, as a `/fed/v1` envelope whose target is `ref@dest` sent to the hub. The hub splits this target, recognizes `dest` (a canonical name or the hub's own nickname for it) as another known peer, and relays the message to `dest` with target `ref`. No client surface originates a hop in this release; the server's own routing (H6: a direct link wins, otherwise the hub) is what will.
+- **The hop is node-to-node only (A3, B4):** a client address has at most one `@`, and a client `to` of the form `x@dest@hub` is refused `bad_request`. The hop survives only between nodes, as a `/fed/v2` envelope whose target is `ref@dest` sent to the hub. The hub splits this target, recognizes `dest` (a canonical name or the hub's own nickname for it) as another known peer, and relays the message to `dest` with target `ref`. No client surface originates a hop in this release; the server's own routing (H6: a direct link wins, otherwise the hub) is what will.
 - **Peer Configuration Fields:**
   Forwarding requires explicit permissions configured on both the hub and the final recipient:
   - **On the Forwarder (`allow = ["forward"]`):** The sending peer's entry in the hub's `peers.json` must include `"forward"` in its `allow` list:
@@ -750,9 +768,9 @@ In a star or multi-node mesh topology, nodes that cannot directly dial one anoth
     ```
     If the forwarding node lacks the `"relayed"` capability, the recipient refuses the send with HTTP `403 Forbidden` (`denied`).
 - **One-Hop Limit:**
-  Forwarded messages are marked with `forwarded: { origin_peer, origin_principal }`, where `origin_peer` is the origin's canonical node name, never the hub's nickname for it. A node refuses to forward any message that already carries the forward mark (`denied`). Multi-hop daisy-chaining is prohibited.
+  The hub sends the message on with the origin in the one origin shape, `{"id" | "service", "node", "label"?}`, its `node` attested by the hub from the identity that authenticated the sender (the origin's canonical node name, never the hub's nickname for it), and with the hop mark `forwarded: { "forwarder": <hub's node name> }`. The recipient refuses a mark whose forwarder is not the node that authenticated to it. A node refuses to forward any message that already carries the mark (`denied`). Multi-hop daisy-chaining is prohibited.
 - **Origin & Attestation (Trust Model):**
-  When a recipient receives a forwarded message, the sender origin displayed to local sessions and services (`label · id@<origin_peer>`, or `name@<origin_peer>` for a service) is the forwarding node's assertion, **not proven end-to-end**. The recipient trusts the hub to attest accurately to who sent the message. (For end-to-end origin signatures, see Section B of `xmsg-hub-design.md`).
+  When a recipient receives a forwarded message, the sender origin displayed to local sessions and services (`label · id@<origin node>`, or `name@<origin node>` for a service) is the forwarding node's assertion, **not proven end-to-end**. The recipient trusts the hub to attest accurately to who sent the message. (For end-to-end origin signatures, see Section B of `xmsg-hub-design.md`).
 - **Destination Target Filters:**
   The forwarding node checks the destination peer's configured `targets` list against the unpacked `ref`, before resolution, since the target lives on the destination. The ref is compared exactly, in the destination's grammar (an instance ID or a name), so a kind- or harness-prefixed ref (`svc:`, `session:`, `claude:`, `agy:`, `pi:`, `http:`) matches no entry and never passes a non-empty `targets`. If the destination peer restricts targets and `ref` is not allowed, the hub rejects the send before relaying. **Open:** a bare ref is compared as a string, so a bare instance label equal to a listed entry passes the hub and the destination resolves it to the labelled instance; the hub cannot tell a label from a service name without resolving.
 - **Reply Routing:**

@@ -428,12 +428,12 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "list",
-            "description": "List the recipients you can message: each entry gives its address (id@node for an instance, name@node for a service), its kind (service or instance), its label and its status. Filter by name, node or kind; node lists a federated peer.",
+            "description": "List the recipients you can message, on this node and every node it can reach: each entry gives its address (id@node for an instance, name@node for a service), its kind (service or instance), its label, its status (live or parked) and the user it belongs to; nodes gives each node asked as ok, unreachable, timeout or denied. Filter by name, node or kind; node asks only that node.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Only recipients with this label or service name" },
-                    "node": { "type": "string", "description": "List this node (a federated peer) instead of the local one" },
+                    "node": { "type": "string", "description": "Ask only this node (this one or a federated peer)" },
                     "kind": { "type": "string", "enum": ["service", "instance"], "description": "Only services or only instances" }
                 },
                 "additionalProperties": false

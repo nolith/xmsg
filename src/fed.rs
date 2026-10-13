@@ -119,15 +119,19 @@ pub(crate) fn target_ref_could_match(target_ref: &str, targets: &[String]) -> bo
     targets.iter().any(|t| t == target_ref)
 }
 
+/// The key a sender is filtered and rate-limited by: its service name, its instance ID, or
+/// `anon:<from>`.
+pub(crate) fn origin_filter_key(origin: &storage::Origin) -> String {
+    match origin.key() {
+        Some(key) => key.to_string(),
+        None => format!("anon:{}", origin.label.as_deref().unwrap_or_default()),
+    }
+}
+
 /// Does a `principals` filter admit this sender? It matches the service name, the
 /// instance ID, or `anon:<from>`.
-pub(crate) fn principal_allowed(principal: &FedPrincipal, principals: &[String]) -> bool {
-    let key = match principal {
-        FedPrincipal::Session { session_id, .. } => session_id.clone(),
-        FedPrincipal::Service { name } => name.clone(),
-        FedPrincipal::Anonymous { from } => format!("anon:{from}"),
-    };
-    principals.contains(&key)
+pub(crate) fn principal_allowed(origin: &storage::Origin, principals: &[String]) -> bool {
+    principals.contains(&origin_filter_key(origin))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1570,19 +1574,27 @@ impl RateLimiter {
 // Wire Protocol Envelopes
 // -----------------------------------------------------------------------------
 
+/// The node-to-node protocol version: the `v` of every envelope on `/fed/v2`.
+pub const WIRE_VERSION: u32 = 2;
+
+/// The hop mark (A3, X26): set by the node that forwarded an envelope, which attests the
+/// origin's node. An envelope carrying it is never forwarded again.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FedForwarded {
-    pub origin_peer: String,
-    pub origin_principal: FedPrincipal,
+    pub forwarder: String,
 }
 
+/// A message between nodes. Its `origin` is one shape for every sender (A12): the sending
+/// node attests the ID or service name, and the receiving node attests the node name from
+/// the identity it authenticated (N-2), so `origin.node` is read only on a forwarded
+/// envelope, where the forwarder attests it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FedEnvelope {
     pub v: u32,
     pub id: String,
-    pub principal: FedPrincipal,
+    pub origin: storage::Origin,
     pub to: FedTarget,
     pub body: String,
     pub thread_id: String,
@@ -1591,72 +1603,52 @@ pub struct FedEnvelope {
     pub forwarded: Option<FedForwarded>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", deny_unknown_fields)]
-pub enum FedPrincipal {
-    #[serde(rename = "session")]
-    Session {
-        harness: String,
-        session_id: String,
-        name: String,
-    },
-    #[serde(rename = "service")]
-    Service { name: String },
-    #[serde(rename = "anonymous")]
-    Anonymous { from: String },
+/// An envelope's origin with its node attested by this node: the authenticated peer's
+/// canonical name, or for a forwarded envelope the node its forwarder attested (N-2). The
+/// origin's own parts are checked: a service name, an instance ID, or an anonymous `from`.
+fn attested_origin(
+    envelope_origin: &storage::Origin,
+    sender_node: &str,
+    forwarded: Option<&FedForwarded>,
+) -> Result<storage::Origin, AppError> {
+    let node = match forwarded {
+        Some(fwd) if fwd.forwarder != sender_node => {
+            return Err(AppError::BadRequest(format!(
+                "forwarder '{}' is not the authenticated peer '{sender_node}'",
+                fwd.forwarder
+            )))
+        }
+        Some(_) => envelope_origin.node.clone(),
+        None => sender_node.to_string(),
+    };
+    check_origin(envelope_origin)?;
+    Ok(storage::Origin {
+        node,
+        ..envelope_origin.clone()
+    })
 }
 
-impl FedPrincipal {
-    /// A12's render of this principal as a sender on `node`: `label · id@node` for a
-    /// session, `name@node` for a service, `<from> · anon@node` for an anonymous sender.
-    pub fn label(&self, node: &str) -> String {
-        match self {
-            FedPrincipal::Session {
-                harness,
-                session_id,
-                name,
-            } => inbox::sender_label(node, harness, session_id, Some(name)),
-            FedPrincipal::Service { name } => inbox::sender_label(node, "svc", name, None),
-            FedPrincipal::Anonymous { from } => format!("{from} · anon@{node}"),
+fn check_origin(origin: &storage::Origin) -> Result<(), AppError> {
+    let name_re = regex::Regex::new(r"^[A-Za-z0-9._-]{1,32}$").expect("valid regex");
+    match (&origin.service, &origin.id) {
+        (Some(_), Some(_)) => Err(AppError::BadRequest(
+            "origin names both a service and an instance".to_string(),
+        )),
+        (Some(name), None) if !name_re.is_match(name) => Err(AppError::BadRequest(format!(
+            "invalid service name '{name}'"
+        ))),
+        (None, Some(id))
+            if id.is_empty()
+                || id.len() > 128
+                || id.contains('@')
+                || id.contains(char::is_control) =>
+        {
+            Err(AppError::BadRequest(format!("invalid instance id '{id}'")))
         }
-    }
-
-    /// The origin this principal gives a message sent from `node` (A12).
-    pub fn origin(&self, node: &str) -> storage::Origin {
-        match self {
-            FedPrincipal::Session {
-                session_id, name, ..
-            } => storage::Origin::instance(
-                session_id,
-                node,
-                inbox::clean_label(name)
-                    .filter(|l| l != session_id)
-                    .as_deref(),
-            ),
-            FedPrincipal::Service { name } => storage::Origin::service(name, node),
-            FedPrincipal::Anonymous { from } => storage::Origin::anonymous(from, node),
+        (None, None) => {
+            inbox::sanitize_from("", origin.label.as_deref().unwrap_or_default()).map(|_| ())
         }
-    }
-
-    pub fn badge(&self) -> String {
-        match self {
-            FedPrincipal::Session { harness, name, .. } if !name.is_empty() => {
-                format!("{harness}:{name}")
-            }
-            FedPrincipal::Session {
-                harness,
-                session_id,
-                ..
-            } => {
-                format!("{harness}:{session_id}")
-            }
-            FedPrincipal::Service { name } => {
-                format!("svc:{name}")
-            }
-            FedPrincipal::Anonymous { from } => {
-                format!("anon:{from}")
-            }
-        }
+        _ => Ok(()),
     }
 }
 
@@ -1670,41 +1662,115 @@ pub struct FedInboxMessage {
     pub to: Option<String>,
 }
 
+/// One item of a dial-out client's mailbox: a message, or a `list` query it answers on its
+/// next long-poll (A-1, AM-1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FedInboxItem {
+    Message(FedInboxMessage),
+    List { query: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FedTarget {
     pub r#ref: String,
 }
 
+/// A reply between nodes. The `replier`'s node is attested by the receiving node (N-2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FedReplyEnvelope {
     pub v: u32,
     pub id: String,
     pub in_reply_to: String,
-    pub replier: FedReplier,
+    pub replier: storage::Origin,
     pub text: String,
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One entry of a node's `list` answer (A4, A-12, A16): an instance ID or a service name,
+/// its kind, label and status, and the user it belongs to. The asking node adds the node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct FedReplier {
-    pub harness: String,
-    pub session_id: String,
-    pub name: String,
+pub struct FedListEntry {
+    pub id: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub status: String,
+    pub user: String,
 }
 
+/// A dial-out client's answer to a mailbox `list` query: its entries, or `denied` when its
+/// entry for the asking node withholds `list`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FedSessionEntry {
-    pub name: Option<String>,
-    pub session_id: String,
-    pub harness: String,
-    pub kind: String,
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub r#ref: Option<String>,
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FedListAnswer {
+    Ok { entries: Vec<FedListEntry> },
+    Denied,
+}
+
+/// `list` queries waiting in dial-out clients' mailboxes, and the askers awaiting them.
+#[derive(Default)]
+pub struct ListQueries {
+    pending: Mutex<HashMap<String, Vec<String>>>,
+    waiting: Mutex<HashMap<String, ListWaiter>>,
+}
+
+type ListWaiter = (
+    String,
+    tokio::sync::oneshot::Sender<(FedListAnswer, String)>,
+);
+
+impl ListQueries {
+    fn ask(
+        &self,
+        peer: &str,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<(FedListAnswer, String)>,
+    ) {
+        let query = ulid::Ulid::new().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut w) = self.waiting.lock() {
+            w.insert(query.clone(), (peer.to_string(), tx));
+        }
+        if let Ok(mut p) = self.pending.lock() {
+            p.entry(peer.to_string()).or_default().push(query.clone());
+        }
+        (query, rx)
+    }
+
+    fn forget(&self, query: &str) {
+        if let Ok(mut w) = self.waiting.lock() {
+            w.remove(query);
+        }
+        if let Ok(mut p) = self.pending.lock() {
+            for qs in p.values_mut() {
+                qs.retain(|q| q != query);
+            }
+        }
+    }
+
+    fn next_for(&self, peer: &str) -> Option<String> {
+        let mut p = self.pending.lock().ok()?;
+        let qs = p.get_mut(peer)?;
+        (!qs.is_empty()).then(|| qs.remove(0))
+    }
+
+    fn answer(&self, query: &str, peer: &str, answer: FedListAnswer, user: String) -> bool {
+        let Ok(mut w) = self.waiting.lock() else {
+            return false;
+        };
+        match w.get(query) {
+            Some((asked, _)) if asked == peer => {
+                let (_, tx) = w.remove(query).expect("present");
+                tx.send((answer, user)).is_ok()
+            }
+            _ => false,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1716,6 +1782,9 @@ pub struct AuthenticatedPeer {
     pub name: String,
     pub pin: String,
     pub uri: Option<String>,
+    /// The user of the certificate the peer presented (A16), empty when it names none, so
+    /// that no listing entry matches it (P-3).
+    pub user: String,
     pub remote_ip: IpAddr,
 }
 
@@ -1767,6 +1836,9 @@ pub struct FedState {
     pub leaf_principal: Option<String>,
     pub outbound_replies_pushed: Arc<AtomicU64>,
     pub dynamic_tls: Arc<std::sync::RwLock<Option<DynamicTls>>>,
+    /// How long an instance stays parked after it was last live (A14), for `list`.
+    pub reply_ttl: Duration,
+    pub list_queries: ListQueries,
 }
 
 impl FedState {
@@ -1830,15 +1902,16 @@ impl FedState {
 pub fn build_fed_router(fed_state: Arc<FedState>) -> Router {
     let max_body_limit = fed_state.max_body + 4096;
     Router::new()
-        .route("/fed/v1/messages", post(fed_send_message_handler))
-        .route("/fed/v1/replies", post(fed_reply_handler))
+        .route("/fed/v2/messages", post(fed_send_message_handler))
+        .route("/fed/v2/replies", post(fed_reply_handler))
         .route(
-            "/fed/v1/messages/{id}/replies",
+            "/fed/v2/messages/{id}/replies",
             get(fed_get_replies_handler),
         )
-        .route("/fed/v1/sessions", get(fed_list_sessions_handler))
-        .route("/fed/v1/inbox", get(fed_get_inbox_handler))
-        .route("/fed/v1/inbox/{id}/ack", post(fed_ack_inbox_handler))
+        .route("/fed/v2/sessions", get(fed_list_sessions_handler))
+        .route("/fed/v2/list/{query}", post(fed_list_answer_handler))
+        .route("/fed/v2/inbox", get(fed_get_inbox_handler))
+        .route("/fed/v2/inbox/{id}/ack", post(fed_ack_inbox_handler))
         .layer(DefaultBodyLimit::max(max_body_limit))
         .with_state(fed_state)
 }
@@ -1848,7 +1921,7 @@ async fn fed_send_message_handler(
     Extension(peer): Extension<Arc<AuthenticatedPeer>>,
     Json(envelope): Json<FedEnvelope>,
 ) -> Result<Response, AppError> {
-    if envelope.v != 1 {
+    if envelope.v != WIRE_VERSION {
         return Err(AppError::BadRequest(format!(
             "unsupported protocol version {}",
             envelope.v
@@ -1868,7 +1941,7 @@ async fn fed_send_message_handler(
     }
 
     if !peer_cfg.principals.is_empty() {
-        let authorized = principal_allowed(&envelope.principal, &peer_cfg.principals);
+        let authorized = principal_allowed(&envelope.origin, &peer_cfg.principals);
         if !authorized {
             return Err(AppError::OpDenied(
                 "principal not authorized for peer".to_string(),
@@ -1933,19 +2006,14 @@ async fn fed_send_message_handler(
             }
         }
 
+        // The origin, its node attested here (N-2): the forwarded envelope carries it.
+        let origin = attested_origin(&envelope.origin, &sender_node, None)?;
+
         // Rate limit sender
-        let principal_key = match &envelope.principal {
-            FedPrincipal::Session {
-                harness,
-                session_id,
-                ..
-            } => Some(format!("{harness}:{session_id}")),
-            FedPrincipal::Service { name } => Some(format!("svc:{name}")),
-            FedPrincipal::Anonymous { from } => Some(format!("anon:{from}")),
-        };
+        let principal_key = origin_filter_key(&origin);
         if !fed_state
             .rate_limiter
-            .check_and_consume(&peer.name, principal_key.as_deref())
+            .check_and_consume(&peer.name, Some(&principal_key))
         {
             return Err(AppError::RateLimited("Rate limit exceeded".to_string()));
         }
@@ -1985,7 +2053,7 @@ async fn fed_send_message_handler(
         let forwarded_envelope = FedEnvelope {
             v: envelope.v,
             id: envelope.id.clone(),
-            principal: envelope.principal.clone(),
+            origin: origin.clone(),
             to: FedTarget {
                 r#ref: target_ref.to_string(),
             },
@@ -1993,8 +2061,7 @@ async fn fed_send_message_handler(
             thread_id: envelope.thread_id.clone(),
             created_at: envelope.created_at,
             forwarded: Some(FedForwarded {
-                origin_peer: sender_node.clone(),
-                origin_principal: envelope.principal.clone(),
+                forwarder: fed_state.node_name.clone(),
             }),
         };
 
@@ -2046,7 +2113,7 @@ async fn fed_send_message_handler(
                 id: envelope.id.clone(),
                 created_at: envelope.created_at,
                 session_id: target_ref.to_string(),
-                from_name: envelope.principal.label(&peer.name),
+                from_name: origin.render(&peer.name),
                 bytes: envelope.body.len(),
                 outcome: outcome.to_string(),
                 recipient_harness: "fed".to_string(),
@@ -2067,13 +2134,17 @@ async fn fed_send_message_handler(
         ));
     }
 
-    // The origin node is a canonical name; it is shown by its local nickname, if any.
-    let (origin_node, effective_principal) = if let Some(ref fwd) = envelope.forwarded {
-        (&fwd.origin_peer, &fwd.origin_principal)
-    } else {
-        (&sender_node, &envelope.principal)
+    // N-2: the origin's node is attested here, from the authenticated peer or, for a
+    // forwarded envelope, its forwarder; it is shown by its local nickname, if any.
+    let origin = attested_origin(&envelope.origin, &sender_node, envelope.forwarded.as_ref())?;
+    let from_name = origin.render(fed_state.peers.display_name(&origin.node));
+    let principal_key = origin_filter_key(&origin);
+    // Replies always return to the origin node, which decides how they reach the sender
+    // (A-2); here the sender is only its key, or anonymous.
+    let (return_harness, return_session_id) = match origin.key() {
+        Some(key) => (Some("fed".to_string()), Some(key.to_string())),
+        None => (None, None),
     };
-    let effective_origin_peer = &fed_state.peers.display_name(origin_node).to_string();
 
     let target = match resolve_target_session_fed(&fed_state, target_ref).await {
         Ok(t) => {
@@ -2096,50 +2167,12 @@ async fn fed_send_message_handler(
             }
             // Target is allowed but not found / gone / ambiguous:
             // Check rate limiter and record failure outcome
-            let principal_key = match &envelope.principal {
-                FedPrincipal::Session {
-                    harness,
-                    session_id,
-                    ..
-                } => Some(format!("{harness}:{session_id}")),
-                FedPrincipal::Service { name } => Some(format!("svc:{name}")),
-                FedPrincipal::Anonymous { from } => Some(format!("anon:{from}")),
-            };
             if !fed_state
                 .rate_limiter
-                .check_and_consume(&peer.name, principal_key.as_deref())
+                .check_and_consume(&peer.name, Some(&principal_key))
             {
                 return Err(AppError::RateLimited("Rate limit exceeded".to_string()));
             }
-
-            let (from_name, return_harness, return_session_id) = match effective_principal {
-                FedPrincipal::Session {
-                    harness,
-                    session_id,
-                    name,
-                } => {
-                    if !matches!(harness.as_str(), "claude" | "agy" | "pi" | "svc") {
-                        return Err(AppError::BadRequest(format!("invalid harness '{harness}'")));
-                    }
-                    let sanitized =
-                        inbox::sender_label(effective_origin_peer, harness, session_id, Some(name));
-                    (sanitized, Some(harness.clone()), Some(session_id.clone()))
-                }
-                FedPrincipal::Service { name } => {
-                    let re = regex::Regex::new(r"^[A-Za-z0-9._-]{1,32}$").unwrap();
-                    if !re.is_match(name) {
-                        return Err(AppError::BadRequest(format!(
-                            "invalid service name '{name}'"
-                        )));
-                    }
-                    let badge = inbox::sender_label(effective_origin_peer, "svc", name, None);
-                    (badge, Some("svc".to_string()), Some(name.clone()))
-                }
-                FedPrincipal::Anonymous { from } => {
-                    let sanitized = inbox::sanitize_from(effective_origin_peer, from)?;
-                    (sanitized, None, None)
-                }
-            };
             let body_len = envelope.body.len();
             let outcome_str = match &err {
                 AppError::NotFound(_) | AppError::NotFoundDetail(_) => "not_found",
@@ -2168,51 +2201,12 @@ async fn fed_send_message_handler(
     };
 
     // 4. Rate limiting: consume rate limit for authorized, resolved target
-    let principal_key = match &envelope.principal {
-        FedPrincipal::Session {
-            harness,
-            session_id,
-            ..
-        } => Some(format!("{harness}:{session_id}")),
-        FedPrincipal::Service { name } => Some(format!("svc:{name}")),
-        FedPrincipal::Anonymous { from } => Some(format!("anon:{from}")),
-    };
     if !fed_state
         .rate_limiter
-        .check_and_consume(&peer.name, principal_key.as_deref())
+        .check_and_consume(&peer.name, Some(&principal_key))
     {
         return Err(AppError::RateLimited("Rate limit exceeded".to_string()));
     }
-
-    // 5. Validate principal and sanitize badge
-    let (from_name, return_harness, return_session_id) = match effective_principal {
-        FedPrincipal::Session {
-            harness,
-            session_id,
-            name,
-        } => {
-            if !matches!(harness.as_str(), "claude" | "agy" | "pi" | "svc") {
-                return Err(AppError::BadRequest(format!("invalid harness '{harness}'")));
-            }
-            let sanitized =
-                inbox::sender_label(effective_origin_peer, harness, session_id, Some(name));
-            (sanitized, Some(harness.clone()), Some(session_id.clone()))
-        }
-        FedPrincipal::Service { name } => {
-            let re = regex::Regex::new(r"^[A-Za-z0-9._-]{1,32}$").unwrap();
-            if !re.is_match(name) {
-                return Err(AppError::BadRequest(format!(
-                    "invalid service name '{name}'"
-                )));
-            }
-            let badge = inbox::sender_label(effective_origin_peer, "svc", name, None);
-            (badge, Some("svc".to_string()), Some(name.clone()))
-        }
-        FedPrincipal::Anonymous { from } => {
-            let sanitized = inbox::sanitize_from(effective_origin_peer, from)?;
-            (sanitized, None, None)
-        }
-    };
 
     // 6. Idempotent delivery: check if id already recorded
     let body_len = envelope.body.len();
@@ -2291,7 +2285,7 @@ async fn fed_send_message_handler(
         &from_name,
         &envelope.id,
         &envelope.body,
-        effective_principal.origin(origin_node),
+        origin,
     )
     .await;
 
@@ -2392,28 +2386,12 @@ pub async fn deliver_federated_reply_locally(
     Ok(push_res)
 }
 
-/// The origin a federated replier gives its reply: a service by name, an instance by ID,
-/// attested by the node it came from.
-fn replier_origin(replier: &FedReplier, node: &str) -> storage::Origin {
-    if replier.harness == "svc" {
-        storage::Origin::service(&replier.session_id, node)
-    } else {
-        storage::Origin::instance(
-            &replier.session_id,
-            node,
-            inbox::clean_label(&replier.name)
-                .filter(|l| l != &replier.session_id)
-                .as_deref(),
-        )
-    }
-}
-
 async fn fed_reply_handler(
     State(fed_state): State<Arc<FedState>>,
     Extension(peer): Extension<Arc<AuthenticatedPeer>>,
     Json(reply): Json<FedReplyEnvelope>,
 ) -> Result<Response, AppError> {
-    if reply.v != 1 {
+    if reply.v != WIRE_VERSION {
         return Err(AppError::BadRequest(format!(
             "unsupported protocol version {}",
             reply.v
@@ -2432,14 +2410,19 @@ async fn fed_reply_handler(
         ));
     }
 
+    // The replier, its node attested here (N-2).
+    let node = fed_state
+        .peers
+        .canonical_name(&peer.name)
+        .unwrap_or(&peer.name)
+        .to_string();
+    let replier = attested_origin(&reply.replier, &node, None)?;
+    let replier_key = replier.key().unwrap_or(&peer.name).to_string();
+
     // Rate limiting: consume peer and principal buckets
-    let principal_key = Some(format!(
-        "{}:{}",
-        reply.replier.harness, reply.replier.session_id
-    ));
     if !fed_state
         .rate_limiter
-        .check_and_consume(&peer.name, principal_key.as_deref())
+        .check_and_consume(&peer.name, Some(&origin_filter_key(&replier)))
     {
         return Err(AppError::RateLimited("Rate limit exceeded".to_string()));
     }
@@ -2513,13 +2496,7 @@ async fn fed_reply_handler(
                 .into_response());
         } else {
             // Undialable origin (leaf / outbound link): store reply for polling
-            let replier_session_id = if !reply.replier.session_id.is_empty() {
-                reply.replier.session_id.clone()
-            } else if !reply.replier.name.is_empty() {
-                reply.replier.name.clone()
-            } else {
-                peer.name.clone()
-            };
+            let replier_session_id = replier_key.clone();
 
             let push_outcome = "stored";
             {
@@ -2566,17 +2543,7 @@ async fn fed_reply_handler(
         .as_ref()
         .and_then(|m| Some((m.return_harness.clone()?, m.return_session_id.clone()?)))
     {
-        let node = fed_state
-            .peers
-            .canonical_name(&peer.name)
-            .unwrap_or(&peer.name)
-            .to_string();
-        let replier_badge = inbox::sender_label(
-            &peer.name,
-            &reply.replier.harness,
-            &reply.replier.session_id,
-            Some(&reply.replier.name),
-        );
+        let replier_badge = replier.render(&peer.name);
 
         let push_res = deliver_federated_reply_locally(
             &fed_state,
@@ -2584,7 +2551,7 @@ async fn fed_reply_handler(
             &reply.in_reply_to,
             &reply.id,
             &replier_badge,
-            replier_origin(&reply.replier, &node),
+            replier,
             &reply.text,
             &ret_harness,
             &ret_session_id,
@@ -2601,13 +2568,7 @@ async fn fed_reply_handler(
             .into_response());
     }
 
-    let replier_session_id = if !reply.replier.session_id.is_empty() {
-        reply.replier.session_id.clone()
-    } else if !reply.replier.name.is_empty() {
-        reply.replier.name.clone()
-    } else {
-        peer.name.clone()
-    };
+    let replier_session_id = replier_key;
     let push_outcome = "stored";
     {
         let db = fed_state
@@ -2759,57 +2720,57 @@ async fn fed_list_sessions_handler(
         return Err(AppError::RateLimited("Rate limit exceeded".to_string()));
     }
 
-    let query = crate::registry::SessionsQuery::default();
-    let claude_sessions = {
-        let active_pairs = crate::claim::sync_claims(
-            &fed_state.db,
-            &fed_state.agy_config.proc_root,
-            std::slice::from_ref(&fed_state.sessions_dir),
-            &fed_state.node_name,
-        )
-        .await?;
-        let mut list = Vec::new();
-        for (claim, entry) in active_pairs {
-            let mut session: crate::registry::Session = entry.into();
-            session.session_id = claim.address();
-            list.push(session);
-        }
-        list
-    };
-    let mut sessions = claude_sessions;
-    let mut agy_sessions =
-        crate::agy::list_agy_sessions(&fed_state.agy_config, &fed_state.agy_store, &query);
-    sessions.append(&mut agy_sessions);
-    let mut pi_sessions =
-        crate::pi::list_pi_sessions(&fed_state.agy_config.proc_root, &fed_state.pi_store, &query);
-    sessions.append(&mut pi_sessions);
-    let mut svc_sessions = crate::svc::list_svc_sessions(
-        &fed_state.agy_config.proc_root,
-        &fed_state.svc_store,
-        &query,
-    );
-    sessions.append(&mut svc_sessions);
-
-    if let Some(ref allowed_targets) = peer_cfg.targets {
-        sessions.retain(|s| {
-            let target = crate::http::ResolvedTarget::from_session(s.clone());
-            target_matches_allowlist(&target, allowed_targets)
-        });
-    }
-
-    let entries: Vec<FedSessionEntry> = sessions
-        .into_iter()
-        .map(|s| FedSessionEntry {
-            name: s.name,
-            session_id: s.session_id,
-            harness: s.harness,
-            kind: s.kind,
-            status: s.status,
-            r#ref: None,
-        })
-        .collect();
-
+    let entries = listing_for_peer(&fed_state, &peer_cfg).await?;
     Ok((StatusCode::OK, Json(entries)).into_response())
+}
+
+/// This node's user (A16): the user of the identity it presents to its peers.
+pub fn own_user(fed_state: &FedState) -> String {
+    let chain = fed_state.cert_chain();
+    crate::node::own_user(chain.first().map(|c| c.as_ref()))
+}
+
+/// What this node lists to `peer_cfg`'s node: its recipients, narrowed by that entry's
+/// `targets`, each carrying this node's user (A16).
+async fn listing_for_peer(
+    fed_state: &FedState,
+    peer_cfg: &PeerConfig,
+) -> Result<Vec<FedListEntry>, AppError> {
+    let mut entries = crate::surface::listing(
+        &fed_state.local(),
+        fed_state.reply_ttl,
+        &own_user(fed_state),
+    )
+    .await?;
+    if let Some(ref allowed_targets) = peer_cfg.targets {
+        entries.retain(|e| allowed_targets.contains(&e.id));
+    }
+    Ok(entries)
+}
+
+/// P-3: a listing node may list only its own certificate user's recipients. An entry of
+/// any other user is dropped, which is all a receiver can enforce.
+pub(crate) fn admit_entries(entries: Vec<FedListEntry>, cert_user: &str) -> Vec<FedListEntry> {
+    entries
+        .into_iter()
+        .filter(|e| e.user == cert_user)
+        .collect()
+}
+
+/// A dial-out client answers a `list` query from its mailbox (POST, AM-1).
+async fn fed_list_answer_handler(
+    State(fed_state): State<Arc<FedState>>,
+    Extension(peer): Extension<Arc<AuthenticatedPeer>>,
+    AxumPath(query): AxumPath<String>,
+    Json(answer): Json<FedListAnswer>,
+) -> Result<Response, AppError> {
+    if !fed_state
+        .list_queries
+        .answer(&query, &peer.name, answer, peer.user.clone())
+    {
+        return Err(AppError::NotFound(format!("list query '{query}'")));
+    }
+    Ok((StatusCode::OK, Json(json!({ "status": "ok" }))).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2846,27 +2807,33 @@ async fn fed_get_inbox_handler(
         None
     };
 
-    let existing = {
+    // A `list` query waiting for this client goes first (AM-1), then its messages.
+    let next_item = || -> Result<Option<FedInboxItem>, AppError> {
+        if let Some(query) = fed_state.list_queries.next_for(&peer.name) {
+            return Ok(Some(FedInboxItem::List { query }));
+        }
         let db = fed_state
             .db
             .lock()
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        storage::get_next_peer_mailbox_message(&db, &peer.name)
+        Ok(storage::get_next_peer_mailbox_message(&db, &peer.name)
             .map_err(|e| AppError::Internal(e.to_string()))?
+            .map(|msg| {
+                FedInboxItem::Message(FedInboxMessage {
+                    id: msg.id,
+                    origin: msg.origin,
+                    body: msg.body,
+                    to: Some(msg.target_ref),
+                })
+            }))
     };
 
-    if let Some(msg) = existing {
-        let inbox_msg = FedInboxMessage {
-            id: msg.id,
-            origin: msg.origin,
-            body: msg.body,
-            to: Some(msg.target_ref),
-        };
-        return Ok((StatusCode::OK, Json(Some(inbox_msg))).into_response());
+    if let Some(item) = next_item()? {
+        return Ok((StatusCode::OK, Json(Some(item))).into_response());
     }
 
     if wait_secs == 0 {
-        return Ok((StatusCode::OK, Json(None::<FedInboxMessage>)).into_response());
+        return Ok((StatusCode::OK, Json(None::<FedInboxItem>)).into_response());
     }
 
     let mut receiver = rx.unwrap();
@@ -2883,23 +2850,7 @@ async fn fed_get_inbox_handler(
     })
     .await;
 
-    let msg_after = {
-        let db = fed_state
-            .db
-            .lock()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        storage::get_next_peer_mailbox_message(&db, &peer.name)
-            .map_err(|e| AppError::Internal(e.to_string()))?
-    };
-
-    let inbox_msg = msg_after.map(|m| FedInboxMessage {
-        id: m.id,
-        origin: m.origin,
-        body: m.body,
-        to: Some(m.target_ref),
-    });
-
-    Ok((StatusCode::OK, Json(inbox_msg)).into_response())
+    Ok((StatusCode::OK, Json(next_item()?)).into_response())
 }
 
 async fn fed_ack_inbox_handler(
@@ -2955,12 +2906,15 @@ pub fn queue_leaf_mailbox_message(
         }
     }
 
-    // The sender's node: this one, or the origin a forwarded envelope names.
-    let origin_node = envelope
-        .forwarded
-        .as_ref()
-        .map_or(fed_state.node_name.as_str(), |f| f.origin_peer.as_str());
-    let origin = envelope.principal.origin(origin_node);
+    // The sender's node: this one, or the origin a forwarded envelope names (attested by
+    // the forwarder, which is this node).
+    let origin = match envelope.forwarded {
+        Some(_) => envelope.origin.clone(),
+        None => storage::Origin {
+            node: fed_state.node_name.clone(),
+            ..envelope.origin.clone()
+        },
+    };
 
     let envelope_json =
         serde_json::to_string(envelope).map_err(|e| AppError::Internal(e.to_string()))?;
@@ -3155,7 +3109,7 @@ pub async fn send_federated_message(
     let peer_name = peer.name.as_str();
 
     if peer.leaf {
-        let from_name = envelope.principal.label(&fed_state.node_name);
+        let from_name = envelope.origin.render(&fed_state.node_name);
         return queue_leaf_mailbox_message(
             fed_state,
             peer_name,
@@ -3195,7 +3149,7 @@ pub async fn send_federated_message(
             serde_json::to_vec(envelope).map_err(|e| AppError::Internal(e.to_string()))?;
         let req = hyper::Request::builder()
             .method("POST")
-            .uri("/fed/v1/messages")
+            .uri("/fed/v2/messages")
             .header("content-type", "application/json")
             .header("host", peer_name)
             .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
@@ -3304,7 +3258,7 @@ pub async fn send_federated_reply(
             serde_json::to_vec(reply).map_err(|e| AppError::Internal(e.to_string()))?;
         let req = hyper::Request::builder()
             .method("POST")
-            .uri("/fed/v1/replies")
+            .uri("/fed/v2/replies")
             .header("content-type", "application/json")
             .header("host", peer_name)
             .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
@@ -3408,7 +3362,7 @@ pub async fn poll_federated_replies(
         });
 
         let uri =
-            format!("/fed/v1/messages/{message_id}/replies?after={after_seq}&wait={wait_secs}");
+            format!("/fed/v2/messages/{message_id}/replies?after={after_seq}&wait={wait_secs}");
         let req = hyper::Request::builder()
             .method("GET")
             .uri(uri)
@@ -3467,7 +3421,7 @@ pub async fn get_federated_inbox(
     fed_state: &FedState,
     peer_name: &str,
     wait_secs: u64,
-) -> Result<Option<FedInboxMessage>, AppError> {
+) -> Result<Option<FedInboxItem>, AppError> {
     let peer = fed_state
         .peers
         .get(peer_name)
@@ -3500,7 +3454,7 @@ pub async fn get_federated_inbox(
             }
         });
 
-        let uri = format!("/fed/v1/inbox?wait={wait_secs}");
+        let uri = format!("/fed/v2/inbox?wait={wait_secs}");
         let req = hyper::Request::builder()
             .method("GET")
             .uri(uri)
@@ -3527,7 +3481,7 @@ pub async fn get_federated_inbox(
             .to_bytes();
 
         if status.is_success() {
-            let msg: Option<FedInboxMessage> = serde_json::from_slice(&body_bytes)
+            let msg: Option<FedInboxItem> = serde_json::from_slice(&body_bytes)
                 .map_err(|e| AppError::Internal(format!("failed to parse inbox message: {e}")))?;
             Ok(msg)
         } else {
@@ -3590,7 +3544,7 @@ pub async fn ack_federated_inbox(
             }
         });
 
-        let uri = format!("/fed/v1/inbox/{message_id}/ack");
+        let uri = format!("/fed/v2/inbox/{message_id}/ack");
         let req = hyper::Request::builder()
             .method("POST")
             .uri(uri)
@@ -3733,7 +3687,11 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
 
     loop {
         match get_federated_inbox(&fed_state, &peer_name, wait_secs).await {
-            Ok(Some(msg)) => {
+            Ok(Some(FedInboxItem::List { query })) => {
+                backoff_millis = 100;
+                answer_list_query(&fed_state, &peer_name, &query).await;
+            }
+            Ok(Some(FedInboxItem::Message(msg))) => {
                 backoff_millis = 100;
 
                 // Idempotency: if message already processed, just ack and continue
@@ -3875,14 +3833,10 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
                         })
                         .to_string();
 
-                        let replier = FedReplier {
-                            harness: "svc".to_string(),
-                            session_id: "system".to_string(),
-                            name: "system".to_string(),
-                        };
+                        let replier = storage::Origin::service("system", &fed_state.node_name);
 
                         let reply_envelope = FedReplyEnvelope {
-                            v: 1,
+                            v: WIRE_VERSION,
                             id: ulid::Ulid::new().to_string(),
                             in_reply_to: msg.id.clone(),
                             replier,
@@ -3943,159 +3897,240 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
     }
 }
 
-pub async fn list_federated_sessions(
-    fed_state: &FedState,
-    peer_name: &str,
-) -> Result<Vec<FedSessionEntry>, AppError> {
-    let peer = fed_state
-        .current_peers()
-        .get(peer_name)
-        .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("peer '{peer_name}'")))?;
-    let peer_name = peer.name.as_str();
+/// The bound on asking one node for its `list` (D14).
+pub const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
-    let list_fut = async {
-        let connector = make_tls_connector_for_peer(fed_state, &peer)?;
-        let tcp_stream = tokio::net::TcpStream::connect(&peer.address)
-            .await
-            .map_err(|e| {
-                AppError::PeerUnreachable(format!(
-                    "Failed to connect to peer '{peer_name}' at {}: {e}",
-                    peer.address
-                ))
-            })?;
+/// How one node answered a `list` (A-12): `ok`, `unreachable`, `timeout`, or `denied` when
+/// its entry for this node withholds `list` (gate v0 C4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeStatus {
+    pub node: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
 
-        let server_name = ServerName::try_from(peer_name.to_string())
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        let tls_stream = connector
-            .connect(server_name, tcp_stream)
-            .await
-            .map_err(|e| map_tls_connect_error(peer_name, e))?;
-
-        let io = hyper_util::rt::TokioIo::new(tls_stream);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-            .await
-            .map_err(|e| {
-                AppError::PeerUnreachable(format!(
-                    "HTTP handshake failed with peer '{peer_name}': {e}"
-                ))
-            })?;
-
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                debug!("HTTP connection closed: {e}");
-            }
-        });
-
-        let req = hyper::Request::builder()
-            .method("GET")
-            .uri("/fed/v1/sessions")
-            .header("host", peer_name)
-            .body(http_body_util::Empty::<bytes::Bytes>::new())
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-
-        let resp = sender.send_request(req).await.map_err(|e| {
-            AppError::PeerUnreachable(format!("Request to peer '{peer_name}' failed: {e}"))
-        })?;
-
-        let status = resp.status();
-        let max_limit = fed_state.max_body + 4096;
-        let limited = http_body_util::Limited::new(resp.into_body(), max_limit);
-        use http_body_util::BodyExt;
-        let body_bytes = limited
-            .collect()
-            .await
-            .map_err(|_| AppError::PayloadTooLarge {
-                size: max_limit + 1,
-                limit: max_limit,
-            })?
-            .to_bytes();
-
-        if status.is_success() {
-            let mut entries: Vec<FedSessionEntry> =
-                serde_json::from_slice(&body_bytes).map_err(|e| {
-                    AppError::Internal(format!(
-                        "Failed to parse sessions from peer '{peer_name}': {e}"
-                    ))
-                })?;
-            for entry in &mut entries {
-                entry.r#ref = Some(format!("{}@{}", entry.session_id, peer_name));
-            }
-            Ok(entries)
-        } else {
-            let err_resp: Result<WireErrorResponse, _> = serde_json::from_slice(&body_bytes);
-            if let Ok(err) = err_resp {
-                let detail = format!("peer '{peer_name}': {}", err.detail);
-                match status {
-                    StatusCode::NOT_FOUND => Err(AppError::NotFoundDetail(detail)),
-                    StatusCode::FORBIDDEN => Err(AppError::OpDenied(detail)),
-                    StatusCode::TOO_MANY_REQUESTS => Err(AppError::RateLimited(detail)),
-                    StatusCode::BAD_REQUEST => Err(AppError::BadRequest(detail)),
-                    StatusCode::CONFLICT => Err(AppError::Ambiguous(detail)),
-                    StatusCode::GONE => Err(AppError::Gone {
-                        session_id: detail,
-                        pid: 0,
-                    }),
-                    _ => Err(AppError::ServiceUnavailable(detail)),
-                }
-            } else {
-                Err(AppError::ServiceUnavailable(format!(
-                    "Peer '{peer_name}' returned status {status}"
-                )))
-            }
+impl NodeStatus {
+    pub fn ok(node: &str) -> Self {
+        Self {
+            node: node.to_string(),
+            status: "ok".to_string(),
+            detail: None,
         }
-    };
+    }
 
-    match tokio::time::timeout(Duration::from_secs(5), list_fut).await {
-        Ok(res) => res,
-        Err(_) => Err(AppError::PeerUnreachable(format!(
-            "Outbound list call to peer '{peer_name}' timed out after 5s"
-        ))),
+    fn failed(node: &str, status: &str, detail: String) -> Self {
+        Self {
+            node: node.to_string(),
+            status: status.to_string(),
+            detail: Some(detail),
+        }
     }
 }
 
-pub fn parse_fed_principal(s: &str) -> Result<FedPrincipal, AppError> {
-    let s = s.trim();
-    if let Some(name) = s.strip_prefix("svc:") {
-        let re = regex::Regex::new(r"^[A-Za-z0-9._-]{1,32}$").unwrap();
-        if !re.is_match(name) {
-            return Err(AppError::BadRequest(format!(
-                "invalid service name '{name}'"
-            )));
+/// Asks the peer keyed `peer_key` for its `list` (A4, A-1), bounded by `LIST_TIMEOUT`: a
+/// direct peer over `/fed/v2/sessions`, a dial-out client through its mailbox. Returns the
+/// entries its certificate user may list (P-3) and its status.
+pub async fn list_peer(fed_state: &FedState, peer_key: &str) -> (Vec<FedListEntry>, NodeStatus) {
+    let Some(peer) = fed_state.current_peers().get(peer_key).cloned() else {
+        return (
+            Vec::new(),
+            NodeStatus::failed(peer_key, "unreachable", "not a peer".to_string()),
+        );
+    };
+    let asked = async {
+        if peer.leaf {
+            list_dial_out_client(fed_state, &peer.name).await
+        } else {
+            list_direct_peer(fed_state, &peer).await
         }
-        Ok(FedPrincipal::Service {
-            name: name.to_string(),
-        })
-    } else if let Some(rest) = s.strip_prefix("claude:") {
-        Ok(FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: rest.to_string(),
-            name: rest.to_string(),
-        })
-    } else if let Some(rest) = s.strip_prefix("agy:") {
-        Ok(FedPrincipal::Session {
-            harness: "agy".to_string(),
-            session_id: rest.to_string(),
-            name: rest.to_string(),
-        })
-    } else if let Some(rest) = s.strip_prefix("pi:") {
-        Ok(FedPrincipal::Session {
-            harness: "pi".to_string(),
-            session_id: rest.to_string(),
-            name: rest.to_string(),
-        })
-    } else if let Some(from) = s.strip_prefix("anon:") {
-        Ok(FedPrincipal::Anonymous {
-            from: from.to_string(),
-        })
+    };
+    let Ok(res) = tokio::time::timeout(LIST_TIMEOUT, asked).await else {
+        let detail = format!("did not answer `list` within {}s", LIST_TIMEOUT.as_secs());
+        return (
+            Vec::new(),
+            NodeStatus::failed(&peer.name, "timeout", detail),
+        );
+    };
+    match res {
+        Ok((answer, user)) => match answer {
+            FedListAnswer::Ok { entries } => {
+                (admit_entries(entries, &user), NodeStatus::ok(&peer.name))
+            }
+            FedListAnswer::Denied => (
+                Vec::new(),
+                NodeStatus::failed(&peer.name, "denied", "withholds `list`".to_string()),
+            ),
+        },
+        Err(AppError::OpDenied(d)) => (Vec::new(), NodeStatus::failed(&peer.name, "denied", d)),
+        Err(e) => (
+            Vec::new(),
+            NodeStatus::failed(&peer.name, "unreachable", e.to_string()),
+        ),
+    }
+}
+
+/// A dial-out client is asked through its mailbox: the query wakes its waiting long-poll,
+/// and it answers on `/fed/v2/list/{query}` (AM-1). Unbounded here; `list_peer` bounds it.
+async fn list_dial_out_client(
+    fed_state: &FedState,
+    peer_key: &str,
+) -> Result<(FedListAnswer, String), AppError> {
+    let (query, rx) = fed_state.list_queries.ask(peer_key);
+    let _ = fed_state.notify_tx.send(peer_key.to_string());
+    struct Forget<'a>(&'a ListQueries, String);
+    impl Drop for Forget<'_> {
+        fn drop(&mut self) {
+            self.0.forget(&self.1);
+        }
+    }
+    let _forget = Forget(&fed_state.list_queries, query);
+    rx.await
+        .map_err(|_| AppError::PeerUnreachable(format!("'{peer_key}' dropped the list query")))
+}
+
+async fn list_direct_peer(
+    fed_state: &FedState,
+    peer: &PeerConfig,
+) -> Result<(FedListAnswer, String), AppError> {
+    let peer_name = peer.name.as_str();
+    let connector = make_tls_connector_for_peer(fed_state, peer)?;
+    let tcp_stream = tokio::net::TcpStream::connect(&peer.address)
+        .await
+        .map_err(|e| {
+            AppError::PeerUnreachable(format!(
+                "Failed to connect to peer '{peer_name}' at {}: {e}",
+                peer.address
+            ))
+        })?;
+    let server_name = ServerName::try_from(peer_name.to_string())
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let tls_stream = connector
+        .connect(server_name, tcp_stream)
+        .await
+        .map_err(|e| map_tls_connect_error(peer_name, e))?;
+    // The user the peer's certificate names (A16), read from the certificate it presented.
+    let user = tls_stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .and_then(|leaf| crate::node::user_from_cert(leaf.as_ref()).ok())
+        .unwrap_or_default();
+
+    let io = hyper_util::rt::TokioIo::new(tls_stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|e| {
+            AppError::PeerUnreachable(format!(
+                "HTTP handshake failed with peer '{peer_name}': {e}"
+            ))
+        })?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            debug!("HTTP connection closed: {e}");
+        }
+    });
+
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri("/fed/v2/sessions")
+        .header("host", peer_name)
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let resp = sender.send_request(req).await.map_err(|e| {
+        AppError::PeerUnreachable(format!("Request to peer '{peer_name}' failed: {e}"))
+    })?;
+
+    let status = resp.status();
+    let max_limit = fed_state.max_body + 4096;
+    let limited = http_body_util::Limited::new(resp.into_body(), max_limit);
+    use http_body_util::BodyExt;
+    let body_bytes = limited
+        .collect()
+        .await
+        .map_err(|_| AppError::PayloadTooLarge {
+            size: max_limit + 1,
+            limit: max_limit,
+        })?
+        .to_bytes();
+
+    if status.is_success() {
+        let entries: Vec<FedListEntry> = serde_json::from_slice(&body_bytes).map_err(|e| {
+            AppError::ServiceUnavailable(format!("unreadable list from peer '{peer_name}': {e}"))
+        })?;
+        Ok((FedListAnswer::Ok { entries }, user))
+    } else if status == StatusCode::FORBIDDEN {
+        let detail = serde_json::from_slice::<WireErrorResponse>(&body_bytes)
+            .map(|e| e.detail)
+            .unwrap_or_else(|_| format!("peer '{peer_name}' returned status {status}"));
+        Err(AppError::OpDenied(detail))
     } else {
-        let re = regex::Regex::new(r"^[A-Za-z0-9._-]{1,32}$").unwrap();
-        if !re.is_match(s) {
-            return Err(AppError::BadRequest(format!("invalid principal '{s}'")));
+        Err(AppError::ServiceUnavailable(format!(
+            "peer '{peer_name}' returned status {status}"
+        )))
+    }
+}
+
+/// A dial-out client answers a `list` query from `peer_key`'s mailbox, applying its own
+/// entry for that node (A-1, AM-1): `denied` unless it allows `list`.
+pub async fn answer_list_query(fed_state: &FedState, peer_key: &str, query: &str) {
+    let Some(peer) = fed_state.current_peers().get(peer_key).cloned() else {
+        return;
+    };
+    let answer = if peer.allow.iter().any(|op| op == "list") {
+        match listing_for_peer(fed_state, &peer).await {
+            Ok(entries) => FedListAnswer::Ok { entries },
+            Err(e) => {
+                tracing::warn!("list for '{peer_key}' failed: {e}");
+                return;
+            }
         }
-        Ok(FedPrincipal::Service {
-            name: s.to_string(),
-        })
+    } else {
+        FedListAnswer::Denied
+    };
+    let posted = async {
+        let connector = make_tls_connector_for_peer(fed_state, &peer)?;
+        let tcp = tokio::net::TcpStream::connect(&peer.address)
+            .await
+            .map_err(|e| AppError::PeerUnreachable(e.to_string()))?;
+        let server_name = ServerName::try_from(peer.name.clone())
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let tls = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| map_tls_connect_error(&peer.name, e))?;
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
+                .await
+                .map_err(|e| AppError::PeerUnreachable(e.to_string()))?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let body = serde_json::to_vec(&answer).map_err(|e| AppError::Internal(e.to_string()))?;
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri(format!("/fed/v2/list/{query}"))
+            .header("content-type", "application/json")
+            .header("host", peer.name.as_str())
+            .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let resp = sender
+            .send_request(req)
+            .await
+            .map_err(|e| AppError::PeerUnreachable(e.to_string()))?;
+        match resp.status() {
+            s if s.is_success() => Ok(()),
+            s => Err(AppError::ServiceUnavailable(format!(
+                "'{peer_key}' refused the list answer: {s}"
+            ))),
+        }
+    };
+    match tokio::time::timeout(LIST_TIMEOUT, posted).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("list answer to '{peer_key}' failed: {e}"),
+        Err(_) => tracing::warn!("list answer to '{peer_key}' timed out"),
     }
 }
 
@@ -4329,6 +4364,7 @@ pub async fn run_fed_listener_with_acceptor(
                 name: peer_config.name.clone(),
                 pin: client_pin,
                 uri: verified_uri,
+                user: crate::node::user_from_cert(leaf.as_ref()).unwrap_or_default(),
                 remote_ip: remote_addr.ip(),
             });
 

@@ -1170,6 +1170,22 @@ pub fn seen_instance(
     }))
 }
 
+/// The instances that may be parked here at `now` (A14, D-1): observed before, not a pi
+/// (AM-9), and within their parked lifetime: `ttl_secs` after last live, or as long as
+/// their queue. The caller leaves out the ones live now.
+pub fn parked_instances(conn: &Connection, now: i64, ttl_secs: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM instance_seen s WHERE harness != 'pi' AND (last_live + ?2 > ?1 \
+         OR EXISTS (SELECT 1 FROM instance_queue q WHERE q.instance_id = s.id AND q.delivered_at IS NULL AND q.expires_at > ?1) \
+         OR EXISTS (SELECT 1 FROM agy_pending_messages a WHERE a.session_id = s.id AND a.delivered_at IS NULL AND a.created_at >= ?1 - ?2)) \
+         ORDER BY id",
+    )?;
+    let ids = stmt
+        .query_map(params![now, ttl_secs], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
 /// `secs` since the epoch as an RFC 3339 UTC time, `2026-10-12T08:30:00Z`.
 pub fn utc_rfc3339(secs: i64) -> String {
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));

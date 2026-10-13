@@ -19,8 +19,8 @@ use xmsg::agent::run_agent_server;
 use xmsg::agy::{flush_agy_queue, new_agy_store, AgyConfig, AgyCredentials, AgySessionInfo};
 use xmsg::fed::{
     generate_self_signed_ed25519, generate_self_signed_ed25519_pem, make_tls_connector,
-    run_fed_listener, send_federated_message, send_federated_reply, FedEnvelope, FedPrincipal,
-    FedReplier, FedReplyEnvelope, FedState, FedTarget, PeerConfig, PeersMap, RateLimiter,
+    run_fed_listener, send_federated_message, send_federated_reply, FedEnvelope, FedReplyEnvelope,
+    FedState, FedTarget, PeerConfig, PeersMap, RateLimiter,
 };
 use xmsg::http::{build_router, AppState};
 use xmsg::pi::new_pi_store;
@@ -172,6 +172,8 @@ async fn create_test_node_full_inner(
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let fed_listener = match listener_opt {
@@ -500,12 +502,13 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
     .await;
 
     let envelope1 = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "sess-a".to_string(),
-            name: "agent-a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("sess-a".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-a".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -556,6 +559,8 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let res1 = send_federated_message(&fed_state_a1, "host-b", &envelope1).await;
@@ -587,12 +592,13 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
     .await;
 
     let envelope2 = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "sess-a".to_string(),
-            name: "agent-a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("sess-a".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-a".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -643,6 +649,8 @@ async fn test_oracle_1_from_cidr_allowlist_enforced() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let res2 = send_federated_message(&fed_state_a2, "host-b", &envelope2).await;
@@ -688,12 +696,13 @@ async fn test_oracle_2_from_absent_pin_only_accepted() {
     .await;
 
     let envelope = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "sess-a".to_string(),
-            name: "agent-a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("sess-a".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-a".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -744,6 +753,8 @@ async fn test_oracle_2_from_absent_pin_only_accepted() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let res = send_federated_message(&fed_state_a, "host-b", &envelope).await;
@@ -876,16 +887,19 @@ async fn test_oracle_4_reply_route_source_check() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let reply = FedReplyEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
         in_reply_to: orig_msg_id,
-        replier: FedReplier {
-            harness: "claude".to_string(),
-            session_id: "sess-b".to_string(),
-            name: "agent-b".to_string(),
+        replier: xmsg::storage::Origin {
+            id: Some("sess-b".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-b".to_string()),
         },
         text: "Valid reply from wrong source IP".to_string(),
         created_at: 1001,
@@ -975,14 +989,13 @@ async fn test_oracle_5_host_field_in_body_rejected() {
     });
 
     let body_with_host = serde_json::json!({
-        "v": 1,
+        "v": 2,
         "id": ulid::Ulid::new().to_string(),
         "host": "evil-host",
-        "principal": {
-            "kind": "session",
-            "harness": "claude",
-            "session_id": "s1",
-            "name": "a1"
+        "origin": {
+            "id": "s1",
+            "node": "host-a",
+            "label": "a1"
         },
         "to": { "ref": "sess-b" },
         "body": "test",
@@ -992,7 +1005,7 @@ async fn test_oracle_5_host_field_in_body_rejected() {
 
     let req = hyper::Request::builder()
         .method("POST")
-        .uri("/fed/v1/messages")
+        .uri("/fed/v2/messages")
         .header("content-type", "application/json")
         .body(http_body_util::Full::new(bytes::Bytes::from(
             body_with_host.to_string(),
@@ -1033,10 +1046,13 @@ async fn test_oracle_6_anonymous_from_with_colon_gives_400() {
     .await;
 
     let envelope = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Anonymous {
-            from: "bad:sender".to_string(),
+        origin: xmsg::storage::Origin {
+            id: None,
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("bad:sender".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -1087,6 +1103,8 @@ async fn test_oracle_6_anonymous_from_with_colon_gives_400() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let res = send_federated_message(&fed_state_a, "host-b", &envelope).await;
@@ -1099,7 +1117,8 @@ async fn test_oracle_6_anonymous_from_with_colon_gives_400() {
 }
 
 // =============================================================================
-// Oracle 7: harness = "root" gives 400; name with " · claude:y" is sanitized
+// Oracle 7: an origin naming both an instance and a service gives 400 (no harness on the
+// wire, XA5); name with " · claude:y" is sanitized
 // =============================================================================
 #[tokio::test]
 async fn test_oracle_7_root_harness_rejected_and_badge_spoof_sanitized() {
@@ -1164,16 +1183,20 @@ async fn test_oracle_7_root_harness_rejected_and_badge_spoof_sanitized() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
-    // 1. harness = "root" gives 400
+    // 1. XA5 (harness gate v0 P8): the wire carries no harness, so the receiver reads only
+    // the origin's shape. One naming both an instance and a service gives 400.
     let env_root = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "root".to_string(),
-            session_id: "s1".to_string(),
-            name: "admin".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("s1".to_string()),
+            service: Some("root".to_string()),
+            node: "origin-claim".into(),
+            label: Some("admin".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -1191,12 +1214,13 @@ async fn test_oracle_7_root_harness_rejected_and_badge_spoof_sanitized() {
 
     // 2. Name containing spoof badge separator " · claude:y"
     let env_spoof = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "s1".to_string(),
-            name: "x · claude:y".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("s1".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("x · claude:y".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -1283,15 +1307,18 @@ async fn test_n4_attested_name_ascii_only_u0387() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let env_u0387 = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "s1".to_string(),
-            name: "x \u{0387} claude:y".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("s1".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("x \u{0387} claude:y".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -1375,15 +1402,18 @@ async fn test_oracle_8_no_forward_rejected() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let env = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "s1".to_string(),
-            name: "agent-a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("s1".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-a".to_string()),
         },
         to: FedTarget {
             r#ref: "user@host-c".to_string(),
@@ -1467,16 +1497,19 @@ async fn test_oracle_9_forged_reply_id_gives_403() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let forged_reply = FedReplyEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
         in_reply_to: "01H000000000000000000FORGED".to_string(),
-        replier: FedReplier {
-            harness: "claude".to_string(),
-            session_id: "sess-b".to_string(),
-            name: "agent-b".to_string(),
+        replier: xmsg::storage::Origin {
+            id: Some("sess-b".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-b".to_string()),
         },
         text: "forged reply".to_string(),
         created_at: 1000,
@@ -1513,13 +1546,14 @@ async fn test_oracle_9_forged_reply_id_gives_403() {
     }
 
     let cross_peer_reply = FedReplyEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
         in_reply_to: msg_c_id,
-        replier: FedReplier {
-            harness: "claude".to_string(),
-            session_id: "sess-b".to_string(),
-            name: "agent-b".to_string(),
+        replier: xmsg::storage::Origin {
+            id: Some("sess-b".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-b".to_string()),
         },
         text: "cross-peer reply attempt".to_string(),
         created_at: 1000,
@@ -1605,16 +1639,19 @@ async fn test_oracle_10_duplicate_id_delivered_once() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let dup_id = ulid::Ulid::new().to_string();
     let env = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: dup_id.clone(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "s1".to_string(),
-            name: "agent-a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("s1".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-a".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -1714,17 +1751,20 @@ async fn test_oracle_11_rate_limit_429() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     // Send 20 messages (principal limit is 20/min)
     for _ in 0..20 {
         let env = FedEnvelope {
-            v: 1,
+            v: xmsg::fed::WIRE_VERSION,
             id: ulid::Ulid::new().to_string(),
-            principal: FedPrincipal::Session {
-                harness: "claude".to_string(),
-                session_id: "sess-flood".to_string(),
-                name: "flooder".to_string(),
+            origin: xmsg::storage::Origin {
+                id: Some("sess-flood".to_string()),
+                service: None,
+                node: "origin-claim".into(),
+                label: Some("flooder".to_string()),
             },
             to: FedTarget {
                 r#ref: "sess-b".to_string(),
@@ -1741,12 +1781,13 @@ async fn test_oracle_11_rate_limit_429() {
 
     // 21st message should exceed rate limit
     let env_exceeded = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "sess-flood".to_string(),
-            name: "flooder".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("sess-flood".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("flooder".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -1789,10 +1830,10 @@ async fn test_oracle_12_router_isolation() {
     )
     .await;
 
-    // 1. Loopback HTTP router must NOT serve /fed/v1/messages
+    // 1. Loopback HTTP router must NOT serve /fed/v2/messages
     let client = reqwest::Client::new();
     let loopback_resp = client
-        .post(format!("http://{}/fed/v1/messages", node_b.http_addr))
+        .post(format!("http://{}/fed/v2/messages", node_b.http_addr))
         .send()
         .await
         .unwrap();
@@ -1895,15 +1936,18 @@ async fn test_amendment_a_peer_without_send_gets_403_op_denied() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let env = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "s1".to_string(),
-            name: "agent-a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("s1".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-a".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -2249,6 +2293,8 @@ fn make_client_fed_state(
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     })
 }
 
@@ -2316,13 +2362,14 @@ async fn test_f2_anon_origin_reply_stored() {
     );
 
     let reply = FedReplyEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
         in_reply_to: anon_msg_id,
-        replier: FedReplier {
-            harness: "claude".to_string(),
-            session_id: "sess-b".to_string(),
-            name: "agent-b".to_string(),
+        replier: xmsg::storage::Origin {
+            id: Some("sess-b".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-b".to_string()),
         },
         text: "reply to anon message".to_string(),
         created_at: 1000,
@@ -2400,13 +2447,14 @@ async fn test_f2_session_sender_always_pushed() {
     );
 
     let reply = FedReplyEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
         in_reply_to: msg_id,
-        replier: FedReplier {
-            harness: "claude".to_string(),
-            session_id: "sess-b".to_string(),
-            name: "agent-b".to_string(),
+        replier: xmsg::storage::Origin {
+            id: Some("sess-b".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-b".to_string()),
         },
         text: "forced reply".to_string(),
         created_at: 1000,
@@ -2485,13 +2533,14 @@ async fn test_f2_unknown_harness_reply_stored() {
     );
 
     let reply = FedReplyEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
         in_reply_to: msg_id,
-        replier: FedReplier {
-            harness: "claude".to_string(),
-            session_id: "sess-b".to_string(),
-            name: "agent-b".to_string(),
+        replier: xmsg::storage::Origin {
+            id: Some("sess-b".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-b".to_string()),
         },
         text: "reply to unknown harness".to_string(),
         created_at: 1000,
@@ -2672,12 +2721,13 @@ async fn test_f4_one_way_link() {
     .await;
 
     let env = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "s1".to_string(),
-            name: "agent-a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("s1".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-a".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -2751,12 +2801,13 @@ async fn test_f7_outbound_timeout_on_silent_peer() {
     );
 
     let env = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "s1".to_string(),
-            name: "agent-a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("s1".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-a".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -2821,12 +2872,13 @@ async fn test_f8_verbatim_remote_outcome_relay_and_dedup() {
     );
 
     let env = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "s1".to_string(),
-            name: "alice".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("s1".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("alice".to_string()),
         },
         to: FedTarget {
             r#ref: "nobody".to_string(),
@@ -2894,10 +2946,13 @@ async fn test_f9_kind_qualified_principal_filter() {
         &fed_state_a,
         "host-b",
         &FedEnvelope {
-            v: 1,
+            v: xmsg::fed::WIRE_VERSION,
             id: ulid::Ulid::new().to_string(),
-            principal: FedPrincipal::Anonymous {
-                from: "other".into(),
+            origin: xmsg::storage::Origin {
+                id: None,
+                service: None,
+                node: "origin-claim".into(),
+                label: Some("other".into()),
             },
             to: FedTarget {
                 r#ref: "sess-b".into(),
@@ -2916,10 +2971,13 @@ async fn test_f9_kind_qualified_principal_filter() {
         &fed_state_a,
         "host-b",
         &FedEnvelope {
-            v: 1,
+            v: xmsg::fed::WIRE_VERSION,
             id: ulid::Ulid::new().to_string(),
-            principal: FedPrincipal::Anonymous {
-                from: "genie".into(),
+            origin: xmsg::storage::Origin {
+                id: None,
+                service: None,
+                node: "origin-claim".into(),
+                label: Some("genie".into()),
             },
             to: FedTarget {
                 r#ref: "sess-b".into(),
@@ -2942,12 +3000,13 @@ async fn test_f9_kind_qualified_principal_filter() {
         &fed_state_a,
         "host-b",
         &FedEnvelope {
-            v: 1,
+            v: xmsg::fed::WIRE_VERSION,
             id: ulid::Ulid::new().to_string(),
-            principal: FedPrincipal::Session {
-                harness: "claude".into(),
-                session_id: "s1".into(),
-                name: "matrix".into(),
+            origin: xmsg::storage::Origin {
+                id: Some("s1".into()),
+                service: None,
+                node: "origin-claim".into(),
+                label: Some("matrix".into()),
             },
             to: FedTarget {
                 r#ref: "sess-b".into(),
@@ -2966,10 +3025,13 @@ async fn test_f9_kind_qualified_principal_filter() {
         &fed_state_a,
         "host-b",
         &FedEnvelope {
-            v: 1,
+            v: xmsg::fed::WIRE_VERSION,
             id: ulid::Ulid::new().to_string(),
-            principal: FedPrincipal::Service {
-                name: "matrix".into(),
+            origin: xmsg::storage::Origin {
+                id: None,
+                service: Some("matrix".into()),
+                node: "origin-claim".into(),
+                label: None,
             },
             to: FedTarget {
                 r#ref: "sess-b".into(),
@@ -3051,13 +3113,14 @@ async fn test_f10_reply_deduplication_and_rate_limit() {
 
     let reply_id = ulid::Ulid::new().to_string();
     let reply = FedReplyEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: reply_id.clone(),
         in_reply_to: msg_id.clone(),
-        replier: FedReplier {
-            harness: "claude".to_string(),
-            session_id: "sess-b".to_string(),
-            name: "agent-b".to_string(),
+        replier: xmsg::storage::Origin {
+            id: Some("sess-b".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-b".to_string()),
         },
         text: "reply dedup test".to_string(),
         created_at: 1000,
@@ -3083,13 +3146,14 @@ async fn test_f10_reply_deduplication_and_rate_limit() {
     let mut rate_limited = false;
     for i in 0..70 {
         let flood_reply = FedReplyEnvelope {
-            v: 1,
+            v: xmsg::fed::WIRE_VERSION,
             id: ulid::Ulid::new().to_string(),
             in_reply_to: msg_id.clone(),
-            replier: FedReplier {
-                harness: "claude".to_string(),
-                session_id: "sess-b".to_string(),
-                name: "agent-b".to_string(),
+            replier: xmsg::storage::Origin {
+                id: Some("sess-b".to_string()),
+                service: None,
+                node: "origin-claim".into(),
+                label: Some("agent-b".to_string()),
             },
             text: format!("flood reply {i}"),
             created_at: 1000,
@@ -3155,12 +3219,13 @@ async fn test_oracle_server_pin_verified() {
     );
 
     let e = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "s1".to_string(),
-            name: "a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("s1".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("a".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -3243,13 +3308,14 @@ async fn test_oracle_reply_allow_check() {
     );
 
     let reply = FedReplyEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
         in_reply_to: msg_id,
-        replier: FedReplier {
-            harness: "claude".to_string(),
-            session_id: "sess-b".to_string(),
-            name: "agent-b".to_string(),
+        replier: xmsg::storage::Origin {
+            id: Some("sess-b".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-b".to_string()),
         },
         text: "reply attempt without right".to_string(),
         created_at: 1000,
@@ -3342,13 +3408,14 @@ async fn test_n1_offsource_replay_known_reply_id_rejected() {
         &b,
         "host-a",
         &FedReplyEnvelope {
-            v: 1,
+            v: xmsg::fed::WIRE_VERSION,
             id: known,
             in_reply_to: orig,
-            replier: FedReplier {
-                harness: "claude".to_string(),
-                session_id: "s2".to_string(),
-                name: "agent-b".to_string(),
+            replier: xmsg::storage::Origin {
+                id: Some("s2".to_string()),
+                service: None,
+                node: "origin-claim".into(),
+                label: Some("agent-b".to_string()),
             },
             text: "r".to_string(),
             created_at: 1,
@@ -3422,6 +3489,8 @@ async fn test_n1_offsource_flood_leaves_legit_bucket_intact() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let legit_addr = l.local_addr().unwrap();
@@ -3458,13 +3527,14 @@ async fn test_n1_offsource_flood_leaves_legit_bucket_intact() {
             &atk,
             "host-r",
             &FedReplyEnvelope {
-                v: 1,
+                v: xmsg::fed::WIRE_VERSION,
                 id: ulid::Ulid::new().to_string(),
                 in_reply_to: orig.clone(),
-                replier: FedReplier {
-                    harness: "claude".to_string(),
-                    session_id: format!("s{i}"),
-                    name: "agent-a".to_string(),
+                replier: xmsg::storage::Origin {
+                    id: Some(format!("s{i}")),
+                    service: None,
+                    node: "origin-claim".into(),
+                    label: Some("agent-a".to_string()),
                 },
                 text: "r".to_string(),
                 created_at: 1,
@@ -3481,13 +3551,14 @@ async fn test_n1_offsource_flood_leaves_legit_bucket_intact() {
         &good,
         "host-r",
         &FedReplyEnvelope {
-            v: 1,
+            v: xmsg::fed::WIRE_VERSION,
             id: ulid::Ulid::new().to_string(),
             in_reply_to: orig,
-            replier: FedReplier {
-                harness: "claude".to_string(),
-                session_id: "legit".to_string(),
-                name: "agent-a".to_string(),
+            replier: xmsg::storage::Origin {
+                id: Some("legit".to_string()),
+                service: None,
+                node: "origin-claim".into(),
+                label: Some("agent-a".to_string()),
             },
             text: "legit".to_string(),
             created_at: 1,
@@ -3588,12 +3659,13 @@ async fn test_n3_unauthenticated_socket_bound_leaves_slot_for_peer() {
     }
 
     let env = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "s1".to_string(),
-            name: "agent-a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("s1".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("agent-a".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -3725,12 +3797,13 @@ async fn test_n7_mf6_tcp_peer_address_source() {
     });
 
     let env = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: ulid::Ulid::new().to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "s1".to_string(),
-            name: "a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("s1".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("a".to_string()),
         },
         to: FedTarget {
             r#ref: "sess-b".to_string(),
@@ -3743,7 +3816,7 @@ async fn test_n7_mf6_tcp_peer_address_source() {
     let body_bytes = serde_json::to_vec(&env).unwrap();
     let req = hyper::Request::builder()
         .method("POST")
-        .uri("/fed/v1/messages")
+        .uri("/fed/v2/messages")
         .header("content-type", "application/json")
         .header("host", "host-b")
         .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))

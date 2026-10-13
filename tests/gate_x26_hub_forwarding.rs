@@ -327,7 +327,7 @@ where
 // Line: test_oracle_1_relay_and_reply
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA5: re-armed when H6 routing originates hop envelopes (owner design A3/B4)"]
+#[ignore = "H6: re-armed when H6 routing originates hop envelopes (owner design A3/B4; plan §7)"]
 async fn test_oracle_1_relay_and_reply() {
     run_test_with_port_retry("test_oracle_1_relay_and_reply", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -452,7 +452,7 @@ async fn test_oracle_1_relay_and_reply() {
 // Line: test_oracle_2_polling_sender
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA5: re-armed when H6 routing originates hop envelopes (owner design A3/B4)"]
+#[ignore = "H6: re-armed when H6 routing originates hop envelopes (owner design A3/B4; plan §7)"]
 async fn test_oracle_2_polling_sender() {
     run_test_with_port_retry("test_oracle_2_polling_sender", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -569,7 +569,7 @@ async fn test_oracle_2_polling_sender() {
 // Line: test_oracle_3_undialable_client
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA5: re-armed when H6 routing originates hop envelopes (owner design A3/B4)"]
+#[ignore = "H6: re-armed when H6 routing originates hop envelopes (owner design A3/B4; plan §7)"]
 async fn test_oracle_3_undialable_client() {
     run_test_with_port_retry("test_oracle_3_undialable_client", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -1297,7 +1297,7 @@ async fn test_oracle_3a_hub_stores_reply_for_undialable_origin() {
                 &pin_h,
                 port_h,
                 "GET",
-                &format!("/fed/v1/messages/{msg_id}/replies"),
+                &format!("/fed/v2/messages/{msg_id}/replies"),
                 None,
             )
             .await;

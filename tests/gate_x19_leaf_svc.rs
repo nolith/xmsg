@@ -205,6 +205,8 @@ async fn create_hub_test_node(
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let fed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -357,6 +359,8 @@ async fn create_leaf_test_node(
         leaf_principal: Some(leaf_principal.to_string()),
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let r_sock = reg_sock.clone();
@@ -912,6 +916,8 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
         leaf_principal: Some("svc:guard".to_string()),
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     };
 
     // Leaf 1 polls inbox: gets M1
@@ -919,7 +925,9 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
         .await
         .unwrap();
     assert!(poll1.is_some());
-    let m = poll1.unwrap();
+    let Some(xmsg::fed::FedInboxItem::Message(m)) = poll1 else {
+        panic!("expected a message, got {poll1:?}");
+    };
     assert_eq!(m.id, msg1_id);
     assert_eq!(m.body, "M1 for leaf1");
 
@@ -944,7 +952,7 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
         other => panic!("Acking another peer's mailbox id must return NotFound, got: {other:?}"),
     }
 
-    // Non-leaf peer attempts to poll /fed/v1/inbox: must return 403 OpDenied
+    // Non-leaf peer attempts to poll /fed/v2/inbox: must return 403 OpDenied
     let mut nonleaf_peers = PeersMap::empty();
     nonleaf_peers
         .insert(PeerConfig {
@@ -983,12 +991,14 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     };
 
     let poll_nonleaf = xmsg::fed::get_federated_inbox(&nonleaf_fed_state, "hub", 0).await;
     match poll_nonleaf {
         Err(AppError::OpDenied(_)) => {}
-        other => panic!("Non-leaf polling /fed/v1/inbox must return OpDenied, got: {other:?}"),
+        other => panic!("Non-leaf polling /fed/v2/inbox must return OpDenied, got: {other:?}"),
     }
 }
 

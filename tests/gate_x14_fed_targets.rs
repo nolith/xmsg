@@ -15,8 +15,8 @@ use xmsg::agent::{current_uid, run_agent_server};
 use xmsg::agy::{new_agy_store, run_register_server, AgyConfig};
 use xmsg::error::AppError;
 use xmsg::fed::{
-    generate_self_signed_ed25519, run_fed_listener, send_federated_message, FedEnvelope,
-    FedPrincipal, FedState, FedTarget, PeerConfig, PeersMap, RateLimiter,
+    generate_self_signed_ed25519, run_fed_listener, send_federated_message, FedEnvelope, FedState,
+    FedTarget, PeerConfig, PeersMap, RateLimiter,
 };
 use xmsg::http::AppState;
 use xmsg::pi::new_pi_store;
@@ -174,6 +174,8 @@ async fn create_fed_test_node(
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let fed_listener = match listener_opt {
@@ -832,12 +834,13 @@ async fn test_oracle_4_refused_target_does_not_consume_rate_limit_or_create_stor
     // 1. Send to refused target directly via send_federated_message with known ID
     let refused_id = "01REFUSED_MSG_ID_ORACLE4";
     let envelope_refused = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: refused_id.to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "sess-sender".to_string(),
-            name: "sender-a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("sess-sender".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("sender-a".to_string()),
         },
         to: FedTarget {
             r#ref: "other-worker".to_string(),
@@ -873,12 +876,13 @@ async fn test_oracle_4_refused_target_does_not_consume_rate_limit_or_create_stor
     // If the refused send had consumed the 1-capacity rate limit budget, this would return RateLimited.
     let allowed_id = "01ALLOWED_MSG_ID_ORACLE4";
     let envelope_allowed = FedEnvelope {
-        v: 1,
+        v: xmsg::fed::WIRE_VERSION,
         id: allowed_id.to_string(),
-        principal: FedPrincipal::Session {
-            harness: "claude".to_string(),
-            session_id: "sess-sender".to_string(),
-            name: "sender-a".to_string(),
+        origin: xmsg::storage::Origin {
+            id: Some("sess-sender".to_string()),
+            service: None,
+            node: "origin-claim".into(),
+            label: Some("sender-a".to_string()),
         },
         to: FedTarget {
             r#ref: "genie-expert".to_string(),

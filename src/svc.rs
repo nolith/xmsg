@@ -550,7 +550,11 @@ pub async fn run_leaf_inbox_task(
 
     loop {
         match crate::fed::get_federated_inbox(&fed_state, &peer_name, wait_secs).await {
-            Ok(Some(msg)) => {
+            Ok(Some(crate::fed::FedInboxItem::List { query })) => {
+                backoff_millis = 100;
+                crate::fed::answer_list_query(&fed_state, &peer_name, &query).await;
+            }
+            Ok(Some(crate::fed::FedInboxItem::Message(msg))) => {
                 backoff_millis = 100;
 
                 let leaf_name = crate::surface::leaf_service_name(&leaf_principal);
@@ -566,11 +570,7 @@ pub async fn run_leaf_inbox_task(
                         msg.id
                     );
 
-                    let replier = crate::fed::FedReplier {
-                        harness: "svc".to_string(),
-                        session_id: leaf_name.to_string(),
-                        name: leaf_name.to_string(),
-                    };
+                    let replier = storage::Origin::service(leaf_name, &fed_state.node_name);
 
                     let reply_text = serde_json::json!({
                         "error": "not_found",
@@ -579,7 +579,7 @@ pub async fn run_leaf_inbox_task(
                     .to_string();
 
                     let reply_envelope = crate::fed::FedReplyEnvelope {
-                        v: 1,
+                        v: crate::fed::WIRE_VERSION,
                         id: ulid::Ulid::new().to_string(),
                         in_reply_to: msg.id.clone(),
                         replier,

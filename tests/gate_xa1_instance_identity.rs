@@ -1203,14 +1203,18 @@ async fn test_oracle_7_agy_conversation_uuid_across_restart() {
         .expect("agy 7777 MUST be registered under conversation UUID C");
     assert_eq!(before.session_key, conv_uuid, "Session key MUST be C");
     assert_eq!(before.conversation_id, conv_uuid);
-    let listed: Vec<serde_json::Value> = reqwest::Client::new()
-        .get(format!("{}/v1/recipients", server.base_url))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let listed: Vec<serde_json::Value> = serde_json::from_value(
+        reqwest::Client::new()
+            .get(format!("{}/v1/recipients", server.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["recipients"]
+            .take(),
+    )
+    .unwrap();
     assert!(
         listed
             .iter()

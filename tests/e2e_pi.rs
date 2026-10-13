@@ -169,7 +169,7 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
         .unwrap();
     assert_eq!(sessions_resp.status(), StatusCode::OK);
     let sessions_json: Value = sessions_resp.json().await.unwrap();
-    let sessions_arr = sessions_json.as_array().unwrap();
+    let sessions_arr = sessions_json["recipients"].as_array().unwrap();
     let pi_sess = sessions_arr
         .iter()
         .find(|s| s["address"] == format!("{derived_session_id}@test-host"))

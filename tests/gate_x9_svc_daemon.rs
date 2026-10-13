@@ -255,7 +255,9 @@ async fn test_oracle_1_trusted_exe_registered_and_addressable() {
         .await
         .unwrap();
 
-    let sessions = sessions_resp.as_array().expect("recipients list");
+    let sessions = sessions_resp["recipients"]
+        .as_array()
+        .expect("recipients list");
     let node = "test-host";
     let svc_session = sessions
         .iter()
@@ -288,7 +290,11 @@ async fn test_oracle_1_trusted_exe_registered_and_addressable() {
         .json()
         .await
         .unwrap();
-    assert_eq!(by_name.as_array().map(Vec::len), Some(1), "{by_name}");
+    assert_eq!(
+        by_name["recipients"].as_array().map(Vec::len),
+        Some(1),
+        "{by_name}"
+    );
 
     // 5. Send message to svc:dispatcher via HTTP
     let send_resp = client

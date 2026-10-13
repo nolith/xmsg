@@ -166,7 +166,10 @@ impl Node {
     async fn list(&self) -> Vec<serde_json::Value> {
         let (status, body) = self.http("GET", "/v1/recipients", None).await;
         assert_eq!(status, 200, "{body}");
-        serde_json::from_str(&body).unwrap()
+        serde_json::from_value(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["recipients"].take(),
+        )
+        .unwrap()
     }
 
     /// One frame over `agent.sock`, from this test process.
@@ -1063,7 +1066,10 @@ async fn test_oracle_12_names_compare_exactly() {
 
     let (status, body) = node.http("GET", "/v1/recipients?name=dup", None).await;
     assert_eq!(status, 200, "{body}");
-    let listed: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    let listed: Vec<serde_json::Value> = serde_json::from_value(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["recipients"].take(),
+    )
+    .unwrap();
     let addrs: Vec<&str> = listed
         .iter()
         .filter_map(|r| r["address"].as_str())
@@ -1078,7 +1084,10 @@ async fn test_oracle_12_names_compare_exactly() {
         let (_, body) = node
             .http("GET", &format!("/v1/recipients?name={name}"), None)
             .await;
-        let listed: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let listed: Vec<serde_json::Value> = serde_json::from_value(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["recipients"].take(),
+        )
+        .unwrap();
         let (status, sent) = node.send(name, "label").await;
         if found {
             assert_eq!(listed.len(), 1, "list {name}: {body}");

@@ -534,7 +534,7 @@ pub async fn run_agent_server(
                         let query = surface::ListQuery { name, node, kind };
                         surface::list(&state_clone, &query)
                             .await
-                            .map(|r| serde_json::json!({ "status": "ok", "recipients": r }))
+                            .map(|r| serde_json::json!({ "status": "ok", "recipients": r.recipients, "nodes": r.nodes }))
                     }
                     AgentFrame::Send { to, text, idempotency_key } => {
                         let sender = surface::Sender::Session(caller.expect("caller resolved"));

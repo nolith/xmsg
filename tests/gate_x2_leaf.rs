@@ -226,6 +226,8 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let fs_clone = node_b_fed_state.clone();
@@ -320,6 +322,8 @@ async fn test_oracle_2_body_from_ignored_and_attributed_to_leaf_principal() {
         leaf_principal: Some("svc:matrix".to_string()),
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let leaf_app_state = Arc::new(AppState {
@@ -477,6 +481,8 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let fs_clone = node_b_fed_state.clone();
@@ -602,6 +608,8 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
         leaf_principal: Some("svc:matrix".to_string()),
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let leaf_app_state = Arc::new(AppState {

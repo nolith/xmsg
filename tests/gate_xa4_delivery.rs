@@ -225,7 +225,7 @@ impl Node {
     async fn list(&self) -> Vec<Value> {
         let (status, body) = self.http("GET", "/v1/recipients", None).await;
         assert_eq!(status, 200, "{body}");
-        serde_json::from_value(body).unwrap()
+        serde_json::from_value(body["recipients"].clone()).unwrap()
     }
 }
 
@@ -400,11 +400,12 @@ impl Registration {
 }
 
 /// Is `id` listed live?
+/// Is `id` listed live? XA5 lists an instance parked here too, with status `parked`.
 async fn listed(node: &Node, id: &str) -> bool {
     node.list()
         .await
         .iter()
-        .any(|r| r["address"] == format!("{id}@{}", node_name()))
+        .any(|r| r["address"] == format!("{id}@{}", node_name()) && r["status"] == "live")
 }
 
 // =============================================================================

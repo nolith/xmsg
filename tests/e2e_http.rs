@@ -233,7 +233,9 @@ async fn test_e2e_recipients_list_and_query_200() {
     // Unfiltered list returns all live sessions (my-worker, dead-sock-worker, twin1, twin2)
     let res = get("").await;
     assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let entries: Vec<serde_json::Value> = res.json().await.unwrap();
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_value(res.json::<serde_json::Value>().await.unwrap()["recipients"].take())
+            .unwrap();
     assert_eq!(
         entries.len(),
         4,
@@ -244,15 +246,39 @@ async fn test_e2e_recipients_list_and_query_200() {
         .all(|e| e["kind"] == "instance" && e["status"] == "live" && e["node"] == "test-host"));
 
     // Filter by name (a label)
-    let filtered: Vec<serde_json::Value> = get("?name=my-worker").await.json().await.unwrap();
+    let filtered: Vec<serde_json::Value> = serde_json::from_value(
+        get("?name=my-worker")
+            .await
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["recipients"]
+            .take(),
+    )
+    .unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0]["address"], "live-session-1234@test-host");
     assert_eq!(filtered[0]["label"], "my-worker");
 
     // Filter by kind
-    let services: Vec<serde_json::Value> = get("?kind=service").await.json().await.unwrap();
+    let services: Vec<serde_json::Value> = serde_json::from_value(
+        get("?kind=service")
+            .await
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["recipients"]
+            .take(),
+    )
+    .unwrap();
     assert!(services.is_empty());
-    let instances: Vec<serde_json::Value> = get("?kind=instance").await.json().await.unwrap();
+    let instances: Vec<serde_json::Value> = serde_json::from_value(
+        get("?kind=instance")
+            .await
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["recipients"]
+            .take(),
+    )
+    .unwrap();
     assert_eq!(instances.len(), 4);
     assert_eq!(
         get("?kind=other").await.status(),
@@ -271,7 +297,9 @@ async fn test_e2e_recipient_by_name_200() {
         .await
         .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let entries: Vec<serde_json::Value> = res.json().await.unwrap();
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_value(res.json::<serde_json::Value>().await.unwrap()["recipients"].take())
+            .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["address"], "live-session-1234@test-host");
     assert!(entries[0].get("messagingSocketPath").is_none());

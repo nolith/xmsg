@@ -15,10 +15,9 @@ use serde_json::Value;
 
 use xmsg::agent::{current_uid, run_agent_server};
 use xmsg::agy::{new_agy_store, run_register_server, AgyConfig};
-use xmsg::error::AppError;
 use xmsg::fed::{
-    generate_self_signed_ed25519, list_federated_sessions, run_fed_listener, FedState, PeerConfig,
-    PeersMap, RateLimiter,
+    generate_self_signed_ed25519, list_peer, run_fed_listener, FedState, PeerConfig, PeersMap,
+    RateLimiter,
 };
 use xmsg::http::{bind_ucred_unix_listener, build_router, http_get_unix, AppState};
 use xmsg::mcp::{execute_tool, McpConfig};
@@ -164,6 +163,8 @@ async fn create_fed_test_node(
         leaf_principal: None,
         outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
         dynamic_tls: Default::default(),
+        reply_ttl: std::time::Duration::from_secs(7 * 24 * 3600),
+        list_queries: Default::default(),
     });
 
     let fed_listener = match listener_opt {
@@ -390,7 +391,9 @@ async fn test_oracle_1_peer_with_list_allowed() {
     let (status, body) = http_get_unix(&node_b.http_sock, "/v1/recipients?node=host-a").unwrap();
     assert_eq!(status, StatusCode::OK, "Body: {body}");
 
-    let sessions: Vec<Value> = serde_json::from_str(&body).unwrap();
+    let sessions: Vec<Value> =
+        serde_json::from_value(serde_json::from_str::<Value>(&body).unwrap()["recipients"].clone())
+            .unwrap();
     assert!(
         sessions.len() >= 2,
         "Expected at least 2 sessions from host-a, got {sessions:?}"
@@ -473,17 +476,16 @@ async fn test_oracle_2_peer_without_list_allowed_403() {
     // Create session on Node A
     let (_sock, _rx) = create_claude_session_fixture(&node_a.sessions_dir, "sess-a", "agent-a");
 
-    // Node B queries /v1/recipients?node=host-a
+    // Node B queries /v1/recipients?node=host-a. XA5: a node that withholds `list` is
+    // reported in the per-node status, not as an error of the whole list.
     let (status, body) = http_get_unix(&node_b.http_sock, "/v1/recipients?node=host-a").unwrap();
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "Expected 403, got {status} with body: {body}"
-    );
+    assert_eq!(status, StatusCode::OK, "Body: {body}");
 
-    let err: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(err["error"], "denied");
-    let detail = err["detail"].as_str().unwrap();
+    let res: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(res["recipients"], serde_json::json!([]), "{res}");
+    assert_eq!(res["nodes"][0]["node"], "host-a", "{res}");
+    assert_eq!(res["nodes"][0]["status"], "denied", "{res}");
+    let detail = res["nodes"][0]["detail"].as_str().unwrap();
     assert!(
         detail.contains("host-a") || detail.contains("list operation not allowed"),
         "Detail must name peer or indicate op denied: {detail}"
@@ -569,7 +571,9 @@ async fn test_oracle_3_peer_with_targets() {
     let (status, body) = http_get_unix(&node_b.http_sock, "/v1/recipients?node=host-a").unwrap();
     assert_eq!(status, StatusCode::OK, "Body: {body}");
 
-    let sessions: Vec<Value> = serde_json::from_str(&body).unwrap();
+    let sessions: Vec<Value> =
+        serde_json::from_value(serde_json::from_str::<Value>(&body).unwrap()["recipients"].clone())
+            .unwrap();
     assert_eq!(
         sessions.len(),
         1,
@@ -645,10 +649,9 @@ async fn test_oracle_4_no_cwd_or_pid() {
     // Create session on Node A
     let (_sock, _rx) = create_claude_session_fixture(&node_a.sessions_dir, "sess-a", "agent-a");
 
-    // Check direct /fed/v1/sessions output first
-    let wire_entries = list_federated_sessions(&node_b.fed_state, "host-a")
-        .await
-        .unwrap();
+    // Check direct /fed/v2/sessions output first
+    let (wire_entries, wire_status) = list_peer(&node_b.fed_state, "host-a").await;
+    assert_eq!(wire_status.status, "ok", "{wire_status:?}");
     assert!(!wire_entries.is_empty());
 
     // Check via client route /v1/recipients?node=host-a
@@ -656,7 +659,7 @@ async fn test_oracle_4_no_cwd_or_pid() {
     assert_eq!(status, StatusCode::OK);
 
     let val: Value = serde_json::from_str(&body).unwrap();
-    let arr = val.as_array().expect("array of sessions");
+    let arr = val["recipients"].as_array().expect("array of recipients");
     assert!(!arr.is_empty());
 
     for entry in arr {
@@ -692,12 +695,13 @@ async fn test_oracle_4_no_cwd_or_pid() {
             "entry must NOT contain registered: {entry:?}"
         );
 
-        // Assert exact key set on client route (A13): address, kind, label, status, node
+        // Assert exact key set on client route (A13, A16): address, kind, label, status,
+        // node, user
         let mut keys: Vec<String> = obj.keys().cloned().collect();
         keys.sort();
         assert_eq!(
             keys,
-            vec!["address", "kind", "label", "node", "status"],
+            vec!["address", "kind", "label", "node", "status", "user"],
             "exact key set mismatch on entry: {entry:?}"
         );
     }
@@ -817,7 +821,7 @@ async fn test_oracle_5_mcp_list_host() {
 }
 
 // =============================================================================
-// Oracle 6: /fed/v1/sessions from a source outside the peer's from CIDRs is refused.
+// Oracle 6: /fed/v2/sessions from a source outside the peer's from CIDRs is refused.
 // Mutant: skip the from check on this route => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -880,16 +884,13 @@ async fn test_oracle_6_source_outside_from_cidr_refused() {
     let (_sock, _rx) = create_claude_session_fixture(&node_a.sessions_dir, "sess-a", "agent-a");
 
     // Node B connects from 127.0.0.1 to Node A
-    let res = list_federated_sessions(&node_b.fed_state, "host-a").await;
-    // A refusal by the peer's rights is `denied` on the wire (A13's one vocabulary).
-    match res {
-        Err(e @ (AppError::PeerRejected(_) | AppError::OpDenied(_))) if e.code().1 == "denied" => {
-            let detail = e.detail();
-            assert!(
-                detail.contains("host-a") || detail.contains("CIDR") || detail.contains("denied"),
-                "Detail must indicate source CIDR refusal: {detail}"
-            );
-        }
-        other => panic!("Expected a denied refusal, got: {other:?}"),
-    }
+    let (entries, status) = list_peer(&node_b.fed_state, "host-a").await;
+    // A refusal by the peer's rights is `denied` (A13's one vocabulary), per node (A-12).
+    assert!(entries.is_empty(), "{entries:?}");
+    assert_eq!(status.status, "denied", "{status:?}");
+    let detail = status.detail.unwrap_or_default();
+    assert!(
+        detail.contains("host-a") || detail.contains("CIDR") || detail.contains("denied"),
+        "Detail must indicate source CIDR refusal: {detail}"
+    );
 }

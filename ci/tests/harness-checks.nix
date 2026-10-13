@@ -137,7 +137,7 @@
                 || fail "GET /v1/recipients failed"
               echo "agy-hook: recipients: $listed"
               printf '%s' "$listed" | jq -e --arg c "$conv" \
-                'any(.[]; .kind == "instance" and .address == "\($c)@\(.node)")' > /dev/null \
+                'any(.recipients[]; .kind == "instance" and .address == "\($c)@\(.node)")' > /dev/null \
                 || fail "conversation $conv is not addressed as $conv: $listed"
 
               kill "$agy" "$serve"

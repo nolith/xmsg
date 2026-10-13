@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 
 use crate::error::AppError;
+use crate::fed::FedListEntry;
 use crate::http::{AppState, ResolvedTarget};
 use crate::inbox;
 use crate::registry::Session;
@@ -118,20 +119,6 @@ impl Sender {
         match self {
             Sender::Session(s) => s.session_id.clone(),
             Sender::Anonymous(from) => format!("anon:{from}"),
-        }
-    }
-
-    pub fn fed_principal(&self) -> crate::fed::FedPrincipal {
-        match self {
-            Sender::Session(s) if s.harness == "svc" => crate::fed::FedPrincipal::Service {
-                name: s.session_id.clone(),
-            },
-            Sender::Session(s) => crate::fed::FedPrincipal::Session {
-                harness: s.harness.clone(),
-                session_id: s.session_id.clone(),
-                name: s.name.clone().unwrap_or_else(|| s.session_id.clone()),
-            },
-            Sender::Anonymous(from) => crate::fed::FedPrincipal::Anonymous { from: from.clone() },
         }
     }
 
@@ -256,7 +243,8 @@ pub fn parse_to(to: &str) -> Result<(&str, Option<&str>), AppError> {
 // list
 // -----------------------------------------------------------------------------
 
-/// One entry of `list` (A13): its address, kind, label and status, and the node holding it.
+/// One entry of `list` (A13, A-12, A16): its address, kind, label and status (`live` or
+/// `parked`), the node holding it and the user it belongs to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Recipient {
@@ -266,6 +254,15 @@ pub struct Recipient {
     pub label: Option<String>,
     pub status: String,
     pub node: String,
+    pub user: String,
+}
+
+/// What `list` returns: the recipients, and how each node asked answered (A-12).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ListResult {
+    pub recipients: Vec<Recipient>,
+    pub nodes: Vec<crate::fed::NodeStatus>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -279,9 +276,9 @@ pub struct ListQuery {
     pub kind: Option<String>,
 }
 
-fn recipient(id: &str, service: bool, label: Option<String>, node: &str) -> Recipient {
-    Recipient {
-        address: format!("{id}@{node}"),
+fn entry(id: &str, service: bool, label: Option<String>, status: &str, user: &str) -> FedListEntry {
+    FedListEntry {
+        id: id.to_string(),
         kind: if service { "service" } else { "instance" }.to_string(),
         label: if service {
             None
@@ -291,13 +288,25 @@ fn recipient(id: &str, service: bool, label: Option<String>, node: &str) -> Reci
                 .and_then(inbox::clean_label)
                 .filter(|l| l != id)
         },
-        status: "live".to_string(),
-        node: node.to_string(),
+        status: status.to_string(),
+        user: user.to_string(),
     }
 }
 
-/// The recipients the caller may see on this node, or on the peer `node` names.
-pub async fn list(state: &AppState, query: &ListQuery) -> Result<Vec<Recipient>, AppError> {
+fn recipient(e: FedListEntry, node: &str) -> Recipient {
+    Recipient {
+        address: format!("{}@{node}", e.id),
+        kind: e.kind,
+        label: e.label,
+        status: e.status,
+        node: node.to_string(),
+        user: e.user,
+    }
+}
+
+/// The recipients the caller may see (A4): this node's and every peer's, each peer asked
+/// concurrently and bounded by the list timeout (A-1, D14). `node` asks only that node.
+pub async fn list(state: &AppState, query: &ListQuery) -> Result<ListResult, AppError> {
     if let Some(kind) = query.kind.as_deref() {
         if kind != "service" && kind != "instance" {
             return Err(AppError::BadRequest(format!(
@@ -305,54 +314,100 @@ pub async fn list(state: &AppState, query: &ListQuery) -> Result<Vec<Recipient>,
             )));
         }
     }
-    let mut out = match query.node.as_deref() {
-        Some(node) if node != state.node_name => {
-            let fed_state = state
-                .fed_state
-                .as_ref()
-                .filter(|fs| fs.peers.contains_name(node))
-                .ok_or_else(|| AppError::UnknownPeer(node.to_string()))?;
-            let key = fed_state.peers.key_for(node).unwrap_or(node).to_string();
-            crate::fed::list_federated_sessions(fed_state, &key)
-                .await?
-                .into_iter()
-                .map(|e| recipient(&e.session_id, e.harness == "svc", e.name, &key))
-                .collect()
-        }
-        _ => local_recipients(state).await?,
+    let node = state.node_name.as_str();
+    let fed_state = state.fed_state.as_ref();
+    let (local, peers): (bool, Vec<String>) = match (query.node.as_deref(), fed_state) {
+        (Some(n), _) if n == node => (true, Vec::new()),
+        (Some(n), Some(fs)) if fs.current_peers().contains_name(n) => (
+            false,
+            vec![fs.current_peers().key_for(n).unwrap_or(n).to_string()],
+        ),
+        (Some(n), _) => return Err(AppError::UnknownPeer(n.to_string())),
+        (None, Some(fs)) => (true, fs.current_peers().keys().cloned().collect()),
+        (None, None) => (true, Vec::new()),
     };
-    out.retain(|r| {
+
+    let mut recipients = Vec::new();
+    let mut nodes = Vec::new();
+    if local {
+        let user = match fed_state {
+            Some(fs) => crate::fed::own_user(fs),
+            None => crate::node::own_user(None),
+        };
+        for e in listing(&state.local(), state.reply_ttl, &user).await? {
+            recipients.push(recipient(e, node));
+        }
+        nodes.push(crate::fed::NodeStatus::ok(node));
+    }
+    if let Some(fs) = fed_state {
+        let mut asked = tokio::task::JoinSet::new();
+        for key in peers {
+            let fs = fs.clone();
+            asked.spawn(async move {
+                let (entries, status) = crate::fed::list_peer(&fs, &key).await;
+                (key, entries, status)
+            });
+        }
+        let mut answers = Vec::new();
+        while let Some(res) = asked.join_next().await {
+            answers.push(res.map_err(|e| AppError::Internal(e.to_string()))?);
+        }
+        answers.sort_by(|a, b| a.0.cmp(&b.0));
+        for (key, entries, status) in answers {
+            recipients.extend(entries.into_iter().map(|e| recipient(e, &key)));
+            nodes.push(status);
+        }
+    }
+
+    recipients.retain(|r| {
         query.kind.as_deref().is_none_or(|k| r.kind == k)
             && query.name.as_deref().is_none_or(|n| {
                 let local = r.address.rsplit_once('@').map_or("", |(l, _)| l);
                 r.label.as_deref() == Some(n) || (r.kind == "service" && local == n)
             })
     });
-    Ok(out)
+    Ok(ListResult { recipients, nodes })
 }
 
-async fn local_recipients(state: &AppState) -> Result<Vec<Recipient>, AppError> {
-    let node = state.node_name.as_str();
+/// This node's recipients for `user`'s listing (A4, A-12, A16): live Claude, agy and pi
+/// instances, registered services, and the instances parked here (A14): observed, not
+/// running now, and within their parked lifetime. A pi is never parked (AM-9).
+pub(crate) async fn listing(
+    local: &Local<'_>,
+    reply_ttl: Duration,
+    user: &str,
+) -> Result<Vec<FedListEntry>, AppError> {
     let query = crate::registry::SessionsQuery::default();
     let pairs = crate::claim::sync_claims(
-        &state.db,
-        &state.agy_config.proc_root,
-        &state.sessions_dirs,
-        node,
+        local.db,
+        &local.agy_config.proc_root,
+        local.sessions_dirs,
+        local.node_name,
     )
     .await?;
-    let mut out: Vec<Recipient> = pairs
+    let mut out: Vec<FedListEntry> = pairs
         .into_iter()
-        .map(|(claim, entry)| recipient(&claim.address(), false, entry.name, node))
+        .map(|(claim, e)| entry(&claim.address(), false, e.name, "live", user))
         .collect();
-    for s in crate::agy::list_agy_sessions(&state.agy_config, &state.agy_store, &query) {
-        out.push(recipient(&s.session_id, false, None, node));
+    for s in crate::agy::list_agy_sessions(local.agy_config, local.agy_store, &query) {
+        out.push(entry(&s.session_id, false, None, "live", user));
     }
-    for s in crate::pi::list_pi_sessions(&state.agy_config.proc_root, &state.pi_store, &query) {
-        out.push(recipient(&s.session_id, false, s.name, node));
+    let proc_root = &local.agy_config.proc_root;
+    for s in crate::pi::list_pi_sessions(proc_root, local.pi_store, &query) {
+        out.push(entry(&s.session_id, false, s.name, "live", user));
     }
-    for s in crate::svc::list_svc_sessions(&state.agy_config.proc_root, &state.svc_store, &query) {
-        out.push(recipient(&s.session_id, true, None, node));
+    for s in crate::svc::list_svc_sessions(proc_root, local.svc_store, &query) {
+        out.push(entry(&s.session_id, true, None, "live", user));
+    }
+    let parked = {
+        let db = local.db.lock().map_err(db_err)?;
+        storage::parked_instances(&db, storage::now_epoch_secs(), reply_ttl.as_secs() as i64)
+            .map_err(db_err)?
+    };
+    for id in parked {
+        if !out.iter().any(|e| e.id == id) {
+            out.push(entry(&id, false, None, "parked", user));
+        }
     }
     Ok(out)
 }
@@ -738,9 +793,10 @@ pub async fn send(
             // A typed nickname or canonical name, as this node's entry key.
             let peer_key = fed_state.peers.key_for(node).unwrap_or(node).to_string();
             let envelope = crate::fed::FedEnvelope {
-                v: 1,
+                v: crate::fed::WIRE_VERSION,
                 id: message_id.clone(),
-                principal: sender.fed_principal(),
+                // Its node is attested by the receiver (N-2).
+                origin: sender.origin(&state.node_name),
                 to: crate::fed::FedTarget {
                     r#ref: target_ref.to_string(),
                 },
@@ -874,16 +930,9 @@ async fn push_federated_reply(
     let Some(fed_state) = &state.fed_state else {
         return "push_failed";
     };
-    let replier = crate::fed::FedReplier {
-        harness: caller.harness.clone(),
-        session_id: caller.session_id.clone(),
-        name: caller
-            .name
-            .clone()
-            .unwrap_or_else(|| caller.session_id.clone()),
-    };
+    let replier = Sender::Session(caller.clone()).origin(&state.node_name);
     let envelope = crate::fed::FedReplyEnvelope {
-        v: 1,
+        v: crate::fed::WIRE_VERSION,
         id: reply_id.to_string(),
         in_reply_to: in_reply_to.to_string(),
         replier,

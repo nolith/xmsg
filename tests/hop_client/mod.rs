@@ -1,8 +1,9 @@
-//! An in-process federation client that sends a hop envelope straight to a hub.
+//! An in-process federation client that sends an envelope straight to a node.
 //!
-//! Until XA5's routing, nothing in xmsg originates a hop (`to.ref = <ref>@<dest>`); the
-//! hub's handling of one is driven here by presenting the origin node's credentials over
-//! mTLS and posting the envelope the hub accepts on `/fed/v1/messages`.
+//! Until H6's routing, nothing in xmsg originates a hop (`to.ref = <ref>@<dest>`, A3, B4);
+//! the hub's handling of one is driven here by presenting the origin node's credentials
+//! over mTLS and posting the envelope the hub accepts on `/fed/v2/messages`.
+#![allow(dead_code)] // each test crate that includes this module uses part of it
 
 use std::time::Duration;
 
@@ -25,27 +26,42 @@ pub async fn hop_send(
     to_ref: &str,
     body: &str,
 ) -> (u16, Value) {
-    let envelope = json!({
-        "v": 1,
+    send_envelope(
+        origin,
+        hub_pin,
+        hub_port,
+        envelope("alice", "Alice", to_ref, body),
+    )
+    .await
+}
+
+/// A v2 envelope from the instance `id` labelled `label`. Its origin claims a node the
+/// receiver must not read (N-2): the receiver attests the node.
+pub fn envelope(id: &str, label: &str, to_ref: &str, body: &str) -> Value {
+    json!({
+        "v": 2,
         "id": ulid::Ulid::new().to_string(),
-        "principal": {
-            "kind": "session",
-            "harness": "claude",
-            "session_id": "alice",
-            "name": "Alice"
-        },
+        "origin": { "id": id, "node": "unattested.claim", "label": label },
         "to": { "ref": to_ref },
         "body": body,
         "thread_id": ulid::Ulid::new().to_string(),
         "created_at": 1000
-    });
+    })
+}
 
+/// Posts `envelope` to `/fed/v2/messages` on the node at `127.0.0.1:<port>`.
+pub async fn send_envelope(
+    origin: &Origin<'_>,
+    pin: &str,
+    port: u16,
+    envelope: Value,
+) -> (u16, Value) {
     request(
         origin,
-        hub_pin,
-        hub_port,
+        pin,
+        port,
         "POST",
-        "/fed/v1/messages",
+        "/fed/v2/messages",
         Some(envelope),
     )
     .await
@@ -89,6 +105,9 @@ pub async fn request(
         let status = resp.status().as_u16();
         use http_body_util::BodyExt;
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        if bytes.is_empty() {
+            return (status, Value::Null);
+        }
         let v: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
             panic!(
                 "hub answered {status} with non-JSON: {}",

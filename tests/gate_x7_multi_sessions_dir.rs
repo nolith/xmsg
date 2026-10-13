@@ -206,7 +206,10 @@ async fn test_oracle_1_multi_dir_listed_and_deliverable() {
         .await
         .expect("send get /v1/recipients");
     assert_eq!(list_res.status(), 200);
-    let sessions_array: Vec<serde_json::Value> = list_res.json().await.unwrap();
+    let sessions_array: Vec<serde_json::Value> = serde_json::from_value(
+        list_res.json::<serde_json::Value>().await.unwrap()["recipients"].take(),
+    )
+    .unwrap();
     assert_eq!(
         sessions_array.len(),
         2,
@@ -379,7 +382,10 @@ async fn test_oracle_3_duplicate_session_across_dirs_assigned_suffixes_and_route
         .send()
         .await
         .unwrap();
-    let returned_sessions: Vec<serde_json::Value> = list_res.json().await.unwrap();
+    let returned_sessions: Vec<serde_json::Value> = serde_json::from_value(
+        list_res.json::<serde_json::Value>().await.unwrap()["recipients"].take(),
+    )
+    .unwrap();
     let returned_ids: Vec<&str> = returned_sessions
         .iter()
         .filter_map(|s| s["address"].as_str()?.strip_suffix("@test-host"))

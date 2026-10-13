@@ -719,6 +719,8 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             leaf_principal: args.leaf_principal.clone(),
             outbound_replies_pushed: Arc::new(AtomicU64::new(0)),
             dynamic_tls: Default::default(),
+            reply_ttl,
+            list_queries: Default::default(),
         });
 
         if let (Some(cert_path), Some(key_path)) = (&args.fed_cert, &args.fed_key) {

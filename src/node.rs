@@ -77,6 +77,44 @@ pub fn node_name_from_cert(cert_der: &[u8]) -> Result<String, String> {
     }
 }
 
+/// A16's user of a SPIFFE identity: `<user>` of `.../host/<host>/user/<user>`, and for a
+/// pod, which has no user part, its node name `<sa>.<ns>` (D-8).
+pub fn user_from_uri(uri: &str) -> Result<String, String> {
+    let name = node_name_from_uri(uri)?;
+    // The path is `host/<host>/user/<user>` or `ns/<ns>/sa/<sa>`, as the name's derivation
+    // just checked; only a host identity has a user part.
+    let host_form = uri
+        .strip_prefix("spiffe://")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, p)| p.starts_with("host/"));
+    Ok(match host_form {
+        true => name.split('.').next().unwrap_or_default().to_string(),
+        false => name,
+    })
+}
+
+/// A16's user of the node holding this leaf certificate: its URI SAN's user, or with no URI
+/// SAN its key-derived name (a pinned node is a user of its own).
+pub fn user_from_cert(cert_der: &[u8]) -> Result<String, String> {
+    let uris = crate::fed::extract_uri_sans(cert_der)?;
+    match uris.as_slice() {
+        [] => node_name_from_pin(&crate::fed::spki_sha256_from_der(cert_der)?),
+        [uri] => user_from_uri(uri),
+        _ => Err(format!(
+            "certificate carries {} URI SANs; a node identity has exactly one",
+            uris.len()
+        )),
+    }
+}
+
+/// This node's user (A16): its certificate's, or with no federation identity D4's `<user>`.
+pub fn own_user(cert_der: Option<&[u8]>) -> String {
+    match cert_der.map(user_from_cert) {
+        Some(Ok(user)) => user,
+        _ => os_user_name(),
+    }
+}
+
 /// D4: a node with no federation identity is `<user>.<host>`, from its uid's user name and
 /// the OS host name cut at its first `.` (as `hostname -s` does).
 pub fn local_node_name() -> String {
@@ -126,6 +164,19 @@ mod tests {
         );
         assert!(node_name_from_pin("sha256:abcd").is_err());
         assert!(is_key_name_shaped("mzxw6ytboiaaaaaa"));
+        // A16, D-8: a host identity's user is its user part, a pod's is its node name.
+        assert_eq!(
+            user_from_uri("spiffe://json64.dev/host/bitstream/user/sini").unwrap(),
+            "sini"
+        );
+        assert_eq!(
+            user_from_uri("spiffe://json64.dev/ns/genie/sa/genie-guard").unwrap(),
+            "genie-guard.genie"
+        );
+        assert_eq!(
+            user_from_uri("spiffe://json64.dev/ns/host/sa/user").unwrap(),
+            "user.host"
+        );
         assert!(!is_key_name_shaped("laptop"));
         // D4: `<user>.<host>`, the host cut at its first `.`; the user name may contain `.`.
         let local = local_node_name();

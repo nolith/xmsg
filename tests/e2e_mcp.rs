@@ -493,7 +493,10 @@ async fn test_mcp_list_sessions() {
     let result = &list_resp["result"];
     assert_eq!(result["isError"], false);
     let sessions_str = result["content"][0]["text"].as_str().unwrap();
-    let sessions: Vec<serde_json::Value> = serde_json::from_str(sessions_str).unwrap();
+    let sessions: Vec<serde_json::Value> = serde_json::from_value(
+        serde_json::from_str::<serde_json::Value>(sessions_str).unwrap()["recipients"].take(),
+    )
+    .unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["address"], "sess-target-5000@test-host");
     assert_eq!(sessions[0]["label"], "target-agent");

@@ -570,7 +570,7 @@ async fn test_oracle_2_ca_entry_keyed_by_other_name_refused() {
 // Mutant M3: put the nickname on the wire (the hub's forward mark) => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA5: re-armed when H6 routing originates hop envelopes (owner design A3/B4)"]
+#[ignore = "H6: re-armed when H6 routing originates hop envelopes (owner design A3/B4; plan §7)"]
 async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
     run_with_port_retry(|| async {
         let l_creds = pinned_creds("laptop-host");

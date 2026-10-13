@@ -147,15 +147,6 @@ impl ResolvedTarget {
             | ResolvedTarget::Parked { session: s, .. } => s,
         }
     }
-
-    pub(crate) fn from_session(session: registry::Session) -> Self {
-        match session.harness.as_str() {
-            "svc" => ResolvedTarget::Svc(session),
-            "agy" => ResolvedTarget::Agy(session),
-            "pi" => ResolvedTarget::Pi(session),
-            _ => ResolvedTarget::Claude(session, PathBuf::new()),
-        }
-    }
 }
 
 /// Local resolution of a send's target (A11, A7, D-4), one order for every surface. Kind
