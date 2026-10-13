@@ -252,19 +252,29 @@ async fn start_server(config: AgyConfig, store: AgyStore) -> (TempDir, PathBuf) 
     let sock = sock_dir.path().join("register.sock");
     let s_path = sock.clone();
     tokio::spawn(async move {
+        let state = Arc::new(xmsg::http::AppState {
+            sessions_dirs: vec![],
+            agy_config: config,
+            agy_store: store,
+            pi_store: xmsg::pi::new_pi_store(),
+            pi_notify_tx: broadcast::channel(16).0,
+            svc_store: xmsg::svc::new_svc_store(),
+            svc_notify_tx: broadcast::channel(16).0,
+            node_name: xmsg::node::local_node_name(),
+            max_body: 65536,
+            request_counter: std::sync::atomic::AtomicU64::new(1),
+            db: new_db(),
+            notify_tx: broadcast::channel(16).0,
+            reply_ttl: Duration::from_secs(604800),
+            idempotency_ttl: Duration::from_secs(86400),
+            long_poll_semaphore: Arc::new(tokio::sync::Semaphore::new(128)),
+            fed_state: None,
+        });
         let _ = run_register_server(
             s_path,
-            config,
-            store,
-            xmsg::pi::new_pi_store(),
-            new_db(),
-            broadcast::channel(16).0,
-            Duration::from_secs(604800),
+            state,
             xmsg::agent::current_uid(),
-            xmsg::svc::new_svc_store(),
             std::collections::HashMap::new(),
-            broadcast::channel(16).0,
-            None,
         )
         .await;
     });
