@@ -13,8 +13,8 @@
         "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-    in
-    {
+      # Bound here rather than read through `self`, so the modules' default package resolves
+      # when ci/flake.nix applies these outputs with its own `self`.
       packages = forAllSystems (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "xmsg";
@@ -70,6 +70,19 @@
           };
         };
       });
+    in
+    {
+      inherit packages;
+
+      homeManagerModules = rec {
+        xmsg = import ./nix/modules/home-manager.nix { inherit packages; };
+        default = xmsg;
+      };
+
+      nixosModules = rec {
+        xmsg = ./nix/modules/nixos.nix;
+        default = xmsg;
+      };
 
       checks = forAllSystems (
         pkgs:

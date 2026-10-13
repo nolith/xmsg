@@ -6,6 +6,12 @@
     # snapshot of the tree (den-hoag-lbtnv D1). So `outputs` below applies `../flake.nix`'s own
     # `outputs` to the `nixpkgs` declared here, line for line as `../flake.nix` declares it.
     nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
+    # The flake modules are evaluated against home-manager at nix-config's pin (its
+    # `home-manager-unstable` node), so a module change that nix-config cannot take reds here.
+    home-manager = {
+      url = "github:nix-community/home-manager/fae6e9e42c3b762ab47635cddcfaf6f52374a61b";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =

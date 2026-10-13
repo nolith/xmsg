@@ -716,3 +716,93 @@ In a star or multi-node mesh topology, nodes that cannot directly dial one anoth
   - The hub authorizes the reply against the outbound record created during forwarding, looks up the origin peer, and relays the reply back to the origin peer using `send_federated_reply` (if dialable) or stores it in SQLite for long-polling if the origin is a leaf or outbound-linked node.
 - **Default State (Off by Default):**
   Without `"forward"` configured on the sender's peer entry, a node behaves identically to older releases: cross-host target references containing `@` are rejected with `no_forward`.
+
+---
+
+## 8. Installing with Nix: the home-manager and NixOS modules
+
+The flake ships `homeManagerModules.xmsg` (also `homeManagerModules.default`) for everything per user, and
+`nixosModules.xmsg` (also `nixosModules.default`) for the one root-only part, the federation port. Both are
+evaluated in this repository's CI (`ci/tests/module.nix`, `ci/tests/peers-check.nix`) against home-manager at
+nix-config's pin, for `x86_64-linux` and `aarch64-darwin` (nixpkgs 26.11 dropped `x86_64-darwin`).
+
+### 8.1 Minimal home-manager import
+
+```nix
+{
+  inputs.xmsg.url = "github:sini/xmsg";
+
+  # in a home-manager configuration:
+  imports = [ inputs.xmsg.homeManagerModules.xmsg ];
+  programs.xmsg.enable = true;
+}
+```
+
+This installs `xmsg` and runs `xmsg serve` as a user service: `systemd.user.services.xmsg` on Linux,
+`launchd.agents.xmsg` on darwin. `programs.xmsg.server.enable = false` keeps the harness pieces without running a
+server on that host. `programs.xmsg.package` defaults to this flake's `packages.default`.
+
+| option                            | flag                             | default                                                                  |
+| --------------------------------- | -------------------------------- | ------------------------------------------------------------------------ |
+| `programs.xmsg.server.httpSocket` | `--http-sock`                    | xmsg's own, `$XDG_RUNTIME_DIR/xmsg/http.sock`                            |
+| `programs.xmsg.server.agyExe`     | `--agy-exe` (repeated)           | `programs.antigravity-cli.package`'s `bin/agy` when the agy switch is on |
+| `programs.xmsg.server.svcExe`     | `--svc-exe NAME=PATH` (repeated) | `{ }`                                                                    |
+
+### 8.2 Per-harness switches
+
+Each switch installs that harness's pieces, through the harness's own home-manager module where it has the
+option, so it composes with the rest of your configuration:
+
+- `programs.xmsg.harnesses.claude.enable`: the `xmsg mcp` server in `programs.claude-code.mcpServers`, the `xmsg`
+  skill in `programs.claude-code.skills`, and `mcp__xmsg__list`, `mcp__xmsg__send` and `mcp__xmsg__reply` in
+  `programs.claude-code.settings.permissions.allow`. Needs `programs.claude-code.enable`.
+- `programs.xmsg.harnesses.agy.enable`: the server in `programs.antigravity-cli.mcpServers`, the skill in
+  `programs.antigravity-cli.skills`, and the PreInvocation hook `xmsg register agy --hook` (Section 3.3).
+  Needs `programs.antigravity-cli.enable`. **Cost:** `programs.antigravity-cli` has no hook option, so the module
+  writes the whole `~/.gemini/config/hooks.json`; it conflicts with any other agy hook you declare.
+- `programs.xmsg.harnesses.pi.enable`: the extension (`extensions/pi/index.ts`) as
+  `~/.pi/agent/extensions/xmsg-pi.ts`, which pi auto-discovers, and the skill as `~/.pi/agent/skills/xmsg/SKILL.md`.
+  If your `~/.pi/agent/settings.json` lists `extensions` explicitly, add `~/.pi/agent/extensions/xmsg-pi.ts` there.
+
+A Claude or agy switch whose harness module is off fails evaluation, naming the option it needs, rather than
+installing nothing.
+
+### 8.3 Federation and peers
+
+```nix
+programs.xmsg.server.federation = {
+  enable = true;
+  port = 7788;                        # --fed-listen 0.0.0.0:7788 (listenAddress)
+  cert = ./xmsg-node.crt;             # --fed-cert (a path is copied to the store)
+  key = "/run/secrets/xmsg-node.key"; # --fed-key: a runtime path, never the store
+  reloadInterval = 30;                # --fed-reload-interval-secs (null: xmsg's default)
+  peers = {
+    # pinned (Section 7.2): `pin = "sha256:…"`, or `pinFromCert` to compute it at build time
+    cortex = {
+      address = "cortex.example.org:7788";
+      pinFromCert = ./cortex.crt;
+      allow = [ "send" "reply" "list" ];
+    };
+    # CA-signed: the trust anchor and the peer's one URI SAN
+    bitstream = {
+      address = "bitstream.example.org:7788";
+      ca = ./xmsg-root.crt;
+      identities = [ "spiffe://example.org/host/bitstream/user/alice" ];
+      allow = [ "send" "reply" "list" ];
+    };
+  };
+};
+```
+
+`peers` renders the `--peers-file` from the schema of Section 7.3 (`address`, `pin`, `ca`, `identities`, `allow`,
+`from`, `leaf`, `principals`, `targets`, `dial`); unset fields are omitted. Each entry sets exactly one of `pin`,
+`pinFromCert` and `ca`.
+
+On NixOS, open the port with the system module:
+
+```nix
+imports = [ inputs.xmsg.nixosModules.xmsg ];
+programs.xmsg.federation = { enable = true; port = 7788; };
+```
+
+It adds the port to `networking.firewall.allowedTCPPorts` when federation is enabled, and does nothing else.

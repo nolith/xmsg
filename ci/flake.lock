@@ -278,6 +278,27 @@
         "type": "github"
       }
     },
+    "home-manager": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791306979,
+        "narHash": "sha256-KuLePuhwJM9NLt/gTLHzXaOoSZKGoB3m7NfXjiQ98HY=",
+        "owner": "nix-community",
+        "repo": "home-manager",
+        "rev": "fae6e9e42c3b762ab47635cddcfaf6f52374a61b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "home-manager",
+        "rev": "fae6e9e42c3b762ab47635cddcfaf6f52374a61b",
+        "type": "github"
+      }
+    },
     "import-tree": {
       "locked": {
         "lastModified": 1783029876,
@@ -669,6 +690,7 @@
     "root": {
       "inputs": {
         "gen-harness": "gen-harness",
+        "home-manager": "home-manager",
         "nixpkgs": "nixpkgs_6"
       }
     },
