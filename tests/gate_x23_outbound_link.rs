@@ -411,15 +411,25 @@ async fn test_oracle_1_inbound_over_outbound_link() {
     )
     .await;
 
-    // Register sess-alice on hub and sess-bob on client
-    let (_sock_alice, rx_alice) =
-        create_claude_session_fixture(&hub.sessions_dir, "sess-alice", "alice");
-    let (_sock_bob, rx_bob) =
-        create_claude_session_fixture(&client.sessions_dir, "sess-bob", "bob");
+    // Register c30386d2-5a5b-5831-9948-06e077643f3a on hub and b8110187-e017-573c-a03b-abdc22a07b86 on client
+    let (_sock_alice, rx_alice) = create_claude_session_fixture(
+        &hub.sessions_dir,
+        "c30386d2-5a5b-5831-9948-06e077643f3a",
+        "alice",
+    );
+    let (_sock_bob, rx_bob) = create_claude_session_fixture(
+        &client.sessions_dir,
+        "b8110187-e017-573c-a03b-abdc22a07b86",
+        "bob",
+    );
 
-    // 1. Alice on hub sends to sess-bob@client
-    let send_resp =
-        send_via_agent_sock(&hub.agent_sock, "sess-bob@client", "hello bob from hub").await;
+    // 1. Alice on hub sends to b8110187-e017-573c-a03b-abdc22a07b86@client
+    let send_resp = send_via_agent_sock(
+        &hub.agent_sock,
+        "b8110187-e017-573c-a03b-abdc22a07b86@client",
+        "hello bob from hub",
+    )
+    .await;
     assert_eq!(send_resp["status"], "ok");
     assert_eq!(send_resp["outcome"], "queued");
     let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
@@ -487,14 +497,24 @@ async fn test_oracle_2_outbound_send_from_undialable_node() {
     )
     .await;
 
-    let (_sock_alice, rx_alice) =
-        create_claude_session_fixture(&hub.sessions_dir, "sess-alice", "alice");
-    let (_sock_bob, rx_bob) =
-        create_claude_session_fixture(&client.sessions_dir, "sess-bob", "bob");
+    let (_sock_alice, rx_alice) = create_claude_session_fixture(
+        &hub.sessions_dir,
+        "c30386d2-5a5b-5831-9948-06e077643f3a",
+        "alice",
+    );
+    let (_sock_bob, rx_bob) = create_claude_session_fixture(
+        &client.sessions_dir,
+        "b8110187-e017-573c-a03b-abdc22a07b86",
+        "bob",
+    );
 
-    // 1. Bob on undialable node sends to sess-alice@hub
-    let send_resp =
-        send_via_agent_sock(&client.agent_sock, "sess-alice@hub", "hello alice from bob").await;
+    // 1. Bob on undialable node sends to c30386d2-5a5b-5831-9948-06e077643f3a@hub
+    let send_resp = send_via_agent_sock(
+        &client.agent_sock,
+        "c30386d2-5a5b-5831-9948-06e077643f3a@hub",
+        "hello alice from bob",
+    )
+    .await;
     assert_eq!(send_resp["status"], "ok");
     assert_eq!(send_resp["outcome"], "delivered");
     let msg_id = send_resp["message_id"].as_str().unwrap().to_string();

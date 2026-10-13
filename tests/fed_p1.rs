@@ -2130,7 +2130,7 @@ exit 0
     let my_proc_start =
         xmsg::process::starttime(&proc_root, my_pid).unwrap_or_else(|_| "0".to_string());
     let session_key = format!("agy:{my_pid}:{my_proc_start}");
-    let conv_id = "conv-credless-1".to_string();
+    let conv_id = "c5981914-8cc0-5692-912c-c74f1bdcdf85".to_string();
 
     let credless_session =
         AgySessionInfo::new(conv_id.clone(), my_pid, my_proc_start.clone(), None);
@@ -2162,7 +2162,7 @@ exit 0
     )
     .await;
 
-    // 1. Send federated message from node_a targeting conv-credless-1@host-b via agent socket
+    // 1. Send federated message from node_a targeting c5981914-8cc0-5692-912c-c74f1bdcdf85@host-b via agent socket
     let stream = UnixStream::connect(&node_a.agent_sock_path).await.unwrap();
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);

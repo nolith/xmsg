@@ -316,14 +316,14 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         &env.sessions_dir,
         &env.proc_root,
         env._tmp.path(),
-        "sess-claude-a",
+        "af14358a-9385-5e4f-bc3f-e7ddb31f987b",
         "alice",
     );
     let mut session_b = spawn_live_session(
         &env.sessions_dir,
         &env.proc_root,
         env._tmp.path(),
-        "sess-claude-b",
+        "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
         "bob",
     );
 
@@ -339,7 +339,7 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "send",
-            "to": "sess-claude-b",
+            "to": "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
             "text": "Hello Bob from Alice",
         }),
     )
@@ -355,7 +355,9 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         .unwrap();
     let b_msg: serde_json::Value = serde_json::from_str(&line_b).unwrap();
     let content_b = b_msg["message"]["content"].as_str().unwrap();
-    assert!(content_b.contains("from-name=\"alice · sess-claude-a@test-host\""));
+    assert!(
+        content_b.contains("from-name=\"alice · af14358a-9385-5e4f-bc3f-e7ddb31f987b@test-host\"")
+    );
     assert!(content_b.contains("Hello Bob from Alice"));
 
     // Verify DB stored derived return address
@@ -363,7 +365,10 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         let db = env.db.lock().unwrap();
         let rec = storage::get_message(&db, &orig_msg_id).unwrap().unwrap();
         assert_eq!(rec.return_harness.as_deref(), Some("claude"));
-        assert_eq!(rec.return_session_id.as_deref(), Some("sess-claude-a"));
+        assert_eq!(
+            rec.return_session_id.as_deref(),
+            Some("af14358a-9385-5e4f-bc3f-e7ddb31f987b")
+        );
     }
 
     // 2. Act as Session B to reply to Session A
@@ -400,7 +405,9 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         .unwrap();
     let a_msg: serde_json::Value = serde_json::from_str(&line_a).unwrap();
     let content_a = a_msg["message"]["content"].as_str().unwrap();
-    assert!(content_a.contains("from-name=\"bob · sess-claude-b@test-host\""));
+    assert!(
+        content_a.contains("from-name=\"bob · 2fe5d26e-eb6c-50c0-8c91-3919fb271081@test-host\"")
+    );
     let expected_header = format!(
         "[xmsg] reply to message_id={orig_msg_id} — message_id={pushed_msg_id}; reply with the xmsg reply tool\n\nHi Alice, loud and clear!"
     );
@@ -410,12 +417,15 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
     {
         let db = env.db.lock().unwrap();
         let pushed_rec = storage::get_message(&db, &pushed_msg_id).unwrap().unwrap();
-        assert_eq!(pushed_rec.session_id, "sess-claude-a");
+        assert_eq!(
+            pushed_rec.session_id,
+            "af14358a-9385-5e4f-bc3f-e7ddb31f987b"
+        );
         assert_eq!(pushed_rec.recipient_harness, "claude");
         assert_eq!(pushed_rec.return_harness.as_deref(), Some("claude"));
         assert_eq!(
             pushed_rec.return_session_id.as_deref(),
-            Some("sess-claude-b")
+            Some("2fe5d26e-eb6c-50c0-8c91-3919fb271081")
         );
         assert_eq!(pushed_rec.thread_id, orig_msg_id);
     }
@@ -452,7 +462,9 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         .unwrap();
     let b_msg2: serde_json::Value = serde_json::from_str(&line_b2).unwrap();
     let content_b2 = b_msg2["message"]["content"].as_str().unwrap();
-    assert!(content_b2.contains("from-name=\"alice · sess-claude-a@test-host\""));
+    assert!(
+        content_b2.contains("from-name=\"alice · af14358a-9385-5e4f-bc3f-e7ddb31f987b@test-host\"")
+    );
     let expected_b_header = format!(
         "[xmsg] reply to message_id={pushed_msg_id} — message_id={second_pushed_id}; reply with the xmsg reply tool\n\nGreat, conversation complete."
     );
@@ -467,7 +479,7 @@ async fn test_u8_anonymous_http_no_push() {
         &env.sessions_dir,
         &env.proc_root,
         env._tmp.path(),
-        "sess-claude-b",
+        "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
         "bob",
     );
 
@@ -477,7 +489,7 @@ async fn test_u8_anonymous_http_no_push() {
     let post_resp = client
         .post(&post_url)
         .json(&serde_json::json!({
-            "to": "sess-claude-b",
+            "to": "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
             "from": "anon-client",
             "text": "Hello from anonymous HTTP client"
         }))
@@ -544,21 +556,21 @@ async fn test_u8_strict_rejection_of_return_address_overrides() {
         &env.sessions_dir,
         &env.proc_root,
         env._tmp.path(),
-        "sess-claude-a",
+        "af14358a-9385-5e4f-bc3f-e7ddb31f987b",
         "alice",
     );
     let session_b = spawn_live_session(
         &env.sessions_dir,
         &env.proc_root,
         env._tmp.path(),
-        "sess-claude-b",
+        "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
         "bob",
     );
     let mut session_evil = spawn_live_session(
         &env.sessions_dir,
         &env.proc_root,
         env._tmp.path(),
-        "evil-session",
+        "526336da-99e5-5e8b-802d-bd70e661c363",
         "evil",
     );
 
@@ -575,12 +587,12 @@ async fn test_u8_strict_rejection_of_return_address_overrides() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "send",
-            "to": "sess-claude-b",
+            "to": "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
             "text": "Attempt spoofing return address",
-            "return_to": "evil-session",
+            "return_to": "526336da-99e5-5e8b-802d-bd70e661c363",
             "return_harness": "claude",
-            "return_session_id": "evil-session",
-            "returnAddress": "evil-session"
+            "return_session_id": "526336da-99e5-5e8b-802d-bd70e661c363",
+            "returnAddress": "526336da-99e5-5e8b-802d-bd70e661c363"
         }),
     )
     .await;
@@ -599,7 +611,7 @@ async fn test_u8_strict_rejection_of_return_address_overrides() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "send",
-            "to": "sess-claude-b",
+            "to": "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
             "text": "Attempt spoofing return address",
         }),
     )
@@ -613,8 +625,14 @@ async fn test_u8_strict_rejection_of_return_address_overrides() {
         let db = env.db.lock().unwrap();
         let rec = storage::get_message(&db, &msg_id).unwrap().unwrap();
         assert_eq!(rec.return_harness.as_deref(), Some("claude"));
-        assert_eq!(rec.return_session_id.as_deref(), Some("sess-claude-a"));
-        assert_ne!(rec.return_session_id.as_deref(), Some("evil-session"));
+        assert_eq!(
+            rec.return_session_id.as_deref(),
+            Some("af14358a-9385-5e4f-bc3f-e7ddb31f987b")
+        );
+        assert_ne!(
+            rec.return_session_id.as_deref(),
+            Some("526336da-99e5-5e8b-802d-bd70e661c363")
+        );
     }
 
     // Switch to Session B and reply
@@ -661,14 +679,14 @@ async fn test_u8_no_opt_out_session_sender_pushed_and_stored() {
         &env.sessions_dir,
         &env.proc_root,
         env._tmp.path(),
-        "sess-claude-a",
+        "af14358a-9385-5e4f-bc3f-e7ddb31f987b",
         "alice",
     );
     let session_b = spawn_live_session(
         &env.sessions_dir,
         &env.proc_root,
         env._tmp.path(),
-        "sess-claude-b",
+        "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
         "bob",
     );
 
@@ -684,7 +702,7 @@ async fn test_u8_no_opt_out_session_sender_pushed_and_stored() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "send",
-            "to": "sess-claude-b",
+            "to": "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
             "text": "Poll-only request, do not push replies"
         }),
     )
@@ -696,7 +714,10 @@ async fn test_u8_no_opt_out_session_sender_pushed_and_stored() {
     {
         let db = env.db.lock().unwrap();
         let rec = storage::get_message(&db, &msg_id).unwrap().unwrap();
-        assert_eq!(rec.return_session_id.as_deref(), Some("sess-claude-a"));
+        assert_eq!(
+            rec.return_session_id.as_deref(),
+            Some("af14358a-9385-5e4f-bc3f-e7ddb31f987b")
+        );
     }
 
     // Switch to Session B and reply
@@ -743,14 +764,14 @@ async fn test_u8_sender_gone_handling() {
         &env.sessions_dir,
         &env.proc_root,
         env._tmp.path(),
-        "sess-claude-a",
+        "af14358a-9385-5e4f-bc3f-e7ddb31f987b",
         "alice",
     );
     let session_b = spawn_live_session(
         &env.sessions_dir,
         &env.proc_root,
         env._tmp.path(),
-        "sess-claude-b",
+        "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
         "bob",
     );
 
@@ -766,7 +787,7 @@ async fn test_u8_sender_gone_handling() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "send",
-            "to": "sess-claude-b",
+            "to": "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
             "text": "I will disappear before you reply",
         }),
     )
@@ -850,7 +871,7 @@ async fn test_u8_cross_harness_push() {
         &env.sessions_dir,
         &env.proc_root,
         env._tmp.path(),
-        "sess-claude-b",
+        "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
         "bob",
     );
 
@@ -865,7 +886,7 @@ async fn test_u8_cross_harness_push() {
         &env.agent_sock,
         &serde_json::json!({
             "action": "send",
-            "to": "sess-claude-b",
+            "to": "2fe5d26e-eb6c-50c0-8c91-3919fb271081",
             "text": "Hello Claude from Pi",
         }),
     )
@@ -934,18 +955,18 @@ async fn test_u8_cross_harness_claude_to_agy() {
         &env.sessions_dir,
         &env.proc_root,
         env._tmp.path(),
-        "sess-claude-a",
+        "af14358a-9385-5e4f-bc3f-e7ddb31f987b",
         "alice",
     );
 
-    // 2. Setup Agy session: conv-agy-88
+    // 2. Setup Agy session: 0698b3e2-132d-5ed8-966f-4abc10e01d65
     let mut agy_child = std::process::Command::new("sleep")
         .arg("60")
         .spawn()
         .unwrap();
     let agy_pid = agy_child.id();
 
-    let conv_id = "conv-agy-88";
+    let conv_id = "0698b3e2-132d-5ed8-966f-4abc10e01d65";
     let lock_file = env.presence_dir.join(format!("{conv_id}.lock"));
     fs::write(&lock_file, "lock").unwrap();
     let meta = fs::metadata(&lock_file).unwrap();
@@ -1026,7 +1047,7 @@ async fn test_u8_cross_harness_claude_to_agy() {
         .await
         .unwrap()
         .unwrap();
-    assert!(line_a.contains("conv-agy-88@test-host"));
+    assert!(line_a.contains("0698b3e2-132d-5ed8-966f-4abc10e01d65@test-host"));
     assert!(line_a.contains("Hello Claude from Antigravity"));
 
     let _ = agy_child.kill();

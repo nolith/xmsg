@@ -163,7 +163,8 @@ impl ResolvedTarget {
 /// Local resolution of a send's target (A11, A7, D-4), one order for every surface. Kind
 /// prefixes and pids are not refs: a ref is an instance ID (optionally `~n`) or a name.
 ///
-/// 1. An instance ID: a Claude `X~n` or bare `X`, then an agy or pi ID.
+/// 1. An instance ID, which is UUID-shaped (A11): a Claude `X~n` or bare `X`, then an agy
+///    or pi ID. Any other ref is a name and skips this step.
 ///    A bare X with only `X~n` forks live is `ambiguous` (D-4).
 /// 2. A name, among services first (A11): a service carrying it wins, whatever any
 ///    instance is labelled.
@@ -195,6 +196,10 @@ pub(crate) async fn resolve_target(
     let now = storage::now_epoch_secs();
     let query = registry::SessionsQuery::default();
     let is = |id: &str| id == ref_str;
+    // A11: only a UUID-shaped reference (optionally `~n`) is an instance ID; any other is a
+    // name, even where an instance presents it as its ID.
+    let instance = crate::claim::is_instance_ref(ref_str);
+    let is_id = |id: &str| instance && is(id);
 
     // One claim scan answers the Claude half of every step.
     let (claude_by_id, claude_labelled, claude_absence, seen) =
@@ -210,12 +215,12 @@ pub(crate) async fn resolve_target(
     let seen = seen.map_err(|e| AppError::Internal(e.to_string()))?;
 
     // 1. Instance IDs.
-    if let Some(res) = claude_by_id {
+    if let Some(res) = claude_by_id.filter(|_| instance) {
         return res.map(|(session, sock)| ResolvedTarget::Claude(session, sock));
     }
     if let Some(session) = crate::agy::list_agy_sessions(agy_config, agy_store, &query)
         .into_iter()
-        .find(|s| is(&s.session_id))
+        .find(|s| is_id(&s.session_id))
     {
         return Ok(ResolvedTarget::Agy(session));
     }
@@ -224,7 +229,7 @@ pub(crate) async fn resolve_target(
         crate::plugin::sessions(&*db.lock().map_err(|e| AppError::Internal(e.to_string()))?)
             .map_err(|e| AppError::Internal(e.to_string()))?,
     );
-    if let Some(session) = pi_sessions.iter().find(|s| is(&s.session_id)) {
+    if let Some(session) = pi_sessions.iter().find(|s| is_id(&s.session_id)) {
         return Ok(ResolvedTarget::Pi(session.clone()));
     }
 

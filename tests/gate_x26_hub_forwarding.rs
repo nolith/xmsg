@@ -1059,14 +1059,21 @@ async fn test_oracle_6b_direct_send_reply_pushed_back() {
             let node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
             let node_a = spawn_test_node("node-a", port_a, http_a, &cert_a, &key_a, peers_a).await;
 
-            let (_sock_a, rx_a) =
-                create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
-            let (_sock_b, rx_b) = create_claude_session_fixture(&node_b.sessions_dir, "bob", "Bob");
+            let (_sock_a, rx_a) = create_claude_session_fixture(
+                &node_a.sessions_dir,
+                "135aa23d-60a6-5595-a42a-c0296722252e",
+                "Alice",
+            );
+            let (_sock_b, rx_b) = create_claude_session_fixture(
+                &node_b.sessions_dir,
+                "baa3a12f-e06d-59f5-90c8-2eda9a54dd91",
+                "Bob",
+            );
 
             // Alice sends direct to bob@node-b with push_replies: false
             let send_res = send_via_agent_sock(
                 &node_a.agent_sock,
-                "bob@node-b",
+                "baa3a12f-e06d-59f5-90c8-2eda9a54dd91@node-b",
                 "Direct send without push replies",
             )
             .await;
@@ -1123,7 +1130,14 @@ async fn hop_and_reply(
     rx_b: &Arc<Mutex<Vec<String>>>,
     text: &str,
 ) -> String {
-    let (status, sent) = hop_send(origin, pin_h, port_h, "bob@node-b", "Question for Bob").await;
+    let (status, sent) = hop_send(
+        origin,
+        pin_h,
+        port_h,
+        "baa3a12f-e06d-59f5-90c8-2eda9a54dd91@node-b",
+        "Question for Bob",
+    )
+    .await;
     assert_eq!(status, 202, "hop: {sent}");
     let b_msg = wait_for_inbox_message(rx_b, Duration::from_secs(5))
         .await
@@ -1190,14 +1204,24 @@ async fn test_oracle_1a_hub_relays_reply_to_dialable_origin() {
             let node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
             let _hub = spawn_test_node("hub", port_h, http_h, &cert_h, &key_h, peers_h).await;
             let node_a = spawn_test_node("node-a", port_a, http_a, &cert_a, &key_a, peers_a).await;
-            let (_sock_b, rx_b) = create_claude_session_fixture(&node_b.sessions_dir, "bob", "Bob");
+            let (_sock_b, rx_b) = create_claude_session_fixture(
+                &node_b.sessions_dir,
+                "baa3a12f-e06d-59f5-90c8-2eda9a54dd91",
+                "Bob",
+            );
 
             let origin = Origin {
                 cert_der: &cert_a_der,
                 key_der: &key_a_der,
             };
-            let (status, sent) =
-                hop_send(&origin, &pin_h, port_h, "bob@node-b", "Question for Bob").await;
+            let (status, sent) = hop_send(
+                &origin,
+                &pin_h,
+                port_h,
+                "baa3a12f-e06d-59f5-90c8-2eda9a54dd91@node-b",
+                "Question for Bob",
+            )
+            .await;
             assert_eq!(status, 202, "hop: {sent}");
             let b_msg = wait_for_inbox_message(&rx_b, Duration::from_secs(5))
                 .await
@@ -1212,7 +1236,7 @@ async fn test_oracle_1a_hub_relays_reply_to_dialable_origin() {
             let sent = xmsg::storage::MessageRecord {
                 id: msg_id.clone(),
                 created_at: 1000,
-                session_id: "bob@node-b".to_string(),
+                session_id: "baa3a12f-e06d-59f5-90c8-2eda9a54dd91@node-b".to_string(),
                 from_name: "alice".to_string(),
                 bytes: 16,
                 outcome: "delivered".to_string(),
@@ -1223,8 +1247,15 @@ async fn test_oracle_1a_hub_relays_reply_to_dialable_origin() {
                 thread_id: msg_id.clone(),
             };
             xmsg::storage::insert_message(&a_db, &sent).unwrap();
-            xmsg::storage::insert_outbound(&a_db, &msg_id, "hub", "bob@node-b", "delivered", 1000)
-                .unwrap();
+            xmsg::storage::insert_outbound(
+                &a_db,
+                &msg_id,
+                "hub",
+                "baa3a12f-e06d-59f5-90c8-2eda9a54dd91@node-b",
+                "delivered",
+                1000,
+            )
+            .unwrap();
 
             let reply = reply_via_agent_sock(&node_b.agent_sock, &msg_id, "Bob answers A").await;
             assert_eq!(reply["status"], "ok", "{reply}");
@@ -1277,7 +1308,11 @@ async fn test_oracle_3a_hub_stores_reply_for_undialable_origin() {
 
             let node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
             let _hub = spawn_test_node("hub", port_h, http_h, &cert_h, &key_h, peers_h).await;
-            let (_sock_b, rx_b) = create_claude_session_fixture(&node_b.sessions_dir, "bob", "Bob");
+            let (_sock_b, rx_b) = create_claude_session_fixture(
+                &node_b.sessions_dir,
+                "baa3a12f-e06d-59f5-90c8-2eda9a54dd91",
+                "Bob",
+            );
 
             let origin = Origin {
                 cert_der: &cert_a,

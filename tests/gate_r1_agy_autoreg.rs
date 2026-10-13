@@ -358,7 +358,7 @@ exit 0
     let (pi_notify_tx, _) = broadcast::channel(1024);
 
     let session_key = "agy:5555:100".to_string();
-    let conv_id = "conv-queue-test".to_string();
+    let conv_id = "7d595fed-e22e-53c6-bbca-a4005329531c".to_string();
 
     // Session has identity from MCP start, but NO credentials yet (credentials: None)
     let credless_session = AgySessionInfo::new(conv_id.clone(), 5555, "100".to_string(), None);

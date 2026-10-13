@@ -52,7 +52,7 @@ async fn start(caller_name: &str) -> Node {
         xmsg::process::starttime(Path::new(xmsg::process::LIVE_PROC_ROOT), pid).unwrap();
     let session = serde_json::json!({
         "pid": pid,
-        "sessionId": "cap-session",
+        "sessionId": "e2397278-8044-5bdd-a840-de1665aa1599",
         "name": caller_name,
         "cwd": "/w",
         "status": "idle",
@@ -143,7 +143,7 @@ async fn test_anonymous_label_keeps_long_node_name_whole() {
     let node = start("cap-caller").await;
     let res = reqwest::Client::new()
         .post(format!("{}/v1/messages", node.base_url))
-        .json(&serde_json::json!({"to": "cap-session",  "from": "a".repeat(200), "text": "hi" }))
+        .json(&serde_json::json!({"to": "e2397278-8044-5bdd-a840-de1665aa1599",  "from": "a".repeat(200), "text": "hi" }))
         .send()
         .await
         .unwrap();
@@ -169,7 +169,7 @@ async fn test_attested_label_keeps_long_node_name_whole() {
     let node = start(&caller_name).await;
     let stream = UnixStream::connect(&node.agent_sock).await.unwrap();
     let (r, mut w) = stream.into_split();
-    let frame = serde_json::json!({ "action": "send", "to": "cap-session", "text": "hi" });
+    let frame = serde_json::json!({ "action": "send", "to": "e2397278-8044-5bdd-a840-de1665aa1599", "text": "hi" });
     w.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
     let mut line = String::new();
     BufReader::new(r).read_line(&mut line).await.unwrap();
@@ -177,7 +177,7 @@ async fn test_attested_label_keeps_long_node_name_whole() {
     assert_eq!(resp["status"], "ok", "{resp}");
 
     let from_name = received_from_name(&node).await;
-    let attested = format!(" · cap-session@{LONG_NODE}");
+    let attested = format!(" · e2397278-8044-5bdd-a840-de1665aa1599@{LONG_NODE}");
     assert!(
         from_name.ends_with(&attested),
         "the attested node name must arrive whole: {from_name}"

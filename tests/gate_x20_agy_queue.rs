@@ -195,7 +195,7 @@ async fn test_oracle_1_lock_held_unregistered_send_queues_and_flushes_once() {
     let delivered_log = tmp.path().join("delivered.log");
     let fake_agy_bin = create_fake_agy_bin(tmp.path(), &delivered_log);
 
-    let conv_id = "conv-x20-oracle1";
+    let conv_id = "ac7162b0-5ae5-5ec4-bbba-75022566094a";
     let holder_pid = 7001;
     let starttime = "100";
 
@@ -359,7 +359,7 @@ async fn test_oracle_2_old_agy_key_with_matching_starttime_queues_recycled_fails
     let delivered_log = tmp.path().join("delivered.log");
     let fake_agy_bin = create_fake_agy_bin(tmp.path(), &delivered_log);
 
-    let conv_id = "conv-x20-oracle2";
+    let conv_id = "caed0faa-6d2f-5b44-918c-f2b7496eba60";
     let holder_pid = 7002;
     let actual_starttime = "200";
 
@@ -385,7 +385,7 @@ async fn test_oracle_2_old_agy_key_with_matching_starttime_queues_recycled_fails
 
     let client = reqwest::Client::new();
 
-    // 2A. The conversation ID => 202 Accepted, queued under conv-x20-oracle2. The old
+    // 2A. The conversation ID => 202 Accepted, queued under caed0faa-6d2f-5b44-918c-f2b7496eba60. The old
     // `agy:<pid>:<start>` key is no ref any more (XA3: kind prefixes and pid refs leave
     // the grammar); 2B and 2C show both its forms are names nothing carries.
     let matching_key = conv_id.to_string();
@@ -765,7 +765,7 @@ async fn test_oracle_4_federated_send_queues_unregistered_and_checks_starttime()
     let b_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let b_addr = b_listener.local_addr().unwrap();
 
-    let conv_id = "conv-x20-oracle4".to_string();
+    let conv_id = "c5735654-0364-56cd-839d-80b3509ce386".to_string();
     let holder_pid = 7004;
     let actual_starttime = "400".to_string();
 
@@ -819,7 +819,7 @@ async fn test_oracle_4_federated_send_queues_unregistered_and_checks_starttime()
                     presence_dir,
                     proc_locks,
                     proc_root,
-                    "conv-x20-oracle4",
+                    "c5735654-0364-56cd-839d-80b3509ce386",
                     7004,
                     "400",
                     &fake_agy_bin,

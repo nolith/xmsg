@@ -344,7 +344,7 @@ async fn oracle_2_restarted_server_does_not_list_exited_agy_child() {
     let trusted_agy = tmp.path().join("trusted_agy");
     fs::write(&trusted_agy, "binary").unwrap();
 
-    let conv_id = "conv-oracle2";
+    let conv_id = "5557f921-1c31-59cb-b30e-7560f43e07c9";
     let lock_file = presence_dir.join(format!("{conv_id}.lock"));
     fs::write(&lock_file, "lock").unwrap();
     let meta = fs::metadata(&lock_file).unwrap();

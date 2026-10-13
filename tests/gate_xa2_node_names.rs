@@ -708,13 +708,13 @@ async fn test_oracle_3a_hub_forwards_canonical_origin() {
             .extra_args
             .extend(["--fed-listen".to_string(), addr(h_fed)]);
         let _h = start(h_spec, None).await;
-        let bob = claude_session(&c.sessions_dir, "bob", "Bob");
+        let bob = claude_session(&c.sessions_dir, "baa3a12f-e06d-59f5-90c8-2eda9a54dd91", "Bob");
 
         let origin = Origin {
             cert_der: &l_cert,
             key_der: &l_key,
         };
-        let r = format!("bob@{c_name}");
+        let r = format!("baa3a12f-e06d-59f5-90c8-2eda9a54dd91@{c_name}");
         let (status, body) = hop_send(&origin, &h_pin, h_fed, &r, "via the hub").await;
         assert_eq!(status, 202, "{r} through the hub: {body}");
         let line = wait_line(&bob).await.expect("bob on C receives the relay");
@@ -765,10 +765,19 @@ async fn test_oracle_3b_direct_send_by_nickname() {
             .extra_args
             .extend(["--fed-listen".to_string(), addr(h_fed)]);
         let h = start(h_spec, None).await;
-        let alice = claude_session(&l.sessions_dir, "alice", "Alice");
+        let alice = claude_session(
+            &l.sessions_dir,
+            "135aa23d-60a6-5595-a42a-c0296722252e",
+            "Alice",
+        );
 
         // H types L's nickname.
-        let (status, body) = http_send(&h, "alice@laptop", "by nickname").await;
+        let (status, body) = http_send(
+            &h,
+            "135aa23d-60a6-5595-a42a-c0296722252e@laptop",
+            "by nickname",
+        )
+        .await;
         assert_eq!(
             status, 202,
             "x@laptop resolves through H's peers file: {body}"
@@ -1054,8 +1063,13 @@ async fn test_oracle_8_no_hand_assigned_name() {
         assert!(stderr.contains("XMSG_HOST_LABEL"), "{stderr}");
 
         let node = start(NodeSpec::default(), None).await;
-        let inbox = claude_session(&node.sessions_dir, "local-sess", "local");
-        let (status, body) = http_send(&node, "local-sess", "hello").await;
+        let inbox = claude_session(
+            &node.sessions_dir,
+            "d1529eb1-d8e5-59fd-921c-181abc745c4e",
+            "local",
+        );
+        let (status, body) =
+            http_send(&node, "d1529eb1-d8e5-59fd-921c-181abc745c4e", "hello").await;
         assert_eq!(status, 202, "{body}");
         let line = wait_line(&inbox).await.expect("local delivery");
         let expected = xmsg::node::local_node_name();
@@ -1105,7 +1119,7 @@ async fn test_oracle_7b_hub_targets_refuse_harness_kind_refs() {
         )
         .await;
         let mut d_on_h = pin_entry(&addr(d.fed_port), &d_creds.pin, &["send", "reply"]);
-        d_on_h["targets"] = json!(["genie-guard", "sess-label"]);
+        d_on_h["targets"] = json!(["genie-guard", "095f428d-a387-543a-a82b-e21452c783f6"]);
         let h_peers = json!({
             "anode": pin_entry(&addr(get_free_port()), &a_pin, &["send", "reply", "forward"]),
             "dnode": d_on_h,
@@ -1122,13 +1136,26 @@ async fn test_oracle_7b_hub_targets_refuse_harness_kind_refs() {
             .extend(["--fed-listen".to_string(), addr(h_fed)]);
         let _h = start(h_spec, None).await;
         let d_name = node_name_from_pin(&d_creds.pin).unwrap();
-        let inbox = claude_session(&d.sessions_dir, "sess-label", "genie-guard");
+        let inbox = claude_session(
+            &d.sessions_dir,
+            "095f428d-a387-543a-a82b-e21452c783f6",
+            "genie-guard",
+        );
 
         for (r, want) in [
-            (format!("sess-label@{d_name}"), 202),
-            (format!("session:sess-label@{d_name}"), 403),
+            (
+                format!("095f428d-a387-543a-a82b-e21452c783f6@{d_name}"),
+                202,
+            ),
+            (
+                format!("session:095f428d-a387-543a-a82b-e21452c783f6@{d_name}"),
+                403,
+            ),
             (format!("claude:genie-guard@{d_name}"), 403),
-            (format!("claude:sess-label@{d_name}"), 403),
+            (
+                format!("claude:095f428d-a387-543a-a82b-e21452c783f6@{d_name}"),
+                403,
+            ),
         ] {
             let origin = Origin {
                 cert_der: &a_cert,

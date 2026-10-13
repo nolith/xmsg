@@ -21,8 +21,8 @@ async fn test_agy_delivery_env_isolation_and_credentials_lifecycle() {
 
     let my_pid = std::process::id();
 
-    // 1. Create presence lock for conv-agy-test
-    let conv_id = "conv-agy-test";
+    // 1. Create presence lock for c904fe8e-df56-5cf9-8285-e2d97512d4e7
+    let conv_id = "c904fe8e-df56-5cf9-8285-e2d97512d4e7";
     let lock_file = presence_dir.join(format!("{conv_id}.lock"));
     fs::write(&lock_file, "lock").unwrap();
     let meta = fs::metadata(&lock_file).unwrap();

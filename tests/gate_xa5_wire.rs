@@ -512,8 +512,16 @@ async fn mesh(b_allows_list: bool, l_allows_list: bool) -> Mesh {
     let b = start(pb, &ca_b, peers_b, None, None).await;
     let a = start(pa, &ca_a, peers_a, None, None).await;
     let l = start(pl, &ca_l, peers_l, Some("guard"), None).await;
-    let alice = claude_session(&a.sessions_dir, "alice", "Alice");
-    let bob = claude_session(&b.sessions_dir, "bob", "Bob");
+    let alice = claude_session(
+        &a.sessions_dir,
+        "135aa23d-60a6-5595-a42a-c0296722252e",
+        "Alice",
+    );
+    let bob = claude_session(
+        &b.sessions_dir,
+        "baa3a12f-e06d-59f5-90c8-2eda9a54dd91",
+        "Bob",
+    );
     let guard = register_svc(&l.register_sock, "guard").await;
     Mesh {
         a,
@@ -640,8 +648,8 @@ async fn test_oracle_1_mesh_list_and_send_to_each() {
         let listed = list(&m.a, Duration::from_secs(15)).await;
         let addrs = addresses(&listed);
         for (addr, user) in [
-            ("alice@sini.a", "sini"),
-            ("bob@eve.b", "eve"),
+            ("135aa23d-60a6-5595-a42a-c0296722252e@sini.a", "sini"),
+            ("baa3a12f-e06d-59f5-90c8-2eda9a54dd91@eve.b", "eve"),
             ("guard@guard.genie", "guard.genie"),
         ] {
             let r = listed["recipients"]
@@ -662,15 +670,27 @@ async fn test_oracle_1_mesh_list_and_send_to_each() {
         sorted.sort();
         assert_eq!(
             sorted,
-            ["alice@sini.a", "bob@eve.b", "guard@guard.genie"],
+            [
+                "135aa23d-60a6-5595-a42a-c0296722252e@sini.a",
+                "baa3a12f-e06d-59f5-90c8-2eda9a54dd91@eve.b",
+                "guard@guard.genie"
+            ],
             "{listed}"
         );
         for addr in &addrs {
             let (status, sent) = http_send(&m.a, addr, &format!("to {addr}")).await;
             assert_eq!(status, 202, "send to {addr}: {sent}");
         }
-        assert!(wait_line(&m.alice, "to alice@sini.a").await.is_some());
-        assert!(wait_line(&m.bob, "to bob@eve.b").await.is_some());
+        assert!(
+            wait_line(&m.alice, "to 135aa23d-60a6-5595-a42a-c0296722252e@sini.a")
+                .await
+                .is_some()
+        );
+        assert!(
+            wait_line(&m.bob, "to baa3a12f-e06d-59f5-90c8-2eda9a54dd91@eve.b")
+                .await
+                .is_some()
+        );
         let (r, w) = &mut m.guard;
         let got = svc_poll(r, w).await;
         assert_eq!(got["action"], "deliver", "{got}");
@@ -704,8 +724,14 @@ async fn test_oracle_2_disconnected_dial_out_client_is_bounded() {
         );
         assert_eq!(node_status(&listed, "eve.b"), "ok", "{listed}");
         let addrs = addresses(&listed);
-        assert!(addrs.contains(&"alice@sini.a".to_string()), "{listed}");
-        assert!(addrs.contains(&"bob@eve.b".to_string()), "{listed}");
+        assert!(
+            addrs.contains(&"135aa23d-60a6-5595-a42a-c0296722252e@sini.a".to_string()),
+            "{listed}"
+        );
+        assert!(
+            addrs.contains(&"baa3a12f-e06d-59f5-90c8-2eda9a54dd91@eve.b".to_string()),
+            "{listed}"
+        );
         assert!(
             !addrs.iter().any(|a| a.ends_with("@guard.genie")),
             "{listed}"
@@ -732,7 +758,10 @@ async fn test_oracle_3_withheld_list_is_reported() {
         );
         let addrs = addresses(&listed);
         assert!(!addrs.iter().any(|a| a.ends_with("@eve.b")), "{listed}");
-        assert!(addrs.contains(&"alice@sini.a".to_string()), "{listed}");
+        assert!(
+            addrs.contains(&"135aa23d-60a6-5595-a42a-c0296722252e@sini.a".to_string()),
+            "{listed}"
+        );
         assert!(addrs.contains(&"guard@guard.genie".to_string()), "{listed}");
     })
     .await;
@@ -858,12 +887,21 @@ async fn test_oracle_6_receiver_attests_the_node() {
         let peers_b =
             json!({ "sini.o": ca_entry(get_free_port(), &pb.ca_file(), URI_O, &["send"]) });
         let b = start(pb, &ca_b, peers_b, None, None).await;
-        let bob = claude_session(&b.sessions_dir, "bob", "Bob");
+        let bob = claude_session(
+            &b.sessions_dir,
+            "baa3a12f-e06d-59f5-90c8-2eda9a54dd91",
+            "Bob",
+        );
         let o = Origin {
             cert_der: &ca_o.cert_der,
             key_der: &ca_o.key_der,
         };
-        let mut env = hop_client::envelope("alice", "Alice", "bob", "claims cortex");
+        let mut env = hop_client::envelope(
+            "alice",
+            "Alice",
+            "baa3a12f-e06d-59f5-90c8-2eda9a54dd91",
+            "claims cortex",
+        );
         env["origin"]["node"] = json!("sini.cortex");
         let (status, res) = hop_client::send_envelope(&o, &ca_b.pin, b.fed_port, env).await;
         assert_eq!(status, 202, "{res}");
@@ -983,15 +1021,29 @@ async fn test_oracle_8_relay_carries_the_origin_and_one_hop() {
         let b = start(pb, &ca_b, peers_b, None, None).await;
         let _h = start(ph, &ca_h, peers_h, None, None).await;
         let a = start(pa, &ca_a, peers_a, None, None).await;
-        let bob = claude_session(&b.sessions_dir, "bob", "Bob");
-        let bob_on_a = claude_session(&a.sessions_dir, "bob", "Bob");
+        let bob = claude_session(
+            &b.sessions_dir,
+            "baa3a12f-e06d-59f5-90c8-2eda9a54dd91",
+            "Bob",
+        );
+        let bob_on_a = claude_session(
+            &a.sessions_dir,
+            "baa3a12f-e06d-59f5-90c8-2eda9a54dd91",
+            "Bob",
+        );
         let o = Origin {
             cert_der: &ca_o.cert_der,
             key_der: &ca_o.key_der,
         };
 
-        let (status, res) =
-            hop_client::hop_send(&o, &ca_h.pin, _h.fed_port, "bob@eve.b", "relayed").await;
+        let (status, res) = hop_client::hop_send(
+            &o,
+            &ca_h.pin,
+            _h.fed_port,
+            "baa3a12f-e06d-59f5-90c8-2eda9a54dd91@eve.b",
+            "relayed",
+        )
+        .await;
         assert_eq!(status, 202, "{res}");
         let line = wait_line(&bob, "relayed")
             .await
@@ -1001,8 +1053,14 @@ async fn test_oracle_8_relay_carries_the_origin_and_one_hop() {
             "the forwarded origin: {line}"
         );
 
-        let (status, res) =
-            hop_client::hop_send(&o, &ca_h.pin, _h.fed_port, "bob@sini.a@eve.b", "twice").await;
+        let (status, res) = hop_client::hop_send(
+            &o,
+            &ca_h.pin,
+            _h.fed_port,
+            "baa3a12f-e06d-59f5-90c8-2eda9a54dd91@sini.a@eve.b",
+            "twice",
+        )
+        .await;
         assert_eq!(status, 403, "{res}");
         assert_eq!(
             res["detail"], "message has already been forwarded (one hop maximum)",
@@ -1043,7 +1101,10 @@ async fn test_oracle_3b_dial_out_client_withholding_list_is_reported() {
             !addrs.iter().any(|a| a.ends_with("@guard.genie")),
             "{listed}"
         );
-        assert!(addrs.contains(&"bob@eve.b".to_string()), "{listed}");
+        assert!(
+            addrs.contains(&"baa3a12f-e06d-59f5-90c8-2eda9a54dd91@eve.b".to_string()),
+            "{listed}"
+        );
     })
     .await;
 }
@@ -1124,13 +1185,22 @@ async fn test_oracle_10_forward_mark_names_the_authenticated_peer() {
             "sini.o": ca_entry(get_free_port(), &pb.ca_file(), URI_O, &["send", "relayed"]),
         });
         let b = start(pb, &ca_b, peers_b, None, None).await;
-        let bob = claude_session(&b.sessions_dir, "bob", "Bob");
+        let bob = claude_session(
+            &b.sessions_dir,
+            "baa3a12f-e06d-59f5-90c8-2eda9a54dd91",
+            "Bob",
+        );
         let o = Origin {
             cert_der: &ca_o.cert_der,
             key_der: &ca_o.key_der,
         };
         let marked = |forwarder: &str, body: &str| {
-            let mut env = hop_client::envelope("alice", "Alice", "bob", body);
+            let mut env = hop_client::envelope(
+                "alice",
+                "Alice",
+                "baa3a12f-e06d-59f5-90c8-2eda9a54dd91",
+                body,
+            );
             env["forwarded"] = json!({ "forwarder": forwarder });
             env
         };

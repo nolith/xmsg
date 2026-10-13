@@ -161,7 +161,7 @@ async fn test_oracle_1_multi_dir_listed_and_deliverable() {
     write_claude_session(
         dir_a.path(),
         my_pid,
-        "sess-alpha-001",
+        "8f0ddc09-f6b5-5a11-9ffa-bf3e69848223",
         "worker-alpha",
         &my_proc_start,
         &listener_a.sock_path,
@@ -171,7 +171,7 @@ async fn test_oracle_1_multi_dir_listed_and_deliverable() {
     write_claude_session(
         dir_b.path(),
         my_pid,
-        "sess-beta-002",
+        "eaa01066-ba31-55ae-9603-610ab0258fe5",
         "worker-beta",
         &my_proc_start,
         &listener_b.sock_path,
@@ -188,12 +188,12 @@ async fn test_oracle_1_multi_dir_listed_and_deliverable() {
     );
     let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
     assert!(
-        ids.contains(&"sess-alpha-001"),
-        "sess-alpha-001 must be listed"
+        ids.contains(&"8f0ddc09-f6b5-5a11-9ffa-bf3e69848223"),
+        "8f0ddc09-f6b5-5a11-9ffa-bf3e69848223 must be listed"
     );
     assert!(
-        ids.contains(&"sess-beta-002"),
-        "sess-beta-002 must be listed"
+        ids.contains(&"eaa01066-ba31-55ae-9603-610ab0258fe5"),
+        "eaa01066-ba31-55ae-9603-610ab0258fe5 must be listed"
     );
 
     // 2. HTTP Server GET /v1/sessions
@@ -219,14 +219,20 @@ async fn test_oracle_1_multi_dir_listed_and_deliverable() {
     // 3. Deliverability to session in dir_a
     let post_a = client
         .post(format!("{}/v1/messages", server.base_url))
-        .json(&serde_json::json!({"to": "sess-alpha-001",
-            "from": "claude",
-            "text": "Hello Alpha"
-        }))
+        .json(
+            &serde_json::json!({"to": "8f0ddc09-f6b5-5a11-9ffa-bf3e69848223",
+                "from": "claude",
+                "text": "Hello Alpha"
+            }),
+        )
         .send()
         .await
         .expect("post to alpha");
-    assert_eq!(post_a.status(), 202, "Message to sess-alpha-001 accepted");
+    assert_eq!(
+        post_a.status(),
+        202,
+        "Message to 8f0ddc09-f6b5-5a11-9ffa-bf3e69848223 accepted"
+    );
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     let lines_a = listener_a.received_lines.lock().await;
@@ -238,14 +244,20 @@ async fn test_oracle_1_multi_dir_listed_and_deliverable() {
     // 4. Deliverability to session in dir_b
     let post_b = client
         .post(format!("{}/v1/messages", server.base_url))
-        .json(&serde_json::json!({"to": "sess-beta-002",
-            "from": "claude",
-            "text": "Hello Beta"
-        }))
+        .json(
+            &serde_json::json!({"to": "eaa01066-ba31-55ae-9603-610ab0258fe5",
+                "from": "claude",
+                "text": "Hello Beta"
+            }),
+        )
         .send()
         .await
         .expect("post to beta");
-    assert_eq!(post_b.status(), 202, "Message to sess-beta-002 accepted");
+    assert_eq!(
+        post_b.status(),
+        202,
+        "Message to eaa01066-ba31-55ae-9603-610ab0258fe5 accepted"
+    );
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     let lines_b = listener_b.received_lines.lock().await;
@@ -342,7 +354,7 @@ async fn test_oracle_3_duplicate_session_across_dirs_assigned_suffixes_and_route
         xmsg::process::starttime(Path::new(xmsg::process::LIVE_PROC_ROOT), child_pid).unwrap();
     let listener_b = start_socket_listener("inbox_test_b").await;
 
-    let duplicate_id = "sess-colliding-dup-999";
+    let duplicate_id = "07dc23ee-3e4d-5502-9f8d-41f7b6eab264";
     write_claude_session(
         dir_a.path(),
         my_pid,
@@ -361,7 +373,7 @@ async fn test_oracle_3_duplicate_session_across_dirs_assigned_suffixes_and_route
     );
 
     // Unique session in dir_b
-    let unique_id = "sess-unique-legit-777";
+    let unique_id = "2bfd836e-ecd4-5aeb-8de4-137434acfe7a";
     write_claude_session(
         dir_b.path(),
         my_pid,

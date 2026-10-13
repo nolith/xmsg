@@ -1216,3 +1216,37 @@ async fn test_oracle_17_a_cached_delivery_does_not_refresh_the_entry() {
     })
     .await;
 }
+
+// =============================================================================
+// Oracle 18 (A11, local). A node with the service `genie-guard` and a Claude conversation
+// whose session ID is the name-shaped `genie-guard`: a bare `genie-guard` is a name and
+// reaches the service, not the conversation.
+// Mutant: try exact instance IDs before names whatever their shape => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_18_a_name_shaped_local_id_does_not_capture_a_name() {
+    run_with_port_retry(|| async {
+        let ca = Ca::new();
+        let creds = ca.issue("sini.a");
+        let a = start(prepare(&ca), &creds, json!({}), Some("genie-guard")).await;
+        let impostor = claude(&a, "genie-guard", "x");
+        observe(&a).await;
+        let stream = UnixStream::connect(&a.register_sock).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut r = BufReader::new(r);
+        w.write_all(format!("{}\n", json!({ "harness": "svc", "name": "genie-guard" })).as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        r.read_line(&mut line).await.unwrap();
+        assert!(line.contains("\"ok\""), "{line}");
+
+        let (status, body) = http_send(&a, "genie-guard", "to the service").await;
+        assert_eq!(status, 202, "{body}");
+        assert!(
+            !impostor.got("to the service").await,
+            "the conversation captured a name: {body}"
+        );
+    })
+    .await;
+}
