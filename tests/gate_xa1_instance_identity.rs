@@ -977,6 +977,50 @@ async fn test_oracle_6b_fork_notice_once_under_concurrent_scans() {
 }
 
 // =============================================================================
+// Oracle 6e: a notice whose delivery fails is delivered once by a later scan.
+// Mutant: keep the claim of a failed delivery => RED
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_6e_failed_fork_notice_retried_once() {
+    let conv = "0199cecf-0006-7000-8000-00000000000e";
+    let f = fork_fixture(conv).await;
+    // P2's socket is not up yet.
+    let missing = f.db_path.with_file_name("p2-not-yet.sock");
+    write_claude_session_file(&f.sessions_dir, 1002, conv, "second", "200", &missing);
+    let conn = rusqlite::Connection::open(&f.db_path).unwrap();
+    init_db(&conn).unwrap();
+    let db = std::sync::Mutex::new(conn);
+
+    xmsg::claim::sync_claims(&db, &f.proc_root, &f.sessions_dir, "test-node")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(notice_count(&f.p1).await, 1);
+    assert_eq!(notice_count(&f.p2).await, 0);
+
+    // P2's socket comes up; the next scans deliver its notice once.
+    write_claude_session_file(
+        &f.sessions_dir,
+        1002,
+        conv,
+        "second",
+        "200",
+        &f.p2.sock_path,
+    );
+    for _ in 0..2 {
+        xmsg::claim::sync_claims(&db, &f.proc_root, &f.sessions_dir, "test-node")
+            .await
+            .unwrap();
+    }
+    let (n1, n2) = settle_notices(&f.p1, &f.p2, Duration::from_secs(2)).await;
+    assert_eq!(n1, 1, "P1 must not be noticed again");
+    assert_eq!(
+        n2, 1,
+        "P2's failed notice must be delivered exactly once later"
+    );
+}
+
+// =============================================================================
 // Oracle 6c: a fork first observed by Claude's mcp_start is noticed there,
 // with no list.
 // Mutant B-N2-mcp: the mcp_start Claude arm drops the notices => RED
