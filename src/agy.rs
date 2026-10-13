@@ -1021,29 +1021,9 @@ pub fn default_register_sock_path() -> Result<PathBuf, AppError> {
 /// well under a millisecond, so 100ms keeps an armed conversation's cost below 1% of a core.
 pub const AGY_PROC_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Checks whether `pid` is a strict descendant of `ancestor_pid` within `proc_root`.
-pub fn is_descendant_of(proc_root: &Path, pid: u32, ancestor_pid: u32) -> bool {
-    if pid == ancestor_pid || pid <= 1 {
-        return false;
-    }
-    let mut curr = pid;
-    for _ in 0..32 {
-        let Some(ppid) = crate::process::parent_pid(proc_root, curr) else {
-            return false;
-        };
-        if ppid == ancestor_pid {
-            return true;
-        }
-        if ppid <= 1 || ppid == curr {
-            return false;
-        }
-        curr = ppid;
-    }
-    false
-}
-
 /// Checks whether Arm A is actively watching `conv_id` (Linux, locks supported, presence lock
-/// held by an attested agy process, and /proc readable).
+/// held by an attested agy process, and that process's `task/*/children` readable). Without the
+/// `children` file the watcher reads nothing, so B′'s hook fires from the first turn.
 pub fn is_conversation_proc_watched(config: &AgyConfig, conv_id: &str) -> bool {
     if !locks_supported(&config.proc_locks_path) {
         return false;
@@ -1091,13 +1071,7 @@ pub fn is_conversation_proc_watched(config: &AgyConfig, conv_id: &str) -> bool {
         return false;
     }
 
-    // Verify /proc is readable for the holder process
-    let holder_dir = config.proc_root.join(holder_pid.to_string());
-    if fs::metadata(&holder_dir).is_err() {
-        return false;
-    }
-
-    true
+    proc_children(&config.proc_root, holder_pid).is_some()
 }
 
 /// Per-watcher memory. Holds conversation ids only, never a credential value.
@@ -1105,8 +1079,6 @@ pub fn is_conversation_proc_watched(config: &AgyConfig, conv_id: &str) -> bool {
 pub struct AgyProcWatch {
     /// Conversations whose unreadable `environ` has already been logged.
     unreadable_logged: HashSet<String>,
-    /// Whether the ppid-scan fallback has been announced.
-    fallback_logged: bool,
 }
 
 fn trusted_canons(config: &AgyConfig) -> Vec<PathBuf> {
@@ -1212,9 +1184,10 @@ fn agy_credentials_from_environ(bytes: &[u8]) -> Option<(String, String)> {
 /// `conv_id` from the first process carrying both. Returns whether it registered.
 ///
 /// Only the subtree is read: the walk descends from the holder through
-/// `/proc/<pid>/task/<tid>/children`. Where the kernel lacks that file it falls back, once
-/// announced, to listing `/proc` and walking each pid's parent chain (at most 32 hops), which reads
-/// `stat` of processes outside the subtree but `environ` only inside it.
+/// `/proc/<pid>/task/<tid>/children`, and each listing is trusted only if its owner's start time
+/// still matches its pin after the read. Where the holder has no `children` file (the kernel lacks
+/// `CONFIG_PROC_CHILDREN`, or the holder is gone) nothing is read and the hook request covers the
+/// conversation.
 #[allow(clippy::too_many_arguments)]
 async fn register_from_subtree(
     config: &AgyConfig,
@@ -1231,35 +1204,18 @@ async fn register_from_subtree(
 
     // (pid, the parent it was listed under, that parent's pinned start time)
     let mut queue: VecDeque<(u32, u32, String)> = VecDeque::new();
-    let fallback = match proc_children(proc_root, holder_pid) {
-        Some(kids) => {
-            queue.extend(
-                kids.into_iter()
-                    .map(|c| (c, holder_pid, holder_st.to_string())),
-            );
-            false
-        }
-        None => {
-            if !watch.fallback_logged {
-                watch.fallback_logged = true;
-                tracing::info!(
-                    "agy proc watcher: /proc/<pid>/task/<tid>/children is absent; falling back to a ppid scan of /proc"
-                );
-            }
-            if let Ok(entries) = fs::read_dir(proc_root) {
-                let mut pids: Vec<u32> = entries
-                    .flatten()
-                    .filter_map(|e| e.file_name().to_str()?.parse().ok())
-                    .collect();
-                pids.sort_unstable();
-                queue.extend(
-                    pids.into_iter()
-                        .map(|p| (p, holder_pid, holder_st.to_string())),
-                );
-            }
-            true
-        }
+    let Some(kids) = proc_children(proc_root, holder_pid) else {
+        return Ok(false);
     };
+    // The listing is the attested holder's only if the holder's start time still matches its pin:
+    // a recycled holder pid's children are never read.
+    if st_of(holder_pid).as_deref() != Some(holder_st) {
+        return Ok(false);
+    }
+    queue.extend(
+        kids.into_iter()
+            .map(|c| (c, holder_pid, holder_st.to_string())),
+    );
 
     let mut seen = HashSet::new();
     while let Some((p, parent, parent_st)) = queue.pop_front() {
@@ -1275,12 +1231,8 @@ async fn register_from_subtree(
         };
 
         // Scope rule: p must be in the attested agy's subtree.
-        let in_subtree = if fallback {
-            is_descendant_of(proc_root, p, holder_pid)
-        } else {
-            crate::process::parent_pid(proc_root, p) == Some(parent)
-                && st_of(parent).as_deref() == Some(parent_st.as_str())
-        };
+        let in_subtree = crate::process::parent_pid(proc_root, p) == Some(parent)
+            && st_of(parent).as_deref() == Some(parent_st.as_str());
         if !in_subtree {
             continue;
         }
@@ -1354,8 +1306,8 @@ async fn register_from_subtree(
             }
         }
 
-        if !fallback {
-            if let Some(kids) = proc_children(proc_root, p) {
+        if let Some(kids) = proc_children(proc_root, p) {
+            if st_of(p).as_deref() == Some(st_before.as_str()) {
                 queue.extend(kids.into_iter().map(|c| (c, p, st_before.clone())));
             }
         }

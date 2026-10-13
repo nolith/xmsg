@@ -434,12 +434,14 @@ async fn oracle_1b_serve_watcher_registers_without_hook() {
 
 // ---------------------------------------------------------------------------
 // Oracle 2: the variables in a process OUTSIDE the attested agy's subtree => not registered, and
-// that process's environ is never even opened (a FIFO counts the opens).
+// that process is never even read: FIFOs count the opens of its `environ` and its `stat`.
 //   2a: a sibling of the attested agy (ppid 1).
 //   2b: the child of a NON-attested agy binary (same file name, other path) holding a lock.
-// Each runs with the kernel's children files (descent) and without them (ppid-scan fallback).
-// Mutants: subtree replaced by all of /proc => RED (descent); fallback ancestry check skipped =>
-// RED (fallback); attestation skipped => RED (2b).
+// Each runs with the kernel's children files (descent) and without them. Without them nothing is
+// read at all, nothing registers, and `check` reports `watching: false`, so the hook injects on
+// turn 1.
+// Mutants: subtree replaced by all of /proc => RED (descent); /proc listing restored where the
+// children file is absent => RED (no children); attestation skipped => RED (2b).
 // ---------------------------------------------------------------------------
 async fn oracle_2_outside(non_attested: bool, children: bool) {
     let t = Tree::new();
@@ -470,18 +472,46 @@ async fn oracle_2_outside(non_attested: bool, children: bool) {
     let opens = serve_fifo(t.environ(outsider), stop.clone(), |_| {
         agy_env("token-oracle-2")
     });
+    let outsider_ppid = if non_attested { 2100 } else { 1 };
+    let stat_reads = serve_fifo(
+        t.proc_root.join(outsider.to_string()).join("stat"),
+        stop.clone(),
+        move |_| stat_line(outsider, outsider_ppid, "200").into_bytes(),
+    );
 
     let store = new_agy_store();
     let res = scan(&t, &store, &["conv-2a", "conv-2b"]).await;
+    let mut checked = None;
+    if !children {
+        // The production server: its start-up sweep arms conv-2a, and the hook's check runs.
+        let (_dir, sock) = start_server(t.config(), store.clone()).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let watching = check(&sock, "conv-2a")["watching"].clone();
+        let (code, out) = run_hook(env!("CARGO_BIN_EXE_xmsg"), &sock, "conv-2a");
+        checked = Some((watching, code, out));
+    }
     stop.store(true, Ordering::SeqCst);
     let opens = opens.join().unwrap();
+    let stat_reads = stat_reads.join().unwrap();
 
     assert_eq!(
         opens, 0,
         "a process outside the attested subtree must never be read"
     );
+    assert_eq!(
+        stat_reads, 0,
+        "a process outside the attested subtree must never be read, not even its stat"
+    );
     assert!(res.is_ok(), "{res:?}");
     assert!(store.read().unwrap().is_empty(), "nothing may register");
+    if let Some((watching, code, out)) = checked {
+        assert_eq!(
+            watching, false,
+            "without the children file the watcher reads nothing, so check must not stand down"
+        );
+        assert_eq!(code, 0);
+        assert_hook_injects(&out, "turn 1 without the children file");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -490,7 +520,7 @@ async fn oracle_2a_sibling_outside_subtree() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn oracle_2a_sibling_outside_subtree_fallback() {
+async fn oracle_2a_sibling_outside_subtree_no_children() {
     oracle_2_outside(false, false).await;
 }
 
@@ -500,7 +530,7 @@ async fn oracle_2b_child_of_non_attested_agy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn oracle_2b_child_of_non_attested_agy_fallback() {
+async fn oracle_2b_child_of_non_attested_agy_no_children() {
     oracle_2_outside(true, false).await;
 }
 
@@ -586,6 +616,52 @@ async fn oracle_3b_pid_recycled_before_ancestry_check_never_read() {
 }
 
 // ---------------------------------------------------------------------------
+// Oracle 3c (holder pid recycled before its children are listed): the attested agy's stat is a
+// FIFO that serves the attested start time on its first read (attestation) and a new one on every
+// later read. Its `children` listing then belongs to the recycled process, so no listed child is
+// read, not even its stat.
+// Mutant: no holder start-time re-check after the listing => RED.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread")]
+async fn oracle_3c_holder_recycled_before_listing_children_never_read() {
+    let t = Tree::new();
+    t.agy("conv-3c", 3200, &t.trusted_exe);
+    t.hold("conv-3c", 3200);
+    t.children(3200, 3200, &[3201]);
+    t.process(3201, 3200, None, None, "200");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let holder_reads = serve_fifo(t.proc_root.join("3200").join("stat"), stop.clone(), |n| {
+        stat_line(3200, 1, if n == 0 { "100" } else { "9999" }).into_bytes()
+    });
+    let child_stat_reads = serve_fifo(t.proc_root.join("3201").join("stat"), stop.clone(), |_| {
+        stat_line(3201, 3200, "200").into_bytes()
+    });
+    let environ_opens = serve_fifo(t.environ(3201), stop.clone(), |_| {
+        agy_env("token-oracle-3c")
+    });
+
+    let store = new_agy_store();
+    let res = scan(&t, &store, &["conv-3c"]).await;
+    stop.store(true, Ordering::SeqCst);
+    let holder_reads = holder_reads.join().unwrap();
+    let child_stat_reads = child_stat_reads.join().unwrap();
+    let environ_opens = environ_opens.join().unwrap();
+
+    assert_eq!(
+        child_stat_reads, 0,
+        "a child listed by a recycled holder pid must never be read"
+    );
+    assert_eq!(environ_opens, 0);
+    assert_eq!(
+        holder_reads, 2,
+        "attestation, then the re-check after the listing"
+    );
+    assert!(res.is_ok(), "{res:?}");
+    assert!(store.read().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // Oracle 4: unreadable environ => no registration, no error surfaced, and B′'s hook output is as
 // in X27: the stand-down turn, then the userMessage injection.
 // Mutant: treat unreadable as fatal => RED.
@@ -634,6 +710,7 @@ async fn oracle_5_hook_stand_down_mechanics() {
     let t = Tree::new();
     t.agy("conv-watched-standdown", 5000, &t.trusted_exe);
     t.hold("conv-watched-standdown", 5000);
+    t.children(5000, 5000, &[]);
 
     let (_dir, sock) = start_server(t.config(), new_agy_store()).await;
 
