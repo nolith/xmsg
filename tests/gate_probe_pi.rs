@@ -361,12 +361,15 @@ async fn test_gate_probe_b3_attested_name_sanitization_and_envelope_integrity() 
     let send_resp: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(send_resp["status"], "ok");
 
-    // Check delivery fromName cap (must be <= 64 chars)
+    // Check delivery fromName cap: the attested prefix whole, the name part <= 64 chars
     let from_name = send_resp["delivery"]["fromName"].as_str().unwrap();
+    let name_part = from_name
+        .strip_prefix("xmsg@test-host · pi:")
+        .expect("attested prefix whole");
     assert!(
-        from_name.chars().count() <= 64,
-        "Attested fromName must be <= 64 characters, got {}",
-        from_name.chars().count()
+        name_part.chars().count() <= xmsg::inbox::LABEL_MAX_CHARS,
+        "the attested name part must be <= 64 characters, got {}",
+        name_part.chars().count()
     );
     assert!(
         !from_name.contains('"'),

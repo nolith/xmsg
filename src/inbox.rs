@@ -55,14 +55,18 @@ pub struct DeliveryResponse {
     pub outcome: Option<String>,
 }
 
+/// The most characters of a sender's self-described label that a label shows. Only that
+/// part is bounded: the attested part (`xmsg@<node>`) is always emitted whole (A12).
+pub const LABEL_MAX_CHARS: usize = 64;
+
 /// Sanitizes the `from` parameter for unauthenticated HTTP senders:
 /// - Rejects ':' and '/' outright (returns AppError::BadSender).
 /// - Enforces strictly printable ASCII characters (0x20 to 0x7E).
 /// - Strips quotes (") and angle brackets (<, >).
 /// - Collapses whitespace runs to a single space.
 /// - Trims leading and trailing whitespace.
-/// - Prefixes `xmsg@<node-name> · `.
-/// - Truncates the whole resulting string to 64 characters.
+/// - Truncates the name to `LABEL_MAX_CHARS` and prefixes `xmsg@<node-name> · `, which is
+///   never cut: the result is at most `LABEL_MAX_CHARS + 8` characters plus the node name.
 pub fn sanitize_from(node_name: &str, raw_from: &str) -> Result<String, AppError> {
     if raw_from.contains(':') || raw_from.contains('/') {
         return Err(AppError::BadSender(
@@ -102,9 +106,8 @@ pub fn sanitize_from(node_name: &str, raw_from: &str) -> Result<String, AppError
         ));
     }
 
-    let prefixed = format!("xmsg@{node_name} · {trimmed}");
-    let capped: String = prefixed.chars().take(64).collect();
-    Ok(capped)
+    let label: String = trimmed.chars().take(LABEL_MAX_CHARS).collect();
+    Ok(format!("xmsg@{node_name} · {}", label.trim_end()))
 }
 
 /// Sanitizes an attested caller session name and formats the attested badge:
@@ -112,7 +115,7 @@ pub fn sanitize_from(node_name: &str, raw_from: &str) -> Result<String, AppError
 /// - Strips `"`, `<`, `>`, `\n`, `\r`, and Unicode categories Cc, Cf, Cs, Zl, Zp.
 /// - Collapses whitespace runs to a single space.
 /// - Trims leading and trailing whitespace.
-/// - Caps total string to 64 Unicode scalar characters.
+/// - Caps the name to `LABEL_MAX_CHARS`; `xmsg@<node-name> · <harness>:` is never cut.
 pub fn sanitize_attested_from(node_name: &str, harness: &str, caller_name: &str) -> String {
     let mut cleaned = String::with_capacity(caller_name.len());
     let mut prev_whitespace = false;
@@ -161,8 +164,8 @@ pub fn sanitize_attested_from(node_name: &str, harness: &str, caller_name: &str)
         name_stripped
     };
 
-    let prefixed = format!("xmsg@{node_name} · {harness}:{name_final}");
-    prefixed.chars().take(64).collect()
+    let label: String = name_final.chars().take(LABEL_MAX_CHARS).collect();
+    format!("xmsg@{node_name} · {harness}:{}", label.trim_end())
 }
 
 /// Sanitizes the message body:
