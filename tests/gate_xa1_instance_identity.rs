@@ -9,9 +9,13 @@ use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Mutex;
 
 use xmsg::agy::{new_agy_store, AgyConfig};
-use xmsg::claim::{get_all_claims_for_id, is_uuid_shaped, sync_claims_db, validate_service_name};
+use xmsg::claim::{
+    get_all_claims_for_id, is_uuid_shaped, sync_claims_db, sync_claims_entries,
+    validate_service_name,
+};
 use xmsg::http::{build_router, AppState};
 use xmsg::pi::new_pi_store;
+use xmsg::registry::read_session_entries;
 use xmsg::storage::init_db;
 
 fn setup_mock_proc(proc_root: &Path, pid: u32, starttime: &str) {
@@ -615,7 +619,11 @@ async fn test_oracle_3_no_promotion_while_live_no_reuse_of_suffixes() {
 
 // =============================================================================
 // Oracle 4: Ties broken by (procStart, pid)
-// Mutant M4: take read_dir order (no sort) => RED
+// The scan is fed its entries in an explicit order, so the fixture does not
+// depend on the filesystem's read_dir order: one list inverts
+// (procStart, pid), the other follows it, and both give the plain ID to the
+// lower (procStart, pid).
+// Mutant M4: take input order (no sort) => RED on the inverted list
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_oracle_4_ties_broken_by_proc_start_and_pid() {
@@ -627,70 +635,36 @@ async fn test_oracle_4_ties_broken_by_proc_start_and_pid() {
     setup_mock_proc(&proc_root, 2000, "200");
     setup_mock_proc(&proc_root, 1000, "100");
 
-    let mut inverted_count = 0;
+    let sd = tmp.path().join("sessions");
+    fs::create_dir_all(&sd).unwrap();
+    write_claude_session_file(&sd, 2000, id, "p2000", "200", &sock);
+    write_claude_session_file(&sd, 1000, id, "p1000", "100", &sock);
+    let entries = read_session_entries(&sd);
+    assert_eq!(entries.len(), 2);
 
-    // Build in both creation orders, ensuring at least one fixture inverts (procStart, pid) in read_dir
-    let mut attempt = 0;
-    let (sd1, read_pids1) = loop {
-        attempt += 1;
-        let sd = tmp.path().join(format!("sessions_1_{attempt}"));
-        fs::create_dir_all(&sd).unwrap();
-        write_claude_session_file(&sd, 2000, id, "p2000", "200", &sock);
-        write_claude_session_file(&sd, 1000, id, "p1000", "100", &sock);
+    let mut inverted = entries.clone();
+    inverted.sort_by_key(|e| std::cmp::Reverse(e.pid));
+    let mut in_order = entries;
+    in_order.sort_by_key(|e| e.pid);
+    let pids = |v: &[xmsg::registry::SessionFileEntry]| v.iter().map(|e| e.pid).collect::<Vec<_>>();
+    assert_eq!(pids(&inverted), vec![2000, 1000]);
+    assert_eq!(pids(&in_order), vec![1000, 2000]);
 
-        let read_pids: Vec<u32> = fs::read_dir(&sd)
-            .unwrap()
-            .map(|e| {
-                let fname = e.unwrap().file_name().to_string_lossy().to_string();
-                fname.split('_').next().unwrap().parse::<u32>().unwrap()
-            })
-            .collect();
-
-        if read_pids == vec![2000, 1000] || attempt >= 50 {
-            break (sd, read_pids);
-        }
-    };
-
-    let (sd2, _read_pids2) = {
-        let sd = tmp.path().join("sessions_2");
-        fs::create_dir_all(&sd).unwrap();
-        write_claude_session_file(&sd, 1000, id, "p1000", "100", &sock);
-        write_claude_session_file(&sd, 2000, id, "p2000", "200", &sock);
-        let r: Vec<u32> = fs::read_dir(&sd)
-            .unwrap()
-            .map(|e| {
-                let fname = e.unwrap().file_name().to_string_lossy().to_string();
-                fname.split('_').next().unwrap().parse::<u32>().unwrap()
-            })
-            .collect();
-        (sd, r)
-    };
-
-    if read_pids1 == vec![2000, 1000] {
-        inverted_count += 1;
-    }
-
-    for (order, sd) in [(1, sd1), (2, sd2)] {
-        let db_path = tmp.path().join(format!("xmsg_{order}.db"));
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+    for (order, list) in [("inverted", inverted), ("in-order", in_order)] {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
-        let (pairs, _) = sync_claims_db(&conn, &proc_root, &sd, "test-node").unwrap();
+        let (pairs, _) = sync_claims_entries(&conn, &proc_root, list, "test-node").unwrap();
         assert_eq!(pairs.len(), 2);
         let p1000_claim = pairs.iter().find(|(c, _)| c.pid == 1000).unwrap().0.clone();
         let p2000_claim = pairs.iter().find(|(c, _)| c.pid == 2000).unwrap().0.clone();
 
         assert_eq!(
             p1000_claim.suffix, 1,
-            "1000 has smaller (procStart, pid) -> MUST win suffix 1 regardless of creation or read_dir order"
+            "{order}: 1000 has the smaller (procStart, pid) and MUST hold the plain ID whatever the input order"
         );
-        assert_eq!(p2000_claim.suffix, 2);
+        assert_eq!(p2000_claim.suffix, 2, "{order}");
     }
-
-    assert!(
-        inverted_count >= 1,
-        "read_dir order MUST invert (procStart, pid) in at least one fixture to validate tie rule"
-    );
 }
 
 // =============================================================================

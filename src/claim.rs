@@ -189,12 +189,32 @@ pub fn sync_claims_db(
     ),
     AppError,
 > {
+    let raw_entries = registry::read_session_entries(sessions_dirs);
+    sync_claims_entries(conn, proc_root, raw_entries, host_label)
+}
+
+/// One claim scan over session file entries in the order given. The scan
+/// itself orders new observations by `(procStart, pid)`, so the result does
+/// not depend on the order of `raw_entries` (which is `read_dir` order in
+/// production).
+#[allow(clippy::type_complexity)]
+pub fn sync_claims_entries(
+    conn: &Connection,
+    proc_root: &Path,
+    raw_entries: Vec<SessionFileEntry>,
+    host_label: &str,
+) -> Result<
+    (
+        Vec<(InstanceClaim, SessionFileEntry)>,
+        Vec<ForkNoticeToSend>,
+    ),
+    AppError,
+> {
     // One transaction per scan: an error part-way rolls back every claim and
     // every notice claim it made, so none is recorded without being returned.
     let tx = conn
         .unchecked_transaction()
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    let raw_entries = registry::read_session_entries(sessions_dirs);
 
     // Filter to live entries where process is still alive and proc_start matches
     let live_entries: Vec<SessionFileEntry> = raw_entries
