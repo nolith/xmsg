@@ -298,6 +298,7 @@ async fn create_full_test_node(
 struct Pair {
     _child: ChildGuard,
     register_sock_b: PathBuf,
+    http_sock_b: PathBuf,
     node_a: FullTestNode,
     _tmp_b: TempDir,
 }
@@ -431,6 +432,7 @@ async fn start_pair() -> Pair {
             return Pair {
                 _child: child_guard,
                 register_sock_b,
+                http_sock_b,
                 node_a,
                 _tmp_b: tmp_b,
             };
@@ -510,6 +512,58 @@ async fn k1_fed_message_to_opencode_is_replied_to() {
         rr["status"], "ok",
         "the recipient may reply to a federated message: {rr}"
     );
+}
+
+/// C3 across nodes: a send to an opencode session on node_b answers `queued`, and node_b's
+/// record reads `delivered` only once the plugin acks it. node_a's record keeps the answer
+/// it got: no `/fed/v2` exchange reports a later delivery (README, Delivery and the queue).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k4_fed_send_to_plugin_is_queued_until_acked() {
+    let pair = start_pair().await;
+    let (mut rb, mut wb, addr) = opencode_session(&pair.register_sock_b, "ses_acked").await;
+    let id = addr.split_once('@').unwrap().0.to_string();
+
+    let sent = send_via_agent_sock(&pair.node_a.agent_sock, &format!("{id}@node_b"), "held").await;
+    assert_eq!(sent["status"], "ok", "{sent}");
+    assert_eq!(sent["outcome"], "queued", "answered before the ack: {sent}");
+    let msg_id = sent["message_id"].as_str().unwrap().to_string();
+
+    let outcome_b = |msg_id: String| {
+        let sock = pair.http_sock_b.clone();
+        tokio::task::spawn_blocking(move || {
+            let (status, text) = xmsg::http::http_request_unix(
+                &sock,
+                "GET",
+                &format!("/v1/messages/{msg_id}"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(status.as_u16(), 200, "{text}");
+            let v: Value = serde_json::from_str(&text).unwrap();
+            v["outcome"].as_str().unwrap().to_string()
+        })
+    };
+    assert_eq!(outcome_b(msg_id.clone()).await.unwrap(), "queued");
+
+    wb.write_all(b"{\"action\":\"poll\",\"wait\":5,\"request_id\":\"r2\"}\n")
+        .await
+        .unwrap();
+    let got = read_json_line(&mut rb).await;
+    assert_eq!(got["message_id"], msg_id.as_str(), "{got}");
+    let ack = serde_json::json!({"action":"ack","session":"ses_acked","message_id":msg_id,"request_id":"r3"});
+    wb.write_all(format!("{ack}\n").as_bytes()).await.unwrap();
+    let acked = read_json_line(&mut rb).await;
+    assert_eq!(acked["status"], "ok", "{acked}");
+    assert_eq!(
+        outcome_b(msg_id.clone()).await.unwrap(),
+        "delivered",
+        "node_b after the ack"
+    );
+
+    let rec = xmsg::storage::get_message(&pair.node_a.db.lock().unwrap(), &msg_id)
+        .unwrap()
+        .expect("node_a's record");
+    assert_eq!(rec.outcome, "queued", "node_a keeps the answer it got");
 }
 
 /// K3 (a): an opencode session's send to another node is accepted there: the node-to-node

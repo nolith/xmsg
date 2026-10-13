@@ -460,9 +460,17 @@ pub fn complete_message(
     return_host: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE messages SET session_id = ?2, outcome = ?3, recipient_harness = ?4, return_host = ?5
-         WHERE id = ?1",
-        params![id, session_id, outcome, recipient_harness, return_host.unwrap_or("")],
+        // `queued` never replaces `delivered`: the ack can land before this send's record.
+        "UPDATE messages SET session_id = ?2,
+         outcome = CASE WHEN outcome = 'delivered' AND ?3 = 'queued' THEN outcome ELSE ?3 END,
+         recipient_harness = ?4, return_host = ?5 WHERE id = ?1",
+        params![
+            id,
+            session_id,
+            outcome,
+            recipient_harness,
+            return_host.unwrap_or("")
+        ],
     )?;
     Ok(())
 }
@@ -808,12 +816,17 @@ pub fn get_next_pending_pi_message(
     }
 }
 
+/// The harness took the message (HA3): its queue row is stamped and its record reads
+/// `delivered`.
 pub fn ack_pi_message(conn: &Connection, session_id: &str, message_id: &str) -> Result<bool> {
     let now = now_epoch_secs();
     let count = conn.execute(
         "UPDATE pi_pending_messages SET delivered_at = ?1 WHERE id = ?2 AND session_id = ?3 AND delivered_at IS NULL",
         params![now, message_id, session_id],
     )?;
+    if count > 0 {
+        update_message_outcome(conn, message_id, "delivered")?;
+    }
     Ok(count > 0)
 }
 
@@ -886,9 +899,13 @@ pub fn mark_agy_message_delivered(conn: &Connection, id: &str, delivered_at: i64
     Ok(count > 0)
 }
 
+/// `queued` never replaces `delivered`: an ack can land before the send that queued the
+/// message records its own outcome.
 pub fn update_message_outcome(conn: &Connection, id: &str, outcome: &str) -> Result<bool> {
     let count = conn.execute(
-        "UPDATE messages SET outcome = ?1 WHERE id = ?2",
+        "UPDATE messages
+         SET outcome = CASE WHEN outcome = 'delivered' AND ?1 = 'queued' THEN outcome ELSE ?1 END
+         WHERE id = ?2",
         params![outcome, id],
     )?;
     Ok(count > 0)
@@ -1744,6 +1761,41 @@ mod queue_tests {
             thread_id: id.into(),
             return_host: None,
         }
+    }
+
+    /// HA3: an ack that lands before the send (or the federated receiver) records its own
+    /// `queued` leaves the record `delivered`; any other outcome is recorded as given.
+    #[test]
+    fn an_early_ack_is_not_undone_by_queued() {
+        let c = Connection::open_in_memory().unwrap();
+        init_db(&c).unwrap();
+        let outcome = |id: &str| get_message(&c, id).unwrap().unwrap().outcome;
+        let pi = |id: &str| PiPendingMessage {
+            id: id.into(),
+            session_id: "s".into(),
+            created_at: now_epoch_secs(),
+            from_name: "f".into(),
+            bytes: 1,
+            text: "t".into(),
+            envelope: "e".into(),
+            delivered_at: None,
+        };
+        for id in ["L", "F"] {
+            upsert_message(&c, &msg(id, "", KEY_PENDING, "")).unwrap();
+            insert_pi_message(&c, &pi(id)).unwrap();
+            assert!(ack_pi_message(&c, "s", id).unwrap());
+            assert_eq!(outcome(id), "delivered", "{id}: the ack");
+        }
+        complete_message(&c, "L", "s", "queued", "opencode", None).unwrap();
+        update_message_outcome(&c, "F", "queued").unwrap();
+        assert_eq!(outcome("L"), "delivered", "the send's own record");
+        assert_eq!(outcome("F"), "delivered", "the federated receiver's record");
+        update_message_outcome(&c, "F", "delivery_failed").unwrap();
+        assert_eq!(
+            outcome("F"),
+            "delivery_failed",
+            "only `queued` is held back"
+        );
     }
 
     /// F2: keys left `pending` settle from what the database says reached the recipient.

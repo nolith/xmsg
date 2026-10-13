@@ -247,16 +247,32 @@ fn not_held(session: &str) -> AppError {
     ))
 }
 
-/// The next message pending for any session `conn_id` holds, as a `deliver` frame.
-fn next_delivery(conn: &Connection, conn_id: &str, node: &str) -> rusqlite::Result<Option<Value>> {
+/// The next message pending for a session `conn_id` holds, as a `deliver` frame. The
+/// sessions take turns, starting after `last`, the session served last on this connection:
+/// a head that is never acked (its injection refused) is offered again only after every
+/// other session's head, so it cannot starve them.
+fn next_delivery(
+    conn: &Connection,
+    conn_id: &str,
+    node: &str,
+    last: &Mutex<Option<String>>,
+) -> rusqlite::Result<Option<Value>> {
     let mut stmt = conn.prepare(
         "SELECT address, session FROM plugin_sessions WHERE conn = ?1 ORDER BY registered_at, rowid",
     )?;
-    let held: Vec<(String, String)> = stmt
+    let mut held: Vec<(String, String)> = stmt
         .query_map(params![conn_id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = last
+        .as_ref()
+        .and_then(|l| held.iter().position(|(a, _)| a == l))
+    {
+        held.rotate_left(i + 1);
+    }
     for (address, session) in held {
         if let Some(msg) = storage::get_next_pending_pi_message(conn, &address)? {
+            *last = Some(address.clone());
             return Ok(Some(json!({
                 "action": "deliver",
                 "session": session,
@@ -271,7 +287,12 @@ fn next_delivery(conn: &Connection, conn_id: &str, node: &str) -> rusqlite::Resu
     Ok(None)
 }
 
-async fn poll(state: &AppState, conn_id: &str, wait: u64) -> Result<Value, AppError> {
+async fn poll(
+    state: &AppState,
+    conn_id: &str,
+    wait: u64,
+    last: &Mutex<Option<String>>,
+) -> Result<Value, AppError> {
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(wait.min(surface::MAX_WAIT_SECS));
     // Subscribed before the first read, so no delivery between the two is missed.
@@ -281,6 +302,7 @@ async fn poll(state: &AppState, conn_id: &str, wait: u64) -> Result<Value, AppEr
             &*state.db.lock().map_err(db_err)?,
             conn_id,
             &state.node_name,
+            last,
         )
         .map_err(db_err)?
         {
@@ -347,6 +369,8 @@ where
     let mut tasks = tokio::task::JoinSet::new();
     // At most one pending `poll` per connection, so a message is delivered to one of them.
     let polling = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The session whose message this connection was served last (`next_delivery`).
+    let last_served = Arc::new(Mutex::new(None));
     let mut buf = Vec::new();
     let max_frame = state.max_body * 6 + 4096;
     loop {
@@ -486,10 +510,15 @@ where
                     let _ = tx.send(answer(Err(e), &request_id));
                     continue;
                 }
-                let (state, tx, conn_id, polling) =
-                    (state.clone(), tx.clone(), conn_id.clone(), polling.clone());
+                let (state, tx, conn_id, polling, last) = (
+                    state.clone(),
+                    tx.clone(),
+                    conn_id.clone(),
+                    polling.clone(),
+                    last_served.clone(),
+                );
                 tasks.spawn(async move {
-                    let res = poll(&state, &conn_id, wait.unwrap_or(30)).await;
+                    let res = poll(&state, &conn_id, wait.unwrap_or(30), &last).await;
                     // Free before answering, so a poll sent on this answer is accepted.
                     polling.store(false, std::sync::atomic::Ordering::SeqCst);
                     let _ = tx.send(answer(res, &request_id));

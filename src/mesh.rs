@@ -34,8 +34,8 @@ pub(crate) enum Dest {
     /// This node, resolving the reference locally.
     Local,
     /// The peer keyed `node`, and the recipient's own ID or service name there. `cached`
-    /// marks a location read from the cache (live-only); `id` marks an instance ID match,
-    /// the only kind cached.
+    /// marks a location read from the cache (live-only); `id` marks an instance ID listed
+    /// live there, the only kind cached.
     Peer {
         node: String,
         key: String,
@@ -146,7 +146,7 @@ fn within_user(ls: &[Listing]) -> Result<Dest, AppError> {
             .iter()
             .min_by_key(|l| (!l.local, l.node))
             .expect("at least one listing")
-            .dest(true)),
+            .dest(false)),
         _ => Err(AppError::Ambiguous(
             live.iter()
                 .map(|l| l.address())

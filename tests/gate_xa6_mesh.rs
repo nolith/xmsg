@@ -37,6 +37,8 @@ fn uri(node: &str) -> String {
 }
 
 const X: &str = "0a6a6a6a-0000-4000-8000-00000000000a";
+/// A live session whose node holds a send for its harness's ack: a pi or plugin session (HA3).
+const H: &str = "0a6a6a6a-0000-4000-8000-00000000000b";
 
 // -----------------------------------------------------------------------------
 // Fixtures
@@ -338,8 +340,8 @@ fn listing(entries: Vec<Value>) -> Listing {
 }
 
 /// An mTLS node presenting `creds`, admitting every pin in `clients`. It answers `list`
-/// with `l`, and takes every send: `queued` for an entry it lists parked, `delivered`
-/// otherwise. Returns its port, the `to.ref` of every send it took, and how many times it
+/// with `l`, and takes every send: `queued` for an entry it lists parked or for `H`,
+/// `delivered` otherwise. Returns its port, the `to.ref` of every send it took, and how many times it
 /// was asked for `list`.
 async fn stub(
     creds: &Creds,
@@ -407,10 +409,10 @@ async fn stub(
                                 ("POST", "/fed/v2/messages") => {
                                     let env: Value = serde_json::from_slice(&body).unwrap();
                                     let r = env["to"]["ref"].as_str().unwrap().to_string();
-                                    let parked = l
-                                        .entries
-                                        .iter()
-                                        .any(|e| e["id"] == r && e["status"] == "parked");
+                                    let parked = r == H
+                                        || l.entries
+                                            .iter()
+                                            .any(|e| e["id"] == r && e["status"] == "parked");
                                     sent.lock().unwrap().push(r.clone());
                                     (
                                         202,
@@ -1247,6 +1249,36 @@ async fn test_oracle_18_a_name_shaped_local_id_does_not_capture_a_name() {
             !impostor.got("to the service").await,
             "the conversation captured a name: {body}"
         );
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 19 (A-12, xh3-verify-v0 C3). H is listed live on `sini.a`, which answers `queued`:
+// a pi or plugin session, whose message is `delivered` only once its harness acks it. The
+// location is cached on the listing being live, not on the outcome, so the second bare H
+// is routed by the cache and asks no node.
+// Mutant: cache only on the outcome `delivered` => RED (the second send fans out again).
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_19_a_live_session_awaiting_its_ack_is_cached() {
+    run_with_port_retry(|| async {
+        let v = view(
+            "bob.c",
+            vec![("sini.a", listing(vec![inst(H, "live", "sini")]))],
+            &[],
+        )
+        .await;
+        for text in ["first", "second"] {
+            let (status, body) = http_send(&v.sender, H, text).await;
+            assert_eq!(status, 202, "{text}: {body}");
+            assert_eq!(body["outcome"], "queued", "{text}: {body}");
+        }
+        assert_eq!(
+            cache_row(&v.sender, H).map(|r| r.0).as_deref(),
+            Some("sini.a")
+        );
+        assert_eq!(v.lists_of("sini.a"), 1, "the second send asked for list");
     })
     .await;
 }

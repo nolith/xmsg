@@ -276,8 +276,8 @@ class Receiver:
 
 
 def acked(message_id):
-    """Whether a plugin session's queued message was acked. The send's `outcome` is `delivered` once
-    the message is queued; the ack is the queue row's `delivered_at` (src/storage.rs)."""
+    """Whether a plugin session's queued message was acked: the queue row's `delivered_at`
+    (src/storage.rs). The send's `outcome` is `queued` until the ack and `delivered` after it."""
     import sqlite3
     db = sqlite3.connect(f"file:{os.path.join(TMP, 'xmsg.db')}?mode=ro", uri=True)
     try:

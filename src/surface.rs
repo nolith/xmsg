@@ -531,7 +531,8 @@ pub(crate) async fn deliver(
             }
             let _ = local.pi_notify_tx.send(session.session_id.clone());
             let harness = crate::plugin::harness(&session.harness).unwrap_or("pi");
-            Ok((session.session_id.clone(), harness, "delivered"))
+            // `delivered` once the harness acks it (HA3): `storage::ack_pi_message`.
+            Ok((session.session_id.clone(), harness, "queued"))
         }
         ResolvedTarget::Svc(session) => {
             let svc_msg = storage::SvcPendingMessage {
@@ -825,11 +826,22 @@ pub async fn send(
                     )))
                 }
                 Reservation::Held(r) => {
+                    // The key follows its message's record, which a later delivery (an ack,
+                    // a drained queue) moves from `queued` to `delivered`.
+                    let outcome = match r.outcome.as_str() {
+                        "queued" => state
+                            .db
+                            .lock()
+                            .map_err(db_err)
+                            .and_then(|db| storage::get_message(&db, &r.message_id).map_err(db_err))?
+                            .map_or(r.outcome, |m| m.outcome),
+                        _ => r.outcome,
+                    };
                     return Ok(SendResult {
                         message_id: r.message_id,
                         address: r.session_id,
-                        outcome: r.outcome,
-                    })
+                        outcome,
+                    });
                 }
             }
         }
@@ -984,8 +996,11 @@ async fn deliver_send(
                 Err(e) => return Err(e),
             };
             let outcome = resp.outcome.unwrap_or_else(|| "delivered".to_string());
-            // Only a fresh resolution is cached, so a location is at most the TTL old (A-12).
-            if id && !cached && outcome == "delivered" {
+            // A live listing that took the message is cached, whether delivered or held for
+            // a live plugin or pi session's ack; a leaf's mailbox is not a live listing. Only
+            // a fresh resolution is cached, so a location is at most the TTL old (A-12).
+            let leaf = fed_state.peers.get(&peer_key).is_some_and(|p| p.leaf);
+            if id && !cached && !leaf {
                 crate::mesh::remember(state, &key, &peer_key);
             }
             let address = format!("{}@{peer_key}", resp.session_id);

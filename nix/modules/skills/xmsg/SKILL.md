@@ -53,8 +53,9 @@ Nothing is guessed: if more than one recipient matches, the error lists each can
 `address`, so they cannot drift to another instance. The outcome is one of:
 
 - `delivered`: the recipient has it;
-- `queued`: the instance is not running now. The message is held and delivered when it next runs, showing when
-  it was sent; anything older than the reply TTL (7 days by default) is dropped.
+- `queued`: the instance is not running now, or it is a pi, opencode or hermes session that has not yet taken
+  the message. The message is held and delivered when it next runs or takes it, showing when it was sent;
+  anything older than the reply TTL (7 days by default) is dropped.
 
 Your identity comes from your session; you never state it. A reply to your message is pushed into this session
 as a new message, so you do not need to wait or poll.
