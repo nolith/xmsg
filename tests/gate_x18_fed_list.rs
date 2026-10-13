@@ -484,7 +484,7 @@ async fn test_oracle_2_peer_without_list_allowed_403() {
     let res: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(res["recipients"], serde_json::json!([]), "{res}");
     assert_eq!(res["nodes"][0]["node"], "host-a", "{res}");
-    assert_eq!(res["nodes"][0]["status"], "denied", "{res}");
+    assert_eq!(res["nodes"][0]["status"], "unreachable", "{res}");
     let detail = res["nodes"][0]["detail"].as_str().unwrap();
     assert!(
         detail.contains("host-a") || detail.contains("list operation not allowed"),
@@ -885,9 +885,9 @@ async fn test_oracle_6_source_outside_from_cidr_refused() {
 
     // Node B connects from 127.0.0.1 to Node A
     let (entries, status) = list_peer(&node_b.fed_state, "host-a").await;
-    // A refusal by the peer's rights is `denied` (A13's one vocabulary), per node (A-12).
+    // A refusal by the peer's rights: the node could not be asked, `unreachable` (A-12).
     assert!(entries.is_empty(), "{entries:?}");
-    assert_eq!(status.status, "denied", "{status:?}");
+    assert_eq!(status.status, "unreachable", "{status:?}");
     let detail = status.detail.unwrap_or_default();
     assert!(
         detail.contains("host-a") || detail.contains("CIDR") || detail.contains("denied"),

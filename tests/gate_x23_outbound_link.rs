@@ -196,6 +196,7 @@ async fn spawn_hub_node(
         let bin = env!("CARGO_BIN_EXE_xmsg");
         let child = tokio::process::Command::new(bin)
             .env("XDG_RUNTIME_DIR", &run_dir)
+            .env("HOME", &run_dir)
             .args([
                 "serve",
                 "--listen",
@@ -325,7 +326,7 @@ async fn spawn_client_node(
 
     let bin = env!("CARGO_BIN_EXE_xmsg");
     let mut cmd = tokio::process::Command::new(bin);
-    cmd.env("XDG_RUNTIME_DIR", &run_dir);
+    cmd.env("XDG_RUNTIME_DIR", &run_dir).env("HOME", &run_dir);
     cmd.args([
         "serve",
         "--listen",
@@ -693,6 +694,7 @@ async fn test_oracle_4_off_by_default_no_pull_loop() {
     let bin = env!("CARGO_BIN_EXE_xmsg");
     let child = tokio::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", &run_dir)
+        .env("HOME", &run_dir)
         .env("RUST_LOG", "info")
         .args([
             "serve",

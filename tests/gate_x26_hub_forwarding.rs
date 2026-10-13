@@ -192,6 +192,7 @@ async fn spawn_test_node(
     let bin = env!("CARGO_BIN_EXE_xmsg");
     let child = tokio::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", &run_dir)
+        .env("HOME", &run_dir)
         .args([
             "serve",
             "--listen",

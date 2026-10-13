@@ -76,6 +76,7 @@ impl Node {
         let exe = std::env::current_exe().unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_xmsg"));
         cmd.env("XDG_RUNTIME_DIR", self.dir.join("run"))
+            .env("HOME", &self.dir)
             .arg("serve")
             .arg("--db-path")
             .arg(&self.db)

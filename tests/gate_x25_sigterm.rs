@@ -80,6 +80,7 @@ async fn spawn_full_node(tmp: Option<TempDir>) -> FullNodeFixture {
     let bin = env!("CARGO_BIN_EXE_xmsg");
     let child = tokio::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", &run_dir)
+        .env("HOME", &run_dir)
         .env("RUST_LOG", "info")
         .args([
             "serve",
@@ -170,6 +171,7 @@ async fn spawn_leaf_node() -> LeafNodeFixture {
     let bin = env!("CARGO_BIN_EXE_xmsg");
     let child = tokio::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", &run_dir)
+        .env("HOME", &run_dir)
         .env("RUST_LOG", "info")
         .args([
             "serve",
@@ -352,6 +354,7 @@ async fn test_oracle_3_unacked_message_persists_across_sigterm_restart() {
     // 1. Spawn node first time
     let child1 = tokio::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", &run_dir)
+        .env("HOME", &run_dir)
         .env("RUST_LOG", "info")
         .args([
             "serve",
@@ -451,6 +454,7 @@ async fn test_oracle_3_unacked_message_persists_across_sigterm_restart() {
     // 6. Spawn node second time with SAME db_path
     let child2 = tokio::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", &run_dir)
+        .env("HOME", &run_dir)
         .env("RUST_LOG", "info")
         .args([
             "serve",
@@ -552,6 +556,8 @@ async fn test_oracle_4_pid_1_unshare_container_sigterm_clean_shutdown() {
             "--pid",
             "--fork",
             "--forward-signals",
+            "env",
+            &format!("HOME={}", run_dir.display()),
             bin,
             "serve",
             "--db-path",

@@ -2386,6 +2386,42 @@ pub async fn deliver_federated_reply_locally(
     Ok(push_res)
 }
 
+/// Federated reply authorization: is `replier` the recipient `outbound` records (A7)?
+/// - A peer that answered the send resolved the reference first, so the record holds the
+///   instance ID or service name it reported, and only that key may reply.
+/// - A send queued for a dial-out client is resolved there, later, so the record holds the
+///   reference as typed. The replier must be what that reference resolves to by the
+///   resolver's own steps: its ID, its service name, or its label.
+/// - A queued send may instead get the client's own `not_found` error reply, which a
+///   service sends (the leaf principal, or `system`), never the recipient. Only a reply
+///   that is exactly that error object is admitted on that ground.
+fn replier_is_recipient(
+    o: &storage::OutboundRecord,
+    replier: &storage::Origin,
+    text: &str,
+) -> bool {
+    let typed = split_peer_ref(&o.target_ref).map_or(o.target_ref.as_str(), |(r, _)| r);
+    if replier.key() == Some(typed) {
+        return true;
+    }
+    o.outcome == "queued"
+        && ((replier.id.is_some() && replier.label.as_deref() == Some(typed))
+            || (replier.service.is_some() && is_not_found_reply(text)))
+}
+
+/// `{"error": "not_found", "detail": …}` and nothing else: a dial-out client's answer
+/// that a queued message has no recipient there.
+fn is_not_found_reply(text: &str) -> bool {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ErrorReply {
+        error: String,
+        #[allow(dead_code)]
+        detail: String,
+    }
+    serde_json::from_str::<ErrorReply>(text).is_ok_and(|e| e.error == "not_found")
+}
+
 async fn fed_reply_handler(
     State(fed_state): State<Arc<FedState>>,
     Extension(peer): Extension<Arc<AuthenticatedPeer>>,
@@ -2457,15 +2493,17 @@ async fn fed_reply_handler(
             .map_err(|e| AppError::Internal(e.to_string()))?
     };
 
-    let outbound = match outbound {
-        Some(o) if o.peer == peer.name => o,
-        _ => {
-            return Err(AppError::NotRecipient(format!(
-                "in_reply_to '{}' not authorized for peer '{}'",
-                reply.in_reply_to, peer.name
-            )));
-        }
-    };
+    if !outbound
+        .as_ref()
+        .is_some_and(|o| o.peer == peer.name && replier_is_recipient(o, &replier, &reply.text))
+    {
+        return Err(AppError::NotRecipient(format!(
+            "in_reply_to '{}' not authorized for replier '{}' of peer '{}'",
+            reply.in_reply_to,
+            replier.key().unwrap_or("anon"),
+            peer.name
+        )));
+    }
 
     // 3. Check if this is a reply to a forwarded message (hub forwarding case)
     let forwarded = {
@@ -2537,7 +2575,6 @@ async fn fed_reply_handler(
         storage::get_message(&db, &reply.in_reply_to)
             .map_err(|e| AppError::Internal(e.to_string()))?
     };
-    let _ = outbound;
 
     if let Some((ret_harness, ret_session_id)) = orig_msg
         .as_ref()
@@ -3900,8 +3937,10 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
 /// The bound on asking one node for its `list` (D14).
 pub const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How one node answered a `list` (A-12): `ok`, `unreachable`, `timeout`, or `denied` when
-/// its entry for this node withholds `list` (gate v0 C4).
+/// How one node answered a `list` (A-12): `ok`, `unreachable` or `timeout`. A node that
+/// withholds `list` counts as one that could not be asked (gate v0 C4): `unreachable`, with
+/// the detail `withholds list`. So does a dial-out client that does not answer in time
+/// (A-1).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NodeStatus {
@@ -3948,28 +3987,33 @@ pub async fn list_peer(fed_state: &FedState, peer_key: &str) -> (Vec<FedListEntr
     };
     let Ok(res) = tokio::time::timeout(LIST_TIMEOUT, asked).await else {
         let detail = format!("did not answer `list` within {}s", LIST_TIMEOUT.as_secs());
-        return (
-            Vec::new(),
-            NodeStatus::failed(&peer.name, "timeout", detail),
-        );
+        let status = if peer.leaf { "unreachable" } else { "timeout" };
+        return (Vec::new(), NodeStatus::failed(&peer.name, status, detail));
     };
     match res {
         Ok((answer, user)) => match answer {
             FedListAnswer::Ok { entries } => {
                 (admit_entries(entries, &user), NodeStatus::ok(&peer.name))
             }
-            FedListAnswer::Denied => (
-                Vec::new(),
-                NodeStatus::failed(&peer.name, "denied", "withholds `list`".to_string()),
-            ),
+            FedListAnswer::Denied => (Vec::new(), withholds_list(&peer.name)),
         },
-        Err(AppError::OpDenied(d)) => (Vec::new(), NodeStatus::failed(&peer.name, "denied", d)),
+        Err(AppError::OpDenied(d)) => (
+            Vec::new(),
+            NodeStatus::failed(&peer.name, "unreachable", format!("{WITHHOLDS_LIST}: {d}")),
+        ),
         Err(e) => (
             Vec::new(),
             NodeStatus::failed(&peer.name, "unreachable", e.to_string()),
         ),
     }
 }
+
+fn withholds_list(node: &str) -> NodeStatus {
+    NodeStatus::failed(node, "unreachable", WITHHOLDS_LIST.to_string())
+}
+
+/// The detail of a node that withholds `list` from the asker.
+pub const WITHHOLDS_LIST: &str = "withholds list";
 
 /// A dial-out client is asked through its mailbox: the query wakes its waiting long-poll,
 /// and it answers on `/fed/v2/list/{query}` (AM-1). Unbounded here; `list_peer` bounds it.

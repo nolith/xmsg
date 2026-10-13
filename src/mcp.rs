@@ -428,7 +428,7 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "list",
-            "description": "List the recipients you can message, on this node and every node it can reach: each entry gives its address (id@node for an instance, name@node for a service), its kind (service or instance), its label, its status (live or parked) and the user it belongs to; nodes gives each node asked as ok, unreachable, timeout or denied. Filter by name, node or kind; node asks only that node.",
+            "description": "List the recipients you can message, on this node and every node it can reach: each entry gives its address (id@node for an instance, name@node for a service), its kind (service or instance), its label, its status (live or parked) and the user it belongs to; nodes gives each node asked as ok, unreachable or timeout (a node that withholds list is unreachable, detail withholds list). Filter by name, node or kind; node asks only that node.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -25,9 +25,19 @@ Call **`list`**, optionally with `name`, `node` or `kind` (`service` or `instanc
 - `address`: `id@node` or `name@node`;
 - `kind`: `service` or `instance`;
 - `label`: an instance's own description (a service has none);
-- `status`.
+- `status`: `live`, or `parked` for an instance that is not running now and would be queued for;
+- `user`: the user the recipient belongs to.
 
-`node` lists that node instead of this one.
+Without `node`, `list` covers this node and every node it can reach. With `node`, it asks only that node.
+
+Beside the entries, `nodes` gives each node asked and its status:
+
+- `ok`: it answered;
+- `unreachable`: it could not be asked. A node that withholds `list` from yours is `unreachable`, with the
+  detail `withholds list`;
+- `timeout`: it did not answer in time.
+
+A node that is not `ok` lists nothing, so its recipients are missing from the list, not absent from the node.
 
 ## Sending: `send`
 

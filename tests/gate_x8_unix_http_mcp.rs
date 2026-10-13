@@ -247,6 +247,7 @@ async fn test_oracle_2_no_flag_no_tcp_bound() {
     let db_path = temp_dir.path().join("db.sqlite");
 
     let mut server = Command::new(bin)
+        .env("HOME", temp_dir.path())
         .args([
             "serve",
             "--http-sock",

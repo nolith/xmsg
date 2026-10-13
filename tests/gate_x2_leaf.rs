@@ -72,6 +72,7 @@ async fn test_oracle_1_leaf_binds_no_harness_sockets_or_fed_listener() {
 
         let mut child = std::process::Command::new(bin)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("HOME", &runtime_dir)
             .args([
                 "serve",
                 "--leaf",
@@ -771,6 +772,7 @@ async fn test_oracle_4_leaf_with_fed_listen_refused_at_start() {
     let bin = env!("CARGO_BIN_EXE_xmsg");
     let child = tokio::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", tmp.path())
+        .env("HOME", tmp.path())
         .args([
             "serve",
             "--leaf",

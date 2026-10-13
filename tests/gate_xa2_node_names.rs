@@ -192,6 +192,7 @@ async fn spawn_node(spec: NodeSpec, prepared: Option<(TempDir, PathBuf)>) -> Res
 
     let mut cmd = tokio::process::Command::new(BIN);
     cmd.env("XDG_RUNTIME_DIR", &run_dir)
+        .env("HOME", &run_dir)
         .env("RUST_LOG", "warn")
         .env_remove("XMSG_HOST_LABEL")
         .args(&args)

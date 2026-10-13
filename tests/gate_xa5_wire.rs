@@ -214,6 +214,7 @@ async fn start(
 
     let mut child = tokio::process::Command::new(BIN)
         .env("XDG_RUNTIME_DIR", &run_dir)
+        .env("HOME", &run_dir)
         .env("RUST_LOG", "warn")
         .args(&args)
         .stdout(std::process::Stdio::piped())
@@ -385,6 +386,18 @@ fn node_status(listed: &Value, node: &str) -> String {
         .to_string()
 }
 
+fn node_detail(listed: &Value, node: &str) -> String {
+    listed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["node"] == node)
+        .unwrap_or_else(|| panic!("no status for {node}: {listed}"))["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// An anonymous HTTP send from `ci` over the node's TCP listener: (status, body).
 async fn http_send(node: &Node, to: &str, text: &str) -> (u16, Value) {
     let url = format!("http://127.0.0.1:{}/v1/messages", node.http_port);
@@ -472,29 +485,29 @@ struct Mesh {
     _ca: Ca,
 }
 
-/// A (`sini.a`), B (`eve.b`) and L (`guard.genie`, a leaf of A). `b_allows_list` is B's
-/// right for A; `extra_a_peers` are further entries in A's peers file.
-async fn mesh(b_allows_list: bool, extra_a_peers: Vec<(String, Value)>) -> Mesh {
+/// A (`sini.a`), B (`eve.b`) and L (`guard.genie`, a leaf of A). `b_allows_list` and
+/// `l_allows_list` are B's and L's `list` rights for A.
+async fn mesh(b_allows_list: bool, l_allows_list: bool) -> Mesh {
     let ca = Ca::new();
     let (ca_a, ca_b, ca_l) = (ca.issue(URI_A), ca.issue(URI_B), ca.issue(URI_L));
     let (pa, pb, pl) = (prepare(&ca), prepare(&ca), prepare(&ca));
 
-    let mut peers_a = json!({
+    let peers_a = json!({
         "eve.b": ca_entry(pb.fed_port, &pa.ca_file(), URI_B, &["send", "reply", "list"]),
         "guard.genie": leaf_entry(&pa.ca_file(), URI_L, &["send", "reply", "inbox"]),
     });
-    for (k, v) in extra_a_peers {
-        peers_a[k] = v;
-    }
     let b_allow: &[&str] = if b_allows_list {
         &["send", "reply", "list"]
     } else {
         &["send", "reply"]
     };
     let peers_b = json!({ "sini.a": ca_entry(pa.fed_port, &pb.ca_file(), URI_A, b_allow) });
-    let peers_l = json!({
-        "sini.a": ca_entry(pa.fed_port, &pl.ca_file(), URI_A, &["send", "reply", "inbox", "list"]),
-    });
+    let l_allow: &[&str] = if l_allows_list {
+        &["send", "reply", "inbox", "list"]
+    } else {
+        &["send", "reply", "inbox"]
+    };
+    let peers_l = json!({ "sini.a": ca_entry(pa.fed_port, &pl.ca_file(), URI_A, l_allow) });
 
     let b = start(pb, &ca_b, peers_b, None, None).await;
     let a = start(pa, &ca_a, peers_a, None, None).await;
@@ -623,7 +636,7 @@ fn lying_lister(method: &str, path: &str) -> (u16, Option<Value>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_oracle_1_mesh_list_and_send_to_each() {
     run_with_port_retry(|| async {
-        let mut m = mesh(true, Vec::new()).await;
+        let mut m = mesh(true, true).await;
         let listed = list(&m.a, Duration::from_secs(15)).await;
         let addrs = addresses(&listed);
         for (addr, user) in [
@@ -643,10 +656,16 @@ async fn test_oracle_1_mesh_list_and_send_to_each() {
         for n in ["sini.a", "eve.b", "guard.genie"] {
             assert_eq!(node_status(&listed, n), "ok", "{listed}");
         }
-        // Only the fixtures are sent to: the host's own live sessions (an agy conversation
-        // on the machine running the test) may be listed too.
-        for addr in ["alice@sini.a", "bob@eve.b", "guard@guard.genie"] {
-            assert!(addrs.iter().any(|a| a == addr), "{listed}");
+        // Exactly the fixtures: each node runs with HOME in its tempdir, so nothing of the
+        // host's (an agy conversation on the machine running the test) is listed (§1a).
+        let mut sorted = addrs.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            ["alice@sini.a", "bob@eve.b", "guard@guard.genie"],
+            "{listed}"
+        );
+        for addr in &addrs {
             let (status, sent) = http_send(&m.a, addr, &format!("to {addr}")).await;
             assert_eq!(status, 202, "send to {addr}: {sent}");
         }
@@ -661,14 +680,15 @@ async fn test_oracle_1_mesh_list_and_send_to_each() {
 }
 
 // =============================================================================
-// Oracle 2: Unreachable. With L disconnected, `list` on A reports L `unreachable` or
-// `timeout` within the list timeout (D14), and the rest of the result still comes back.
+// Oracle 2: Unreachable. With L disconnected, `list` on A reports L `unreachable` within the
+// list timeout (D14; A-1: a dial-out node that does not answer is `unreachable`), and the
+// rest of the result still comes back.
 // Mutant: wait without a bound. Run under a timeout => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_oracle_2_disconnected_dial_out_client_is_bounded() {
     run_with_port_retry(|| async {
-        let mut m = mesh(true, Vec::new()).await;
+        let mut m = mesh(true, true).await;
         m.l.stop().await;
         let t = Instant::now();
         let listed = list(&m.a, Duration::from_secs(15)).await;
@@ -677,9 +697,9 @@ async fn test_oracle_2_disconnected_dial_out_client_is_bounded() {
             took < xmsg::fed::LIST_TIMEOUT + Duration::from_secs(3),
             "list took {took:?}: {listed}"
         );
-        let l_status = node_status(&listed, "guard.genie");
-        assert!(
-            l_status == "unreachable" || l_status == "timeout",
+        assert_eq!(
+            node_status(&listed, "guard.genie"),
+            "unreachable",
             "{listed}"
         );
         assert_eq!(node_status(&listed, "eve.b"), "ok", "{listed}");
@@ -696,15 +716,20 @@ async fn test_oracle_2_disconnected_dial_out_client_is_bounded() {
 
 // =============================================================================
 // Oracle 3: Rights. B withholds `list` from A, so B's entries are absent and its status
-// says so (gate v0 C4).
+// says so: `unreachable`, detail `withholds list` (gate v0 C4; A-12's statuses are `ok`,
+// `unreachable` and `timeout`).
 // Mutant: ignore the right => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_oracle_3_withheld_list_is_reported() {
     run_with_port_retry(|| async {
-        let m = mesh(false, Vec::new()).await;
+        let m = mesh(false, true).await;
         let listed = list(&m.a, Duration::from_secs(15)).await;
-        assert_eq!(node_status(&listed, "eve.b"), "denied", "{listed}");
+        assert_eq!(node_status(&listed, "eve.b"), "unreachable", "{listed}");
+        assert!(
+            node_detail(&listed, "eve.b").starts_with("withholds list"),
+            "{listed}"
+        );
         let addrs = addresses(&listed);
         assert!(!addrs.iter().any(|a| a.ends_with("@eve.b")), "{listed}");
         assert!(addrs.contains(&"alice@sini.a".to_string()), "{listed}");
@@ -988,6 +1013,256 @@ async fn test_oracle_8_relay_carries_the_origin_and_one_hop() {
             bob_on_a.lock().unwrap().is_empty(),
             "nothing is forwarded a second time"
         );
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 3b: Rights on a dial-out client (AM-1). L withholds `list` from A: it answers
+// `denied` from its mailbox, A reports it `unreachable`, detail `withholds list`, and lists
+// none of L's entries.
+// Mutants: L ignores its own right => RED; A reports the denied answer `ok` => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_3b_dial_out_client_withholding_list_is_reported() {
+    run_with_port_retry(|| async {
+        let m = mesh(true, false).await;
+        let listed = list(&m.a, Duration::from_secs(15)).await;
+        assert_eq!(
+            node_status(&listed, "guard.genie"),
+            "unreachable",
+            "{listed}"
+        );
+        assert_eq!(
+            node_detail(&listed, "guard.genie"),
+            "withholds list",
+            "{listed}"
+        );
+        let addrs = addresses(&listed);
+        assert!(
+            !addrs.iter().any(|a| a.ends_with("@guard.genie")),
+            "{listed}"
+        );
+        assert!(addrs.contains(&"bob@eve.b".to_string()), "{listed}");
+    })
+    .await;
+}
+
+const URI_W: &str = "spiffe://xa5.test/host/w/user/sini";
+const URI_X: &str = "spiffe://xa5.test/host/x/user/sini";
+
+// =============================================================================
+// Oracle 9: A `list` answer is taken only from the dial-out client asked (AM-1). A has two
+// dial-out clients, W and X (wire clients). X's answer to W's query is refused 404; W's own
+// is taken.
+// Mutant: take an answer from any peer => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_9_list_answer_from_another_peer_is_refused() {
+    run_with_port_retry(|| async {
+        let ca = Ca::new();
+        let (ca_a, ca_w, ca_x) = (ca.issue(URI_A), ca.issue(URI_W), ca.issue(URI_X));
+        let pa = prepare(&ca);
+        let allow = &["send", "reply", "inbox", "list"];
+        let peers_a = json!({
+            "sini.w": leaf_entry(&pa.ca_file(), URI_W, allow),
+            "sini.x": leaf_entry(&pa.ca_file(), URI_X, allow),
+        });
+        let a = Arc::new(start(pa, &ca_a, peers_a, None, None).await);
+        let asker = {
+            let a = a.clone();
+            tokio::spawn(async move { list(&a, Duration::from_secs(15)).await })
+        };
+        let w = Origin {
+            cert_der: &ca_w.cert_der,
+            key_der: &ca_w.key_der,
+        };
+        let x = Origin {
+            cert_der: &ca_x.cert_der,
+            key_der: &ca_x.key_der,
+        };
+        let (status, item) =
+            hop_client::request(&w, &ca_a.pin, a.fed_port, "GET", "/fed/v2/inbox?wait=5", None)
+                .await;
+        assert_eq!(status, 200, "{item}");
+        assert_eq!(item["kind"], "list", "{item}");
+        let uri = format!("/fed/v2/list/{}", item["query"].as_str().unwrap());
+        let answer = |id: &str| {
+            json!({ "status": "ok",
+                    "entries": [{ "id": id, "kind": "service", "status": "live", "user": "sini" }] })
+        };
+        let (status, res) =
+            hop_client::request(&x, &ca_a.pin, a.fed_port, "POST", &uri, Some(answer("forged")))
+                .await;
+        assert_eq!(status, 404, "X answers W's query: {res}");
+        let (status, res) =
+            hop_client::request(&w, &ca_a.pin, a.fed_port, "POST", &uri, Some(answer("wsvc")))
+                .await;
+        assert_eq!(status, 200, "W answers its own query: {res}");
+        let listed = asker.await.unwrap();
+        assert_eq!(node_status(&listed, "sini.w"), "ok", "{listed}");
+        let addrs = addresses(&listed);
+        assert!(addrs.contains(&"wsvc@sini.w".to_string()), "{listed}");
+        assert!(!addrs.iter().any(|a| a.starts_with("forged@")), "{listed}");
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 10: The forward mark (X26, N-2). B refuses an envelope from O whose mark names a
+// forwarder other than O, the peer that authenticated (400). The same envelope marked by O
+// is taken.
+// Mutant: accept any forwarder => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_10_forward_mark_names_the_authenticated_peer() {
+    run_with_port_retry(|| async {
+        let ca = Ca::new();
+        let (ca_b, ca_o) = (ca.issue(URI_B), ca.issue(URI_O));
+        let pb = prepare(&ca);
+        let peers_b = json!({
+            "sini.o": ca_entry(get_free_port(), &pb.ca_file(), URI_O, &["send", "relayed"]),
+        });
+        let b = start(pb, &ca_b, peers_b, None, None).await;
+        let bob = claude_session(&b.sessions_dir, "bob", "Bob");
+        let o = Origin {
+            cert_der: &ca_o.cert_der,
+            key_der: &ca_o.key_der,
+        };
+        let marked = |forwarder: &str, body: &str| {
+            let mut env = hop_client::envelope("alice", "Alice", "bob", body);
+            env["forwarded"] = json!({ "forwarder": forwarder });
+            env
+        };
+        let (status, res) =
+            hop_client::send_envelope(&o, &ca_b.pin, b.fed_port, marked("sini.h", "marked by h"))
+                .await;
+        assert_eq!(status, 400, "{res}");
+        let (status, res) =
+            hop_client::send_envelope(&o, &ca_b.pin, b.fed_port, marked("sini.o", "marked by o"))
+                .await;
+        assert_eq!(status, 202, "{res}");
+        assert!(wait_line(&bob, "marked by o").await.is_some());
+        assert!(
+            !bob.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("marked by h")),
+            "nothing marked by another forwarder is delivered"
+        );
+    })
+    .await;
+}
+
+/// A node that takes every send and reports it delivered to `bob`.
+fn delivering_peer(method: &str, path: &str) -> (u16, Option<Value>) {
+    match (method, path) {
+        ("POST", "/fed/v2/messages") => (
+            202,
+            Some(json!({
+                "sessionId": "bob", "fromName": "ci", "bytes": 1, "messageId": "m",
+                "outcome": "delivered",
+            })),
+        ),
+        _ => (404, None),
+    }
+}
+
+/// A reply on `/fed/v2/replies` from `peer` to the node at `port`: its HTTP status.
+async fn fed_reply(
+    peer: &Origin<'_>,
+    pin: &str,
+    port: u16,
+    in_reply_to: &str,
+    replier: Value,
+    text: &str,
+) -> u16 {
+    let env = json!({
+        "v": 2, "id": ulid::Ulid::new().to_string(), "in_reply_to": in_reply_to,
+        "replier": replier, "text": text, "created_at": 1000,
+    });
+    hop_client::request(peer, pin, port, "POST", "/fed/v2/replies", Some(env))
+        .await
+        .0
+}
+
+// =============================================================================
+// Oracle 11: Federated reply authorization (A7; `outbound` holds the resolved `id@node`).
+// A reply is taken only from the recipient the send recorded.
+// - S, a direct peer, answered the send to `bob@eve.s` with `bob`: a reply from S as
+//   `mallory` is refused 403, one as `bob` is taken.
+// - A send to `Bobby@sini.w` is queued for W, a dial-out client, and resolved there: a reply
+//   as `mallory`, or from a service that is not an error reply, is refused; one from the
+//   instance labelled `Bobby` is taken.
+// - A send to `nobody@sini.w` takes W's `not_found` error reply from a service, and the same
+//   error reply from an instance is refused.
+// Mutant: accept any replier from the right peer => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_11_reply_only_from_the_recorded_recipient() {
+    run_with_port_retry(|| async {
+        let ca = Ca::new();
+        let (ca_a, ca_s, ca_w) = (ca.issue(URI_A), ca.issue(URI_S), ca.issue(URI_W));
+        let pa = prepare(&ca);
+        let (s_port, _) = stub_peer(&ca_s, &ca_a.pin, delivering_peer).await;
+        let peers_a = json!({
+            "eve.s": ca_entry(s_port, &pa.ca_file(), URI_S, &["send", "reply"]),
+            "sini.w": leaf_entry(&pa.ca_file(), URI_W, &["send", "reply", "inbox"]),
+        });
+        let a = start(pa, &ca_a, peers_a, None, None).await;
+        let s = Origin {
+            cert_der: &ca_s.cert_der,
+            key_der: &ca_s.key_der,
+        };
+        let w = Origin {
+            cert_der: &ca_w.cert_der,
+            key_der: &ca_w.key_der,
+        };
+        let pin = ca_a.pin.as_str();
+        let mallory = json!({ "id": "mallory", "node": "x", "label": "Mallory" });
+        let system = json!({ "service": "system", "node": "x" });
+
+        // Resolved by the peer that answered.
+        let (status, sent) = http_send(&a, "bob@eve.s", "for bob").await;
+        assert_eq!(status, 202, "{sent}");
+        let id = sent["message_id"].as_str().unwrap();
+        let bob = json!({ "id": "bob", "node": "x" });
+        assert_eq!(
+            fed_reply(&s, pin, a.fed_port, id, mallory.clone(), "forged").await,
+            403
+        );
+        assert_eq!(
+            fed_reply(&s, pin, a.fed_port, id, bob, "from bob").await,
+            200
+        );
+
+        // Queued for a dial-out client, resolved there by label.
+        let (status, sent) = http_send(&a, "Bobby@sini.w", "for bobby").await;
+        assert_eq!(status, 202, "{sent}");
+        assert_eq!(sent["outcome"], "queued", "{sent}");
+        let id = sent["message_id"].as_str().unwrap();
+        let bobby = json!({ "id": "b0b", "node": "x", "label": "Bobby" });
+        assert_eq!(
+            fed_reply(&w, pin, a.fed_port, id, mallory.clone(), "forged").await,
+            403
+        );
+        assert_eq!(
+            fed_reply(&w, pin, a.fed_port, id, system.clone(), "forged").await,
+            403
+        );
+        assert_eq!(
+            fed_reply(&w, pin, a.fed_port, id, bobby, "from bobby").await,
+            200
+        );
+
+        // The dial-out client's own error reply.
+        let (status, sent) = http_send(&a, "nobody@sini.w", "for nobody").await;
+        assert_eq!(status, 202, "{sent}");
+        let id = sent["message_id"].as_str().unwrap();
+        let err = json!({ "error": "not_found", "detail": "no live session matches 'nobody'" })
+            .to_string();
+        assert_eq!(fed_reply(&w, pin, a.fed_port, id, mallory, &err).await, 403);
+        assert_eq!(fed_reply(&w, pin, a.fed_port, id, system, &err).await, 200);
     })
     .await;
 }

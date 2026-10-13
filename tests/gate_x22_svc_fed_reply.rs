@@ -367,6 +367,7 @@ async fn test_oracle_1_full_node_svc_federated_reply() {
         let bin = env!("CARGO_BIN_EXE_xmsg");
         let child = tokio::process::Command::new(bin)
             .env("XDG_RUNTIME_DIR", &sock_dir_b)
+            .env("HOME", &sock_dir_b)
             .args([
                 "serve",
                 "--listen",

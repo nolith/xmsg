@@ -3555,7 +3555,7 @@ async fn test_n1_offsource_flood_leaves_legit_bucket_intact() {
             id: ulid::Ulid::new().to_string(),
             in_reply_to: orig,
             replier: xmsg::storage::Origin {
-                id: Some("legit".to_string()),
+                id: Some("sess-b".to_string()),
                 service: None,
                 node: "origin-claim".into(),
                 label: Some("agent-a".to_string()),
@@ -3703,6 +3703,7 @@ async fn test_n5_tls_key_load_failure_fatal_at_startup() {
     let bin = env!("CARGO_BIN_EXE_xmsg");
     let mut child = tokio::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", tmp.path())
+        .env("HOME", tmp.path())
         .args([
             "serve",
             "--listen",
@@ -3909,6 +3910,7 @@ async fn test_n7_f6_bind_fatal() {
     let bin = env!("CARGO_BIN_EXE_xmsg");
     let output = std::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", tmp.path())
+        .env("HOME", tmp.path())
         .args([
             "serve",
             "--listen",
@@ -3959,6 +3961,7 @@ async fn test_n7_f6_unspecified_address_binds() {
     let bin = env!("CARGO_BIN_EXE_xmsg");
     let mut child = std::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", tmp.path())
+        .env("HOME", tmp.path())
         .args([
             "serve",
             "--listen",
@@ -4019,6 +4022,7 @@ async fn test_n7_f6_cert_key_required() {
     let bin = env!("CARGO_BIN_EXE_xmsg");
     let output = std::process::Command::new(bin)
         .env("XDG_RUNTIME_DIR", tmp.path())
+        .env("HOME", tmp.path())
         .args([
             "serve",
             "--listen",

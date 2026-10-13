@@ -1196,6 +1196,7 @@ async fn test_oracle_7_startup_refusal_leaf_with_svc_exe() {
     fs::write(&peers_file, "{}").unwrap();
 
     let output = std::process::Command::new(bin)
+        .env("HOME", tmp.path())
         .args([
             "serve",
             "--leaf",
