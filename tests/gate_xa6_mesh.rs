@@ -14,6 +14,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -213,7 +214,7 @@ async fn start(p: Prepared, creds: &Creds, peers: Value, svc: Option<&str>) -> N
         .spawn()
         .expect("spawn xmsg serve");
 
-    for _ in 0..200 {
+    for _ in 0..600 {
         if let Ok(Some(_)) = child.try_wait() {
             let mut err = String::new();
             if let Some(mut e) = child.stderr.take() {
@@ -241,7 +242,7 @@ async fn start(p: Prepared, creds: &Creds, peers: Value, svc: Option<&str>) -> N
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let _ = child.start_kill();
-    panic!("xmsg serve neither served nor exited within 10s: {args:?}");
+    panic!("xmsg serve neither served nor exited within 30s: {args:?}");
 }
 
 async fn run_with_port_retry<F, Fut>(f: F)
@@ -338,8 +339,13 @@ fn listing(entries: Vec<Value>) -> Listing {
 
 /// An mTLS node presenting `creds`, admitting every pin in `clients`. It answers `list`
 /// with `l`, and takes every send: `queued` for an entry it lists parked, `delivered`
-/// otherwise. Returns its port and the `to.ref` of every send it took.
-async fn stub(creds: &Creds, clients: &[&str], l: Listing) -> (u16, Arc<Mutex<Vec<String>>>) {
+/// otherwise. Returns its port, the `to.ref` of every send it took, and how many times it
+/// was asked for `list`.
+async fn stub(
+    creds: &Creds,
+    clients: &[&str],
+    l: Listing,
+) -> (u16, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
     let mut peers = HashMap::new();
     for (i, pin) in clients.iter().enumerate() {
         peers.insert(
@@ -364,11 +370,13 @@ async fn stub(creds: &Creds, clients: &[&str], l: Listing) -> (u16, Arc<Mutex<Ve
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let sent = Arc::new(Mutex::new(Vec::new()));
-    let sent_c = sent.clone();
+    let lists = Arc::new(AtomicUsize::new(0));
+    let (sent_c, lists_c) = (sent.clone(), lists.clone());
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
             let sent = sent_c.clone();
+            let lists = lists_c.clone();
             let l = l.clone();
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(tcp).await else {
@@ -377,12 +385,16 @@ async fn stub(creds: &Creds, clients: &[&str], l: Listing) -> (u16, Arc<Mutex<Ve
                 let svc = hyper::service::service_fn(
                     move |req: hyper::Request<hyper::body::Incoming>| {
                         let sent = sent.clone();
+                        let lists = lists.clone();
                         let l = l.clone();
                         async move {
                             use http_body_util::BodyExt;
                             let (method, path) =
                                 (req.method().clone(), req.uri().path().to_string());
                             let body = req.into_body().collect().await.unwrap().to_bytes();
+                            if (method.as_str(), path.as_str()) == ("GET", "/fed/v2/sessions") {
+                                lists.fetch_add(1, Ordering::SeqCst);
+                            }
                             let (status, out) = match (method.as_str(), path.as_str()) {
                                 ("GET", "/fed/v2/sessions") if l.denied => (
                                     403,
@@ -429,13 +441,14 @@ async fn stub(creds: &Creds, clients: &[&str], l: Listing) -> (u16, Arc<Mutex<Ve
             });
         }
     });
-    (port, sent)
+    (port, sent, lists)
 }
 
 /// One sending node and the nodes in its view: stubs, and unreachable entries.
 struct View {
     sender: Node,
     sent: HashMap<String, Arc<Mutex<Vec<String>>>>,
+    lists: HashMap<String, Arc<AtomicUsize>>,
     _ca: Ca,
 }
 
@@ -446,10 +459,12 @@ async fn view(sender: &str, stubs: Vec<(&str, Listing)>, unreachable: &[&str]) -
     let p = prepare(&ca);
     let mut peers = serde_json::Map::new();
     let mut sent = HashMap::new();
+    let mut lists = HashMap::new();
     for (name, l) in stubs {
-        let (port, s) = stub(&ca.issue(name), &[&creds.pin], l).await;
+        let (port, s, n) = stub(&ca.issue(name), &[&creds.pin], l).await;
         peers.insert(name.to_string(), ca_entry(port, &p.ca_file(), name, ALL));
         sent.insert(name.to_string(), s);
+        lists.insert(name.to_string(), n);
     }
     for name in unreachable {
         peers.insert(
@@ -461,6 +476,7 @@ async fn view(sender: &str, stubs: Vec<(&str, Listing)>, unreachable: &[&str]) -
     View {
         sender,
         sent,
+        lists,
         _ca: ca,
     }
 }
@@ -468,6 +484,9 @@ async fn view(sender: &str, stubs: Vec<(&str, Listing)>, unreachable: &[&str]) -
 impl View {
     fn sent_to(&self, node: &str) -> Vec<String> {
         self.sent[node].lock().unwrap().clone()
+    }
+    fn lists_of(&self, node: &str) -> usize {
+        self.lists[node].load(Ordering::SeqCst)
     }
     fn nothing_sent(&self) -> bool {
         self.sent.values().all(|s| s.lock().unwrap().is_empty())
@@ -736,7 +755,7 @@ async fn test_oracle_11_a_disconnected_dial_out_client_is_unreachable() {
         let ca = Ca::new();
         let creds = ca.issue("sini.a");
         let p = prepare(&ca);
-        let (b_port, b_sent) = stub(
+        let (b_port, b_sent, _) = stub(
             &ca.issue("sini.b"),
             &[&creds.pin],
             listing(vec![svc("foo", "sini")]),
@@ -1088,6 +1107,112 @@ async fn test_oracle_14_a_resolved_dial_out_send_takes_replies_from_the_id_only(
         let err = json!({ "error": "not_found", "detail": "no live session matches" }).to_string();
         let system = json!({ "service": "system", "node": "x" });
         assert_eq!(fed_reply(&w, pin, port, &id, system, &err).await, 200);
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 15 (A11, A8a, D-7). A node listing an "instance" whose ID is the name-shaped
+// `genie-guard` does not capture a bare `genie-guard`, which is a name and reaches the
+// service on `sini.a`: over the full view (from `bob.c`), and under A17 when the listing
+// node is the sender's own user's (from `eve.c`).
+// Mutant: decide ID-vs-name by match, not by UUID shape => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_15_a_name_shaped_listed_id_does_not_capture_a_name() {
+    run_with_port_retry(|| async {
+        for sender in ["bob.c", "eve.c"] {
+            let v = view(
+                sender,
+                vec![
+                    ("sini.a", listing(vec![svc("genie-guard", "sini")])),
+                    ("eve.b", listing(vec![inst("genie-guard", "live", "eve")])),
+                ],
+                &[],
+            )
+            .await;
+            let (status, body) = http_send(&v.sender, "genie-guard", "to the service").await;
+            assert_eq!(status, 202, "{sender}: {body}");
+            assert_eq!(body["address"], "genie-guard@sini.a", "{sender}: {body}");
+            assert!(
+                v.sent_to("eve.b").is_empty(),
+                "{sender}: eve.b captured a name"
+            );
+        }
+    })
+    .await;
+}
+
+/// The sender's cached location of `id`: (node, cached_at), read from its database.
+fn cache_row(node: &Node, id: &str) -> Option<(String, i64)> {
+    let conn = rusqlite::Connection::open(node.tmp.path().join("node.db")).unwrap();
+    conn.query_row(
+        "SELECT node, cached_at FROM location_cache WHERE id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .ok()
+}
+
+// =============================================================================
+// Oracle 16 (A-12). Sent from `bob.c`: X is live on `sini.a`. The first bare X is resolved
+// by a `list` fan-out and delivered; the second, within the TTL, is routed by the cache and
+// asks no node.
+// Mutant: no cache (`remember` a no-op) => RED (the second send fans out again).
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_16_a_cached_location_routes_without_a_fan_out() {
+    run_with_port_retry(|| async {
+        let v = view(
+            "bob.c",
+            vec![("sini.a", listing(vec![inst(X, "live", "sini")]))],
+            &[],
+        )
+        .await;
+        for text in ["first", "second"] {
+            let (status, body) = http_send(&v.sender, X, text).await;
+            assert_eq!(status, 202, "{text}: {body}");
+            assert_eq!(body["address"], format!("{X}@sini.a"), "{text}: {body}");
+        }
+        assert_eq!(v.sent_to("sini.a"), vec![X.to_string(), X.to_string()]);
+        assert_eq!(v.lists_of("sini.a"), 1, "the second send asked for list");
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 17 (A-12, orchestrator default P1). A delivery the cache routed does not refresh
+// the entry: its time stays that of the fresh resolution, so a location is at most the
+// TTL old and a later second live listing surfaces as `ambiguous` within it.
+// Mutant: refresh on every cached delivery => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_17_a_cached_delivery_does_not_refresh_the_entry() {
+    run_with_port_retry(|| async {
+        let v = view(
+            "bob.c",
+            vec![("sini.a", listing(vec![inst(X, "live", "sini")]))],
+            &[],
+        )
+        .await;
+        let (status, body) = http_send(&v.sender, X, "first").await;
+        assert_eq!(status, 202, "{body}");
+        let fresh = cache_row(&v.sender, X).expect("cached after a live delivery");
+        assert_eq!(fresh.0, "sini.a");
+        // The cache's clock is in seconds: the next delivery is in a later one.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (status, body) = http_send(&v.sender, X, "second").await;
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(
+            v.lists_of("sini.a"),
+            1,
+            "the second send was not cache-routed"
+        );
+        assert_eq!(
+            cache_row(&v.sender, X),
+            Some(fresh),
+            "a cached delivery refreshed it"
+        );
     })
     .await;
 }

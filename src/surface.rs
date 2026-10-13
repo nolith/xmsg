@@ -872,7 +872,8 @@ pub async fn send(
                 Err(e) => return Err(e),
             };
         let outcome = resp.outcome.unwrap_or_else(|| "delivered".to_string());
-        if id && outcome == "delivered" {
+        // Only a fresh resolution is cached, so a location is at most the TTL old (A-12).
+        if id && !cached && outcome == "delivered" {
             crate::mesh::remember(state, &key, &peer_key);
         }
         let address = format!("{}@{peer_key}", resp.session_id);

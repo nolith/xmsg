@@ -55,6 +55,14 @@ pub fn is_uuid_shaped(s: &str) -> bool {
     true
 }
 
+/// A11: a UUID, optionally followed by `~<n>`, is an instance ID; anything else is a name.
+pub fn is_instance_ref(s: &str) -> bool {
+    match s.split_once('~') {
+        Some((base, n)) => n.parse::<u32>().is_ok() && is_uuid_shaped(base),
+        None => is_uuid_shaped(s),
+    }
+}
+
 pub fn mint_uuid_v4() -> String {
     let mut bytes = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {

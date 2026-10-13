@@ -106,8 +106,12 @@ fn answer(
     }
 }
 
-/// Instance entries whose ID is `r`, from the nodes that answered.
+/// Instance entries whose ID is `r`, from the nodes that answered. Only a UUID-shaped `r`
+/// (optionally `~n`) is an ID (A11); any other is a name, whatever a node lists.
 fn id_matches<'a>(answers: &'a [Answer], r: &str) -> Vec<Listing<'a>> {
+    if !crate::claim::is_instance_ref(r) {
+        return Vec::new();
+    }
     answers
         .iter()
         .filter(|a| a.asked)
