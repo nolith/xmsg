@@ -4,6 +4,7 @@ pub mod agy;
 pub mod claim;
 pub mod error;
 pub mod fed;
+pub mod handoff;
 pub mod http;
 pub mod inbox;
 pub mod mcp;

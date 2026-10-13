@@ -496,7 +496,18 @@ A `to` with `@node` is resolved by that node alone (`@` this node: the steps abo
 - **What queues.** A send to an instance ID this node has observed, while it is not running: a closed Claude conversation, or an agy conversation between turns. "Observed" is the claim table (a Claude process presenting the ID) plus agy registrations. A pi ID, a released or closed plugin session's address (opencode) and an exited `X~n` are `gone`, never queue and are never listed `parked`.
 - **How long.** A message is held for the reply TTL (`--reply-ttl`, 7 days by default) and dropped unread after it. The ID stays parked, so sends to it queue, for the reply TTL after the conversation was last live, or as long as its queue holds a message, whichever is longer; after that it is `not_found` (D-1's lifetime). Discovery is on demand, so for Claude "last live" is the scan that found the conversation gone, and for agy its last registration.
 - **Delivery.** The queue drains when the conversation is next observed: a new Claude process presenting the ID (the next scan of the session files, which every `list`, `send` and MCP start runs), or an agy registration. Each message is delivered once, in the order sent, and shows when it was sent: `[xmsg] message_id=<id> sent=<RFC 3339 UTC time>`. Its outcome then reads `delivered`.
-- **Across nodes.** A send from another node to a conversation parked here queues here, as a local one does (XA6's resolution picks the node). A queue that follows a conversation to another node is XA7's.
+- **Across nodes.** A send from another node to a conversation parked here queues here, as a local one does (XA6's resolution picks the node). The queue then follows the conversation across the user's machines, below.
+
+#### The queue across a user's machines (XA7)
+
+A user's nodes are one principal (A16), so a Claude conversation that moves between them (`~/.claude` synced between two machines) keeps its bare ID, and its queue follows it.
+
+- **Parked here and there is one destination.** When every listing of an ID by one user is parked, a sender queues at any one of them (this node if it is one, else the smallest node name), never `ambiguous`. The next registration collects them all.
+- **The node that gains the conversation asks** (D-1). A parked node cannot see the conversation go live elsewhere, so when a scan here newly observes a Claude process holding a plain ID, this node asks each of its user's other nodes that it can dial (peers whose entry names an identity of its user), all at once, for that ID's queue over `POST /fed/v2/handoff`. What they hand over is delivered here at once, within that one registration.
+- **A holder hands over only to the one live listing.** It hands its queue over when the asker is the only live listing of the ID in a complete view of the user's nodes: every peer of its user, and the asker. If any of them cannot be asked, the queue stays where it is (`503 unavailable`). Two live listings take nothing (`409 ambiguous`), and a send to the ID is `ambiguous` too. A node of another user is refused (`403 denied`), whatever it lists.
+- **Transfer, then acknowledge.** The holder keeps its queue and its parked listing until the asker acknowledges on `POST /fed/v2/handoff/ack`, and only then drops them. The asker stores each message under its message ID, so a transfer repeated after a lost acknowledgement, or after the holder crashed, delivers nothing twice (X1). An asker whose holder could not answer for sure asks again every second, for a minute.
+- **The lifetime travels.** A handed-over message keeps its expiry, so it is held no longer than the reply TTL after it was sent, on whichever node holds it. Once no node in view lists the ID, a send to it is `not_found`.
+- **Not covered.** Only the Claude queue moves; agy's stays on its node. A dial-out client is not asked (it cannot be dialled), and neither is a node outside the peers file; the hand-off through the hub is H5's and H6's. A message queued at the holder after its transfer stays there until the conversation is next newly observed on some node. A handed-over message's sender is not recorded on the new node, so the conversation cannot reply to it there.
 
 ### Errors
 
@@ -648,6 +659,7 @@ Nodes talk over `/fed/v2`, and every envelope carries `"v": 2`. The `/fed/v1` ro
 | `/fed/v2/messages/{id}/replies`           | GET       | the replies stored for a message the asker sent (an undialable sender's pull) |
 | `/fed/v2/sessions`                        | GET       | this node's `list` for the asker (Section 7.3)                                |
 | `/fed/v2/inbox`, `/fed/v2/inbox/{id}/ack` | GET, POST | a dial-out client's mailbox (Sections 7.5, 7.6)                               |
+| `/fed/v2/handoff`, `/fed/v2/handoff/ack`  | POST      | a parked queue handed to the user's node that gained the conversation (XA7)   |
 | `/fed/v2/list/{query}`                    | POST      | a dial-out client's answer to a `list` query from its mailbox                 |
 
 **Replies return to the origin (A-2).** A reply always travels back to the node the message came from, and that node decides how it reaches the sender, by the sender's kind: pushed to a session or a service, which have inboxes, and stored for an anonymous HTTP caller, who reads it there with `replies`. The receiving node never decides it. The outbound reply poller of a node that dials out is armed the same way, by the sender's kind.

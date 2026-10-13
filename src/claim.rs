@@ -296,6 +296,7 @@ pub fn sync_claims_entries(
     }
 
     // 3. For each ID with new observations, sort by (procStart, pid) and assign suffixes
+    let mut newly_plain = Vec::new();
     for (id, mut entries) in new_observations_by_id {
         entries.sort_by(|a, b| {
             cmp_proc_start(&a.proc_start, &b.proc_start).then_with(|| a.pid.cmp(&b.pid))
@@ -321,6 +322,9 @@ pub fn sync_claims_entries(
                     .map_err(|e| AppError::Internal(e.to_string()))?;
                 std::cmp::max(2, max_suffix + 1)
             };
+            if suffix == 1 {
+                newly_plain.push(id.clone());
+            }
 
             // The key is (id, pid, proc_start), so a released row of this process is
             // re-claimed in place, under the suffix just assigned.
@@ -427,6 +431,10 @@ pub fn sync_claims_entries(
     }
 
     tx.commit().map_err(|e| AppError::Internal(e.to_string()))?;
+    // D-1: a node that newly observes X holding its plain ID asks for X's queue.
+    for id in &newly_plain {
+        crate::handoff::observed(id);
+    }
     Ok((active_pairs, notices_to_send))
 }
 

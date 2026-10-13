@@ -804,6 +804,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         }));
 
         if let Some(ref fs) = fed_state {
+            bg_tasks.push(xmsg::handoff::spawn(state.clone()));
             for (peer_name, peer_cfg) in fs.peers.iter() {
                 if peer_cfg.is_outbound() {
                     let fs_clone = fs.clone();

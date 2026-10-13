@@ -1923,6 +1923,8 @@ pub fn build_fed_router(fed_state: Arc<FedState>) -> Router {
         .route("/fed/v2/list/{query}", post(fed_list_answer_handler))
         .route("/fed/v2/inbox", get(fed_get_inbox_handler))
         .route("/fed/v2/inbox/{id}/ack", post(fed_ack_inbox_handler))
+        .route("/fed/v2/handoff", post(crate::handoff::handoff_handler))
+        .route("/fed/v2/handoff/ack", post(crate::handoff::ack_handler))
         .layer(DefaultBodyLimit::max(max_body_limit))
         .with_state(fed_state)
 }

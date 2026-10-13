@@ -83,7 +83,7 @@ impl Listing<'_> {
 
 /// The user a peer entry names (A16): its one identity's user, a pinned node's own name,
 /// or none when the entry names several identities.
-fn peer_user(peer: &PeerConfig) -> Option<String> {
+pub(crate) fn peer_user(peer: &PeerConfig) -> Option<String> {
     match (&peer.pin, peer.identities.as_deref()) {
         (Some(pin), _) => crate::node::node_name_from_pin(pin).ok(),
         (None, Some([uri])) => crate::node::user_from_uri(uri).ok(),

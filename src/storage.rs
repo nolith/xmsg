@@ -1113,8 +1113,10 @@ pub fn delete_forwarded_message(conn: &Connection, id: &str) -> Result<()> {
 // -----------------------------------------------------------------------------
 
 /// A message held for a Claude instance that is not running (A14). `body` is what its inbox
-/// receives, the send time included.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// receives, the send time included. It crosses the wire as is in a hand-off (D-1), its
+/// expiry with it, so the queue's lifetime holds across nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueuedMessage {
     pub id: String,
     pub instance_id: String,
@@ -1132,9 +1134,36 @@ pub fn insert_queued(conn: &Connection, msg: &QueuedMessage) -> Result<()> {
     Ok(())
 }
 
-/// Takes the unexpired, undelivered messages queued for `instance_id`, oldest first, and
-/// marks them delivered, so a later observation does not deliver them again.
-pub fn take_queued(conn: &Connection, instance_id: &str, now: i64) -> Result<Vec<QueuedMessage>> {
+/// Stores a message handed over from another of the user's nodes (D-1). A message this node
+/// already holds, delivered or not, is left as it is: a transfer repeated after a lost
+/// acknowledgement delivers nothing twice (X1). Returns whether it was new.
+pub fn insert_handed_over(conn: &Connection, msg: &QueuedMessage) -> Result<bool> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO instance_queue (id, instance_id, created_at, expires_at, from_name, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![msg.id, msg.instance_id, msg.created_at, msg.expires_at, msg.from_name, msg.body],
+    )?;
+    Ok(n == 1)
+}
+
+/// Drops what a hand-off acknowledged (D-1): the messages `ids` queued for `instance_id`,
+/// and then, unless a message for it arrived since the transfer, this node's parked
+/// listing of it.
+pub fn drop_handed_over(conn: &Connection, instance_id: &str, ids: &[String]) -> Result<()> {
+    for id in ids {
+        conn.execute(
+            "DELETE FROM instance_queue WHERE id = ?1 AND instance_id = ?2",
+            params![id, instance_id],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM instance_seen WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM instance_queue WHERE instance_id = ?1 AND delivered_at IS NULL)",
+        params![instance_id],
+    )?;
+    Ok(())
+}
+
+/// The unexpired, undelivered messages queued for `instance_id`, oldest first.
+pub fn queued_for(conn: &Connection, instance_id: &str, now: i64) -> Result<Vec<QueuedMessage>> {
     let mut stmt = conn.prepare(
         "SELECT id, instance_id, created_at, expires_at, from_name, body FROM instance_queue WHERE instance_id = ?1 AND delivered_at IS NULL AND expires_at > ?2 ORDER BY created_at ASC, id ASC",
     )?;
@@ -1150,6 +1179,13 @@ pub fn take_queued(conn: &Connection, instance_id: &str, now: i64) -> Result<Vec
             })
         })?
         .collect::<Result<Vec<_>>>()?;
+    Ok(msgs)
+}
+
+/// Takes the unexpired, undelivered messages queued for `instance_id`, oldest first, and
+/// marks them delivered, so a later observation does not deliver them again.
+pub fn take_queued(conn: &Connection, instance_id: &str, now: i64) -> Result<Vec<QueuedMessage>> {
+    let msgs = queued_for(conn, instance_id, now)?;
     for m in &msgs {
         conn.execute(
             "UPDATE instance_queue SET delivered_at = ?1 WHERE id = ?2",
