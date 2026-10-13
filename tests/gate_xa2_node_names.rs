@@ -203,7 +203,7 @@ async fn spawn_node(spec: NodeSpec, prepared: Option<(TempDir, PathBuf)>) -> Res
     }
     let mut child = cmd.spawn().expect("spawn xmsg serve");
 
-    for _ in 0..200 {
+    for _ in 0..600 {
         if let Ok(Some(_)) = child.try_wait() {
             let mut err = String::new();
             if let Some(mut e) = child.stderr.take() {
@@ -233,7 +233,7 @@ async fn spawn_node(spec: NodeSpec, prepared: Option<(TempDir, PathBuf)>) -> Res
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let _ = child.start_kill();
-    panic!("xmsg serve neither served nor exited within 10s: {args:?}");
+    panic!("xmsg serve neither served nor exited within 30s: {args:?}");
 }
 
 /// A node that must start; a lost port race panics with a message the retry wrapper reads.

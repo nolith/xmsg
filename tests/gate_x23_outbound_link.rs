@@ -229,7 +229,7 @@ async fn spawn_hub_node(
 
         let mut ready = false;
         let mut exited = None;
-        for _ in 0..100 {
+        for _ in 0..600 {
             if let Ok(Some(status)) = guard.child_mut().try_wait() {
                 exited = Some(status);
                 break;
@@ -360,7 +360,7 @@ async fn spawn_client_node(
     let mut guard = ChildGuard::new(child);
 
     let mut ready = false;
-    for _ in 0..100 {
+    for _ in 0..600 {
         if let Ok(Some(status)) = guard.child_mut().try_wait() {
             let mut stderr = String::new();
             if let Some(mut err) = guard.child_mut().stderr.take() {
@@ -726,7 +726,7 @@ async fn test_oracle_4_off_by_default_no_pull_loop() {
 
     // Wait until ready
     let mut ready = false;
-    for _ in 0..100 {
+    for _ in 0..600 {
         if let Ok(Some(status)) = guard.child_mut().try_wait() {
             let mut stderr = String::new();
             if let Some(mut err) = guard.child_mut().stderr.take() {

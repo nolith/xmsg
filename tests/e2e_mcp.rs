@@ -178,7 +178,16 @@ async fn start_mcp_harness() -> McpHarness {
         let _ = xmsg::agent::run_agent_server(ag_sock, ag_state, my_uid).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..1500 {
+        if agent_sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        agent_sock_path.exists(),
+        "the in-process server never bound its socket in 30s"
+    );
 
     McpHarness {
         sessions_dir: sess_dir.path().to_path_buf(),

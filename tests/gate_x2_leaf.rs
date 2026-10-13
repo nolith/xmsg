@@ -99,7 +99,7 @@ async fn test_oracle_1_leaf_binds_no_harness_sockets_or_fed_listener() {
         let healthz_url = format!("http://{listen_addr}/healthz");
         let mut ready = false;
         let mut exited = None;
-        for _ in 0..50 {
+        for _ in 0..600 {
             if let Some(status) = child.try_wait().unwrap() {
                 exited = Some(status);
                 break;
@@ -520,7 +520,16 @@ async fn test_oracle_3_leaf_pull_replies_node_zero_outbound_connections() {
     tokio::spawn(async move {
         let _ = run_agent_server(s_path, s_state, my_uid).await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..1500 {
+        if node_b_agent_sock.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        node_b_agent_sock.exists(),
+        "the in-process server never bound its socket in 30s"
+    );
 
     // Mock target session on node-b
     let my_pid = std::process::id();

@@ -139,7 +139,13 @@ async fn test_shipped_binary_register_cli_with_server() {
         .await;
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..1500 {
+        if sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(sock_path.exists(), "register.sock never came up in 30s");
 
     // Run xmsg register agy child process (child PID will be descendant of my_pid)
     let output = Command::new(bin)

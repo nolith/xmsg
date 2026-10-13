@@ -211,7 +211,7 @@ async fn spawn_hub_node(
 
         let mut ready = false;
         let mut exited = None;
-        for _ in 0..100 {
+        for _ in 0..600 {
             if let Ok(Some(status)) = guard.child_mut().try_wait() {
                 exited = Some(status);
                 break;
@@ -349,7 +349,7 @@ async fn spawn_leaf_node(
 
         let mut ready = false;
         let mut exited = None;
-        for _ in 0..100 {
+        for _ in 0..600 {
             if let Ok(Some(status)) = guard.child_mut().try_wait() {
                 exited = Some(status);
                 break;

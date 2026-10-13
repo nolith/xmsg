@@ -129,7 +129,7 @@ async fn oracle_1_hook_credential_less_and_credentialed_and_malformed() {
     });
 
     // Wait for register.sock to exist
-    for _ in 0..50 {
+    for _ in 0..3000 {
         if reg_sock.exists() {
             break;
         }

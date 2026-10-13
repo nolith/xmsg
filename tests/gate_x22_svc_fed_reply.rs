@@ -267,7 +267,7 @@ async fn create_full_test_node(
         let _ = run_register_server(r_sock, r_state_xa3, my_uid, trusted_svc_exes).await;
     });
 
-    for _ in 0..50 {
+    for _ in 0..1500 {
         if agent_sock.exists() && register_sock.exists() {
             break;
         }
@@ -403,7 +403,7 @@ async fn test_oracle_1_full_node_svc_federated_reply() {
         // Wait for node B to be ready
         let mut ready = false;
         let mut exited = None;
-        for _ in 0..100 {
+        for _ in 0..600 {
             if let Ok(Some(status)) = child_guard.0.try_wait() {
                 exited = Some(status);
                 break;

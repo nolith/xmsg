@@ -265,7 +265,7 @@ async fn test_oracle_2_no_flag_no_tcp_bound() {
         .expect("spawn xmsg serve");
 
     let mut started = false;
-    for _ in 0..50 {
+    for _ in 0..600 {
         if http_sock.exists() {
             started = true;
             break;

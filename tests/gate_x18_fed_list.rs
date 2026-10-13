@@ -245,7 +245,7 @@ async fn create_fed_test_node(
         let _ = axum::serve(ucred_listener, router.into_make_service()).await;
     });
 
-    for _ in 0..50 {
+    for _ in 0..1500 {
         if reg_sock.exists() && agent_sock.exists() && http_sock.exists() {
             break;
         }

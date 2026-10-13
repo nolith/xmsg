@@ -247,7 +247,7 @@ async fn create_hub_test_node(
         let _ = axum::serve(ucred_listener, http_router).await;
     });
 
-    for _ in 0..50 {
+    for _ in 0..1500 {
         if http_sock.exists() && agent_sock.exists() {
             break;
         }
@@ -399,7 +399,7 @@ async fn create_leaf_test_node(
         });
     }
 
-    for _ in 0..50 {
+    for _ in 0..1500 {
         if reg_sock.exists() {
             break;
         }

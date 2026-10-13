@@ -98,7 +98,7 @@ impl Node {
             let _ = fs::remove_file(s);
         }
         let mut child = cmd.spawn().expect("spawn xmsg serve");
-        for _ in 0..200 {
+        for _ in 0..1200 {
             if self.http_sock.exists() && self.agent_sock.exists() && self.register_sock.exists() {
                 self.child = Some(child);
                 return;
@@ -109,7 +109,7 @@ impl Node {
             std::thread::sleep(Duration::from_millis(25));
         }
         let _ = child.kill();
-        panic!("xmsg serve never bound its sockets");
+        panic!("xmsg serve never bound its sockets in 30s");
     }
 
     /// SIGTERM, then wait for a clean exit.

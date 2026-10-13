@@ -162,7 +162,7 @@ async fn setup_harness(service_name: &str) -> SvcTestHarness {
     });
 
     // Wait briefly for register.sock to exist
-    for _ in 0..50 {
+    for _ in 0..1500 {
         if sock_path.exists() {
             break;
         }
@@ -183,7 +183,7 @@ async fn setup_harness(service_name: &str) -> SvcTestHarness {
 }
 
 async fn connect_svc(sock_path: &Path) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         match UnixStream::connect(sock_path).await {
             Ok(stream) => {

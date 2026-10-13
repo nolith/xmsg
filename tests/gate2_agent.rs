@@ -219,7 +219,16 @@ async fn setup(max_body: usize) -> Env {
         });
     }
 
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    for _ in 0..1500 {
+        if reg.exists() && ag.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        reg.exists() && ag.exists(),
+        "the in-process server never bound its socket in 30s"
+    );
     Env {
         _t: t,
         proc_root,

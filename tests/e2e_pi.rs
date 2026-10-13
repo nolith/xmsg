@@ -135,7 +135,16 @@ async fn test_e2e_pi_registration_delivery_and_reply_flow() {
         let _ = run_agent_server(ag_sock, ag_state, my_uid).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..1500 {
+        if sock_path.exists() && agent_sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        sock_path.exists() && agent_sock_path.exists(),
+        "the in-process server never bound its socket in 30s"
+    );
 
     // 3. Mock Pi connects over Unix domain socket and registers
     let stream = UnixStream::connect(&sock_path).await.unwrap();

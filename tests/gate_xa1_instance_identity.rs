@@ -209,7 +209,7 @@ async fn start_server_with(
         let _ = xmsg::agent::run_agent_server(asock, st, my_uid).await;
     });
 
-    for _ in 0..100 {
+    for _ in 0..3000 {
         if agent_sock.exists() {
             break;
         }

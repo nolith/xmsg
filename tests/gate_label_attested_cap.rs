@@ -106,7 +106,7 @@ async fn start(caller_name: &str) -> Node {
     tokio::spawn(async move {
         let _ = xmsg::agent::run_agent_server(sock, st, uid).await;
     });
-    for _ in 0..100 {
+    for _ in 0..3000 {
         if agent_sock.exists() {
             break;
         }

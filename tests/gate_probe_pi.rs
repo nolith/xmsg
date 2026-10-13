@@ -224,7 +224,16 @@ async fn setup_gate_harness() -> GateHarness {
 
     let _app = build_router(app_state);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..1500 {
+        if register_sock_path.exists() && agent_sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        register_sock_path.exists() && agent_sock_path.exists(),
+        "the in-process server never bound its socket in 30s"
+    );
 
     GateHarness {
         _tmp: tmp,

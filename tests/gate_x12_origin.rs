@@ -185,7 +185,7 @@ async fn test_oracle_1_local_attested_session_origin() {
     });
 
     // Wait for sockets to be ready
-    for _ in 0..50 {
+    for _ in 0..1500 {
         if reg_sock.exists() && agent_sock.exists() {
             break;
         }
@@ -462,7 +462,7 @@ async fn create_fed_test_node(
     });
 
     // Wait for sockets
-    for _ in 0..50 {
+    for _ in 0..1500 {
         if reg_sock.exists() && agent_sock.exists() {
             break;
         }

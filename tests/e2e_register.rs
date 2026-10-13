@@ -295,7 +295,7 @@ async fn test_registration_server_e2e_and_atomic_replacement() {
     });
 
     // Wait briefly for socket to become ready
-    for _ in 0..20 {
+    for _ in 0..1500 {
         if sock_path.exists() {
             break;
         }

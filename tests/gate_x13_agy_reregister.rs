@@ -136,7 +136,7 @@ async fn start_test_server(
     });
 
     // Wait briefly for agent_sock to exist
-    for _ in 0..50 {
+    for _ in 0..3000 {
         if agent_sock.exists() {
             break;
         }

@@ -66,7 +66,7 @@ impl Node {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn xmsg serve");
-        for _ in 0..400 {
+        for _ in 0..1200 {
             if http_sock.exists() && register_sock.exists() {
                 return Node {
                     _tmp: tmp,

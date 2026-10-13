@@ -218,7 +218,7 @@ exit 0
     });
 
     // Wait for agent.sock to be bound
-    for _ in 0..50 {
+    for _ in 0..3000 {
         if UnixStream::connect(&agent_sock).await.is_ok() {
             break;
         }

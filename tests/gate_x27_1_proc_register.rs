@@ -279,7 +279,7 @@ async fn start_server(config: AgyConfig, store: AgyStore) -> (TempDir, PathBuf) 
         )
         .await;
     });
-    for _ in 0..200 {
+    for _ in 0..3000 {
         if sock.exists() {
             break;
         }

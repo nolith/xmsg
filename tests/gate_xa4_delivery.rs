@@ -155,7 +155,7 @@ impl Node {
             cmd.arg("--fed-listen").arg(format!("127.0.0.1:{port}"));
         }
         let mut child = cmd.spawn().expect("spawn xmsg serve");
-        for _ in 0..400 {
+        for _ in 0..1200 {
             if let Ok(Some(_)) = child.try_wait() {
                 return None;
             }

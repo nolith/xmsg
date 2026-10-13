@@ -188,7 +188,16 @@ async fn start_replies_harness(reply_ttl: Duration) -> RepliesHarness {
         let _ = run_agent_server(agent_sock, agent_state, my_uid).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..1500 {
+        if agent_sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        agent_sock_path.exists(),
+        "the in-process server never bound its socket in 30s"
+    );
 
     RepliesHarness {
         sess_dir,

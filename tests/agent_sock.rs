@@ -374,7 +374,16 @@ async fn test_agent_sock_reply_and_send_flow() {
         let _ = run_agent_server(s_path, s_state, my_uid).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..1500 {
+        if agent_sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        agent_sock_path.exists(),
+        "the in-process server never bound its socket in 30s"
+    );
 
     // Connect to agent.sock
     let stream = UnixStream::connect(&agent_sock_path).await.unwrap();

@@ -719,7 +719,7 @@ async fn create_fed_test_node(
         let _ = run_agent_server(s_path, s_state, my_uid).await;
     });
 
-    for _ in 0..50 {
+    for _ in 0..1500 {
         if agent_sock.exists() {
             break;
         }

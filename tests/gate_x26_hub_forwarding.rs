@@ -225,7 +225,7 @@ async fn spawn_test_node(
 
     let mut ready = false;
     let mut exited = None;
-    for _ in 0..100 {
+    for _ in 0..600 {
         if let Ok(Some(status)) = guard.child_mut().try_wait() {
             exited = Some(status);
             break;

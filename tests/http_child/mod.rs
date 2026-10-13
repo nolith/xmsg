@@ -29,8 +29,16 @@ pub fn serve_if_child() {
         return;
     };
     let dir = PathBuf::from(dir);
-    let req: Value =
-        serde_json::from_str(&fs::read_to_string(dir.join("req.json")).unwrap()).expect("req.json");
+    // `request_detached` writes `req.json` only once this process is detached, so wait for it.
+    let mut text = None;
+    for _ in 0..600 {
+        if let Ok(t) = fs::read_to_string(dir.join("req.json")) {
+            text = Some(t);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let req: Value = serde_json::from_str(&text.expect("no req.json in 30s")).expect("req.json");
     let method = req["method"].as_str().unwrap();
     let path = req["path"].as_str().unwrap();
     let body = req["body"].as_str();
@@ -175,7 +183,8 @@ impl Drop for FakeParent {
 }
 
 /// One request from a process outside every tree: the child is started in the background
-/// by a `sh` that exits at once, so its parent is no process of this test.
+/// by a `sh` that exits at once, and is handed its request only after that `sh` has been
+/// waited on, so by the time it connects its parent is no process of this test.
 pub async fn request_detached(
     test_name: &str,
     via: &Via,
@@ -185,7 +194,6 @@ pub async fn request_detached(
 ) -> (u16, String) {
     let dir = tempfile::tempdir().unwrap();
     let req = request_value(via, method, path, body);
-    fs::write(dir.path().join("req.json"), req.to_string()).unwrap();
     let status = Command::new("sh")
         .arg("-c")
         .arg(format!("{} &", child_args(test_name)))
@@ -197,5 +205,10 @@ pub async fn request_detached(
         .status()
         .expect("spawn sh");
     assert!(status.success());
+    // `sh` has exited, so the child is already reparented out of this test's tree: only now
+    // may it act. Written by rename, so the child never reads a partial file.
+    let tmp = dir.path().join("req.json.tmp");
+    fs::write(&tmp, req.to_string()).unwrap();
+    fs::rename(&tmp, dir.path().join("req.json")).unwrap();
     take_response(dir.path()).await
 }

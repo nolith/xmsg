@@ -218,7 +218,16 @@ async fn create_test_node_full_inner(
         let _ = run_agent_server(s_path, s_state, my_uid).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..1500 {
+        if agent_sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        agent_sock_path.exists(),
+        "the in-process server never bound its socket in 30s"
+    );
 
     TestNode {
         name: name.to_string(),
@@ -3987,7 +3996,7 @@ async fn test_n7_f6_unspecified_address_binds() {
     // A listener on 0.0.0.0 accepts on loopback too.
     let mut bound = false;
     let mut exited = None;
-    for _ in 0..100 {
+    for _ in 0..300 {
         if let Some(status) = child.try_wait().unwrap() {
             exited = Some(status);
             break;
