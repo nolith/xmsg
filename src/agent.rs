@@ -38,6 +38,8 @@ pub enum AgentFrame {
     Reply {
         message_id: String,
         text: String,
+        #[serde(default)]
+        idempotency_key: Option<String>,
     },
     Replies {
         message_id: String,
@@ -562,9 +564,9 @@ pub async fn run_agent_server(
                                 })
                             })
                     }
-                    AgentFrame::Reply { message_id, text } => {
+                    AgentFrame::Reply { message_id, text, idempotency_key } => {
                         let caller = caller.expect("caller resolved");
-                        surface::reply(&state_clone, &caller, &message_id, &text)
+                        surface::reply(&state_clone, &caller, &message_id, &text, idempotency_key.as_deref())
                             .await
                             .map(|r| serde_json::json!({ "status": "ok", "reply": r }))
                     }

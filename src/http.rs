@@ -96,6 +96,8 @@ pub struct SendRequest {
 #[serde(deny_unknown_fields)]
 pub struct ReplyRequest {
     pub text: String,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -429,7 +431,14 @@ async fn reply_handler(
             ))
         }
     };
-    let reply = surface::reply(&state, &caller, &id, &req.text).await?;
+    let reply = surface::reply(
+        &state,
+        &caller,
+        &id,
+        &req.text,
+        req.idempotency_key.as_deref(),
+    )
+    .await?;
     Ok((StatusCode::OK, Json(reply)).into_response())
 }
 

@@ -119,6 +119,8 @@ enum Frame {
         session: String,
         message_id: String,
         text: String,
+        #[serde(default)]
+        idempotency_key: Option<String>,
     },
     Replies {
         request_id: String,
@@ -550,6 +552,7 @@ where
                 session,
                 message_id,
                 text,
+                idempotency_key,
             } => {
                 let caller =
                     held(&*db.lock().map_err(db_err)?, &conn_id, &session).map_err(db_err)?;
@@ -559,9 +562,15 @@ where
                 };
                 let (state, tx) = (state.clone(), tx.clone());
                 tasks.spawn(async move {
-                    let res = surface::reply(&state, &caller, &message_id, &text)
-                        .await
-                        .map(|r| json!({ "status": "ok", "reply": r }));
+                    let res = surface::reply(
+                        &state,
+                        &caller,
+                        &message_id,
+                        &text,
+                        idempotency_key.as_deref(),
+                    )
+                    .await
+                    .map(|r| json!({ "status": "ok", "reply": r }));
                     let _ = tx.send(answer(res, &request_id));
                 });
             }

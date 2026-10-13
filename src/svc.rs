@@ -39,6 +39,8 @@ enum SvcFrame {
         #[serde(rename = "messageId")]
         message_id: String,
         text: String,
+        #[serde(default, rename = "idempotencyKey")]
+        idempotency_key: Option<String>,
     },
 }
 
@@ -419,9 +421,21 @@ pub async fn handle_svc_connection<
                 let resp = serde_json::json!({ "status": "ok" });
                 writer.write_all(format!("{resp}\n").as_bytes()).await?;
             }
-            SvcFrame::Reply { message_id, text } => {
+            SvcFrame::Reply {
+                message_id,
+                text,
+                idempotency_key,
+            } => {
                 let caller = crate::surface::service_session(&name);
-                let resp = match crate::surface::reply(&state, &caller, &message_id, &text).await {
+                let resp = match crate::surface::reply(
+                    &state,
+                    &caller,
+                    &message_id,
+                    &text,
+                    idempotency_key.as_deref(),
+                )
+                .await
+                {
                     Ok(reply) => serde_json::json!({
                         "status": "ok",
                         "messageId": reply.pushed_message_id,

@@ -13,7 +13,7 @@ use crate::http::{AppState, ResolvedTarget};
 use crate::inbox;
 use crate::mesh::Dest;
 use crate::registry::Session;
-use crate::storage::{self, MessageRecord, Origin, ReplyRecord};
+use crate::storage::{self, MessageRecord, Origin, ReplyRecord, Reservation};
 
 /// The longest `replies` wait, in seconds (A-12).
 pub const MAX_WAIT_SECS: u64 = 60;
@@ -752,10 +752,36 @@ fn check_idempotency_key(key: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Sends `text` to `to` from `sender`. A replay of an idempotency key returns the first
-/// send's result, its message ID included; the key is the sender's (A15).
+/// How long a send or reply whose key another one holds waits for that one to settle,
+/// before it answers with the holder's ID and the outcome `pending`.
+pub const IN_FLIGHT_WAIT: Duration = Duration::from_secs(2);
+
+/// Polls `reserve` until this caller holds the key, the holder settled (`waiting` is
+/// false), or `IN_FLIGHT_WAIT` ends.
+// ponytail: polls every 50 ms; a per-key notify channel if the wait ever shows up.
+async fn reserve_or_wait<T>(
+    reserve: impl Fn() -> Result<Reservation<T>, AppError>,
+    waiting: impl Fn(&T) -> bool,
+) -> Result<Reservation<T>, AppError> {
+    let deadline = tokio::time::Instant::now() + IN_FLIGHT_WAIT;
+    loop {
+        let held = reserve()?;
+        match &held {
+            Reservation::Held(r) if waiting(r) && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            _ => return Ok(held),
+        }
+    }
+}
+
+/// Sends `text` to `to` from `sender`. An idempotency key, the sender's (A15), is
+/// reserved with the message ID before anything is delivered: a send with a key another
+/// send holds returns that send's result once it settles, or its message ID with the
+/// outcome `pending` while it is still being delivered, and never delivers again. A key
+/// whose send failed is delivered again, under the same message ID.
 pub async fn send(
-    state: &AppState,
+    state: &Arc<AppState>,
     sender: &Sender,
     to: &str,
     text: &str,
@@ -770,33 +796,88 @@ pub async fn send(
             limit: state.max_body,
         });
     }
-    let (target_ref, node) = parse_to(to)?;
+    parse_to(to)?;
     let from_name = sender.label(&state.node_name)?;
     let principal = sender.idempotency_principal();
 
-    if let Some(key) = idempotency_key {
-        check_idempotency_key(key)?;
-        let existing = {
-            let db = state.db.lock().map_err(db_err)?;
-            storage::get_idempotency_record(&db, &principal, key, state.idempotency_ttl.as_secs())
-                .map_err(db_err)?
-        };
-        if let Some(record) = existing {
-            if record.body != text {
-                return Err(AppError::Conflict(format!(
-                    "idempotency key '{key}' was already used with a different message body"
-                )));
+    let message_id = match idempotency_key {
+        None => ulid::Ulid::new().to_string(),
+        Some(key) => {
+            check_idempotency_key(key)?;
+            let fresh = ulid::Ulid::new().to_string();
+            let ttl = state.idempotency_ttl.as_secs();
+            let held = reserve_or_wait(
+                || {
+                    let db = state.db.lock().map_err(db_err)?;
+                    storage::reserve_idempotency_key(
+                        &db, &principal, key, text, &from_name, &fresh, ttl,
+                    )
+                    .map_err(db_err)
+                },
+                |r| r.body == text && r.outcome == storage::KEY_PENDING,
+            )
+            .await?;
+            match held {
+                Reservation::Mine(id) => id,
+                Reservation::Held(r) if r.body != text => {
+                    return Err(AppError::Conflict(format!(
+                        "idempotency key '{key}' was already used with a different message body"
+                    )))
+                }
+                Reservation::Held(r) => {
+                    return Ok(SendResult {
+                        message_id: r.message_id,
+                        address: r.session_id,
+                        outcome: r.outcome,
+                    })
+                }
             }
-            return Ok(SendResult {
-                message_id: record.message_id,
-                address: record.session_id,
-                outcome: record.outcome,
-            });
         }
-    }
+    };
 
+    // Delivered in a task of its own, so a caller that hangs up mid-send cannot leave its
+    // key reserved and unsettled: the send runs to its outcome, and the key records it.
+    let task = {
+        let (state, sender, to, text) = (
+            state.clone(),
+            sender.clone(),
+            to.to_string(),
+            text.to_string(),
+        );
+        let key = idempotency_key.map(str::to_string);
+        tokio::spawn(async move {
+            let res = deliver_send(&state, &sender, &to, &text, &from_name, message_id).await;
+            if let Some(key) = key {
+                let (address, outcome) = match &res {
+                    Ok(r) => (r.address.as_str(), r.outcome.as_str()),
+                    Err(_) => ("", storage::KEY_FAILED),
+                };
+                let settled = state.db.lock().map_err(db_err).and_then(|db| {
+                    storage::settle_idempotency_key(&db, &principal, &key, address, outcome)
+                        .map_err(db_err)
+                });
+                if let Err(e) = settled {
+                    tracing::warn!(target: "xmsg", message_id = %res.as_ref().map_or("", |r| r.message_id.as_str()), "idempotency key not settled: {e}");
+                }
+            }
+            res
+        })
+    };
+    task.await.map_err(|e| AppError::Internal(e.to_string()))?
+}
+
+/// `send`'s delivery, under its reserved `message_id`.
+async fn deliver_send(
+    state: &AppState,
+    sender: &Sender,
+    to: &str,
+    text: &str,
+    from_name: &str,
+    message_id: String,
+) -> Result<SendResult, AppError> {
+    let (target_ref, node) = parse_to(to)?;
+    let from_name = from_name.to_string();
     let (ret_harness, ret_session_id) = sender.inbox();
-    let message_id = ulid::Ulid::new().to_string();
     let now = storage::now_epoch_secs();
 
     // `@node` scopes resolution to that node; a bare reference resolves over the view (XA6).
@@ -927,21 +1008,7 @@ pub async fn send(
             },
         )
         .map_err(db_err)?;
-        if let Some(key) = idempotency_key {
-            let record = storage::IdempotencyRecord {
-                principal,
-                key: key.to_string(),
-                body: text.to_string(),
-                message_id: message_id.clone(),
-                session_id: address.clone(),
-                from_name: from_name.clone(),
-                bytes: text.len(),
-                outcome: outcome.clone(),
-                created_at: now,
-            };
-            let _ = storage::insert_idempotency_record(&db, &record);
-            let _ = storage::purge_idempotency_keys(&db, state.idempotency_ttl.as_secs());
-        }
+        let _ = storage::purge_idempotency_keys(&db, state.idempotency_ttl.as_secs());
         let ttl = state.reply_ttl.as_secs();
         let _ = storage::purge_messages(&db, ttl);
         let _ = storage::purge_replies(&db, ttl);
@@ -1001,12 +1068,17 @@ async fn push_federated_reply(
 }
 
 /// `caller` replies to `message_id`, a message it received. Every reply is stored; it is
-/// also pushed to the original sender when that sender has an inbox (A10, A-2).
+/// also pushed to the original sender when that sender has an inbox (A10, A-2). An
+/// idempotency key is the caller's, and names one reply: as for `send`, it is reserved
+/// with the reply ID before the reply is pushed, a reply with a key another reply holds
+/// returns that reply (or, while it is still being pushed, its ID with `push_outcome`
+/// `pending` and `seq` 0), and a key whose reply failed is replied again, same reply ID.
 pub async fn reply(
-    state: &AppState,
+    state: &Arc<AppState>,
     caller: &Session,
     message_id: &str,
     text: &str,
+    idempotency_key: Option<&str>,
 ) -> Result<ReplyRecord, AppError> {
     if message_id.is_empty() || text.is_empty() {
         return Err(AppError::BadRequest(
@@ -1037,7 +1109,102 @@ pub async fn reply(
         )));
     }
 
-    let reply_id = ulid::Ulid::new().to_string();
+    let principal = Sender::Session(caller.clone()).idempotency_principal();
+    let reply_id = match idempotency_key {
+        None => ulid::Ulid::new().to_string(),
+        Some(key) => {
+            check_idempotency_key(key)?;
+            let fresh = ulid::Ulid::new().to_string();
+            let ttl = state.idempotency_ttl.as_secs();
+            let held = reserve_or_wait(
+                || {
+                    let db = state.db.lock().map_err(db_err)?;
+                    storage::reserve_reply_key(&db, &principal, key, message_id, text, &fresh, ttl)
+                        .map_err(db_err)
+                },
+                |r| {
+                    r.in_reply_to == message_id && r.body == text && r.state == storage::KEY_PENDING
+                },
+            )
+            .await?;
+            match held {
+                Reservation::Mine(id) => id,
+                Reservation::Held(r) if r.in_reply_to != message_id || r.body != text => {
+                    return Err(AppError::Conflict(format!(
+                        "idempotency key '{key}' was already used with a different reply"
+                    )))
+                }
+                Reservation::Held(r) => {
+                    return match r.seq {
+                        Some(seq) => {
+                            let db = state.db.lock().map_err(db_err)?;
+                            storage::get_reply_by_seq(&db, seq)
+                                .map_err(db_err)?
+                                .ok_or_else(|| AppError::NotFound(format!("reply {seq} (expired)")))
+                        }
+                        None => Ok(ReplyRecord {
+                            seq: 0,
+                            message_id: message_id.to_string(),
+                            created_at: r.created_at,
+                            replier_session_id: caller.session_id.clone(),
+                            text: text.to_string(),
+                            push_outcome: Some(storage::KEY_PENDING.to_string()),
+                            pushed_message_id: Some(r.reply_id),
+                        }),
+                    };
+                }
+            }
+        }
+    };
+
+    // As in `send`: pushed in a task of its own, so the key always settles.
+    let task = {
+        let (state, caller, message_id, text) = (
+            state.clone(),
+            caller.clone(),
+            message_id.to_string(),
+            text.to_string(),
+        );
+        let key = idempotency_key.map(str::to_string);
+        tokio::spawn(async move {
+            let res = deliver_reply(
+                &state,
+                &caller,
+                msg,
+                is_forwarded,
+                &message_id,
+                &text,
+                reply_id,
+            )
+            .await;
+            if let Some(key) = key {
+                let (st, seq) = match &res {
+                    Ok(r) => ("done", Some(r.seq)),
+                    Err(_) => (storage::KEY_FAILED, None),
+                };
+                let settled = state.db.lock().map_err(db_err).and_then(|db| {
+                    storage::settle_reply_key(&db, &principal, &key, st, seq).map_err(db_err)
+                });
+                if let Err(e) = settled {
+                    tracing::warn!(target: "xmsg", in_reply_to = %message_id, "idempotency key not settled: {e}");
+                }
+            }
+            res
+        })
+    };
+    task.await.map_err(|e| AppError::Internal(e.to_string()))?
+}
+
+/// `reply`'s push and record, under its reserved `reply_id`.
+async fn deliver_reply(
+    state: &AppState,
+    caller: &Session,
+    msg: MessageRecord,
+    is_forwarded: bool,
+    message_id: &str,
+    text: &str,
+    reply_id: String,
+) -> Result<ReplyRecord, AppError> {
     let remote_host = msg
         .return_host
         .as_deref()

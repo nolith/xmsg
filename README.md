@@ -106,14 +106,14 @@ Serves the HTTP API directly over a local Unix domain socket. Peer credentials (
 
 ### 2.2 `agent.sock`
 
-Used by agent sessions, MCP tool instances and registered services. One JSON frame per line; each mirrors an MCP tool field for field, with `idempotency_key` added on `send` (AM-4). **Every frame refuses a field it does not know** with `bad_request` naming every unknown field (an old client's `{"action":"send","ref":…,"push_replies":…}` is refused naming `ref` and `push_replies`).
+Used by agent sessions, MCP tool instances and registered services. One JSON frame per line; each mirrors an MCP tool field for field, with `idempotency_key` added on `send` and `reply` (AM-4; Section 4, Idempotency). **Every frame refuses a field it does not know** with `bad_request` naming every unknown field (an old client's `{"action":"send","ref":…,"push_replies":…}` is refused naming `ref` and `push_replies`).
 
-| frame                                                | answer                                             |
-| ---------------------------------------------------- | -------------------------------------------------- |
-| `{"action":"list","name"?,"node"?,"kind"?}`          | `{"status":"ok","recipients":[…]}` (§4)            |
-| `{"action":"send","to","text","idempotency_key"?}`   | `{"status":"ok","message_id","address","outcome"}` |
-| `{"action":"reply","message_id","text"}`             | `{"status":"ok","reply":{…}}`                      |
-| `{"action":"replies","message_id","wait"?,"after"?}` | `{"status":"ok","replies":[…]}`                    |
+| frame                                                       | answer                                             |
+| ----------------------------------------------------------- | -------------------------------------------------- |
+| `{"action":"list","name"?,"node"?,"kind"?}`                 | `{"status":"ok","recipients":[…]}` (§4)            |
+| `{"action":"send","to","text","idempotency_key"?}`          | `{"status":"ok","message_id","address","outcome"}` |
+| `{"action":"reply","message_id","text","idempotency_key"?}` | `{"status":"ok","reply":{…}}`                      |
+| `{"action":"replies","message_id","wait"?,"after"?}`        | `{"status":"ok","replies":[…]}`                    |
 
 `send` and `reply` are attributed to the caller by its process ancestry (`SO_PEERCRED`): a Claude, agy or pi session, or a registered service (a service sends over `agent.sock`, attributed by its pid; plan §6 D15). The sender's label is A12's one render, `label · id@node` for an instance and `name@node` for a service; callers cannot supply a sender or a return address. Errors are `{"status":"error","error","detail"}` with the codes of §4.
 
@@ -191,7 +191,7 @@ anonymous (A15, HA2).
 Exposes four tools (A13; all execute autonomously without user interaction prompts):
 
 - **`list(name?, node?, kind?)`:** the recipients the caller may see: each entry's address (`id@node` for an instance, `name@node` for a service), kind (`service` or `instance`), label and status. `node` lists a federated peer.
-- **`send(to, text)`:** `to` is an instance ID (a UUID, optionally `~n`), a service name or an instance label, optionally followed by `@node` (one `@` at most). Returns the message ID, the resolved address and the outcome; follow-ups to the address cannot drift to another instance. The caller's identity is derived; a `from` argument is refused. MCP carries no `idempotency_key`: agents do not retry a send by accident, and programs that retry use HTTP or `agent.sock`.
+- **`send(to, text)`:** `to` is an instance ID (a UUID, optionally `~n`), a service name or an instance label, optionally followed by `@node` (one `@` at most). Returns the message ID, the resolved address and the outcome; follow-ups to the address cannot drift to another instance. The caller's identity is derived; a `from` argument is refused. MCP carries no `idempotency_key` on `send` or `reply`: agents do not retry by accident, and programs that retry use HTTP, `agent.sock` or `register.sock`.
 - **`reply(message_id, text)`:** reply to a message the caller received.
 - **`replies(message_id, wait?)`:** the stored replies to a message the caller sent, waiting up to `wait` seconds (at most 60) for the first.
 
@@ -470,6 +470,8 @@ Communication over the registration socket uses a JSON-lines streaming protocol:
 
    Server responds: `{"status": "ok"}`.
 
+   A reply is `{ "action": "reply", "messageId": "01M4FG...", "text": "...", "idempotencyKey": "..." }` (the key optional, Section 4, Idempotency); the server responds `{"status": "ok", "messageId": <the pushed reply's ID, or null>}`.
+
 3. **At-Least-Once Delivery Contract:**
    The long-poll cursor advances **only** upon receiving an explicit `ack` frame. If a daemon crashes, disconnects, or terminates before sending an `ack`, the unacknowledged message remains at the head of the queue and will be redelivered when the daemon reconnects and polls again.
 
@@ -575,7 +577,7 @@ One vocabulary on every surface, as `{"error": <code>, "detail": …}` (HTTP) or
   { "message_id": "01J9XYZ...", "address": "genie-guard@sini.cortex", "outcome": "delivered" }
   ```
   `address` is the resolved address; send follow-ups to it, so they cannot drift to another instance. `outcome` is `delivered` or `queued`.
-- `POST /v1/messages/{id}/replies` `{"text"}`: reply to a message the caller received. A caller traced on `http.sock` replies as its session or service; an anonymous caller has received nothing and is `denied` (A15). On TCP in leaf mode, the caller is the leaf principal (AM-2).
+- `POST /v1/messages/{id}/replies` `{"text","idempotency_key"?}`: reply to a message the caller received; returns `200` with the stored reply `{"seq","messageId","createdAt","replierSessionId","text","pushOutcome","pushedMessageId"}`. A caller traced on `http.sock` replies as its session or service; an anonymous caller has received nothing and is `denied` (A15). On TCP in leaf mode, the caller is the leaf principal (AM-2).
 - `GET /v1/messages/{id}/replies?after={seq}&wait={seconds}`: the stored replies to a message, waiting up to `wait` seconds (capped at 60; at most 128 concurrent waiters) for the first. Anyone holding the message ID may read them.
 - `GET /v1/messages/{id}`: a message's record and its replies (kept; not part of A13's surface).
 
@@ -583,8 +585,15 @@ One vocabulary on every surface, as `{"error": <code>, "detail": …}` (HTTP) or
 
 #### Idempotency
 
-- **Semantics**: Providing `idempotency_key` (HTTP and `agent.sock`; not MCP) ensures at-most-once delivery across retries. A replay with the identical body returns the first send's result, its `message_id` included, with no second delivery. Re-sending the same key with an altered body returns `409 conflict`. Message-ID deduplication between nodes is separate and unchanged.
-- **Scoping**: keys are scoped to the sender: an attested session by its instance ID (a fork's `~n` included), a service by its name, and an anonymous HTTP caller by `anon:<from>` (A15).
+- **Semantics**: Providing `idempotency_key` on a `send` or a `reply` (HTTP, `agent.sock`, and `register.sock`'s service and plugin frames, where a service's frame spells it `idempotencyKey`; not MCP) ensures at-most-once delivery across retries, concurrent ones included. The key is reserved, and the message ID (a reply's ID) minted, in one transaction before anything is delivered, so one key is one message:
+  - a send with the key and the identical body, once the first has settled, returns the first send's result, its `message_id` included, with no second delivery;
+  - while the first is still being delivered, it waits up to 2 seconds for it to settle, and otherwise returns `{"message_id": <the first send's ID>, "address": "", "outcome": "pending"}` (HTTP `202`; on `agent.sock` with `"status":"ok"`), delivering nothing. `pending` says the outcome is not known yet, not that the send failed; send again with the same key to read the outcome. The first send runs to its outcome even if its caller hung up;
+  - a send whose delivery failed (an error was returned) leaves the key free to be delivered again by the next send with it, under the same message ID, so a peer that did receive the first copy deduplicates it by that ID;
+  - a reply's key names one reply to one message: a retry returns the stored reply (the same `seq` and `pushedMessageId`), or while the first is still being pushed `{"seq": 0, "messageId", "createdAt", "replierSessionId", "text", "pushOutcome": "pending", "pushedMessageId": <its reply ID>}`;
+  - the same key with an altered body, or on a reply to another message, returns `409 conflict`;
+  - a send interrupted by the server stopping keeps its key `pending` until the key expires (`--idempotency-ttl`, default 24 h).
+- **Between nodes**: message-ID deduplication is separate and unchanged.
+- **Scoping**: keys are scoped to the sender, a send's and a reply's apart: an attested session by its instance ID (a fork's `~n` included), a service by its name, and an anonymous HTTP caller by `anon:<from>` (A15).
 - **Limitation**: anonymous callers choose their own `from`, so two HTTP clients using the same `from` share a key namespace. Callers that need isolation send over `agent.sock`, attributed by process.
 
 ### Persisted state and the schema version
@@ -592,7 +601,7 @@ One vocabulary on every surface, as `{"error": <code>, "detail": …}` (HTTP) or
 The database (`--db-path`; default `$XDG_STATE_HOME/xmsg/xmsg.db`, else `~/.local/state/xmsg/xmsg.db`) records its schema version in `PRAGMA user_version`. This schema is version 3. At startup:
 
 - a database at version 3 is opened with its rows, so queued messages, stored replies and outbound records survive a restart, and it gains any table version 3 has since been extended with;
-- a database below it (every build up to and including the deployed `ee1b6ca`, none of which recorded a version, reads 0; and version 2, an unreleased build whose `outbound` has no `resolved` column) has its message state dropped (`messages`, `outbound`, `replies`, the `*_pending_messages` queues, `instance_queue`, `idempotency_keys`, `peer_mailbox`, `location_cache`, and `forwarded_messages` where it exists) and is recreated at version 3, in one transaction. The claim table is kept;
+- a database below it (every build up to and including the deployed `ee1b6ca`, none of which recorded a version, reads 0; and version 2, an unreleased build whose `outbound` has no `resolved` column) has its message state dropped (`messages`, `outbound`, `replies`, the `*_pending_messages` queues, `instance_queue`, `idempotency_keys`, `reply_idempotency_keys`, `peer_mailbox`, `location_cache`, and `forwarded_messages` where it exists) and is recreated at version 3, in one transaction. The claim table is kept;
 - a database above it is refused, naming both versions.
 
 So the first start after the upgrade from `ee1b6ca` loses messages queued before it, and a reply to a message sent before it fails as unknown. To roll back, copy the database before the upgrade and restore it with the previous binary.

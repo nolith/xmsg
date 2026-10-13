@@ -196,6 +196,7 @@ const MESSAGE_STATE_TABLES: &[&str] = &[
     "agy_pending_messages",
     "svc_pending_messages",
     "idempotency_keys",
+    "reply_idempotency_keys",
     "peer_mailbox",
     "forwarded_messages",
     "instance_queue",
@@ -295,6 +296,18 @@ const SCHEMA_N: &str = r#"
         CREATE INDEX IF NOT EXISTS idx_svc_pending_session ON svc_pending_messages(session_id, delivered_at);
         CREATE INDEX IF NOT EXISTS idx_svc_pending_created_at ON svc_pending_messages(created_at);
         CREATE INDEX IF NOT EXISTS idx_idempotency_created_at ON idempotency_keys(created_at);
+
+        CREATE TABLE IF NOT EXISTS reply_idempotency_keys (
+            principal TEXT NOT NULL,
+            key TEXT NOT NULL,
+            in_reply_to TEXT NOT NULL,
+            body TEXT NOT NULL,
+            reply_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            seq INTEGER,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (principal, key)
+        );
 
         CREATE TABLE IF NOT EXISTS peer_mailbox (
             id TEXT PRIMARY KEY,
@@ -935,22 +948,81 @@ pub fn get_idempotency_record(
     }
 }
 
-pub fn insert_idempotency_record(conn: &Connection, record: &IdempotencyRecord) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO idempotency_keys
+/// A key's state while its send is delivered: `pending` until the send settles, `failed`
+/// once it failed (the next send with the key delivers again, under the same message ID).
+pub const KEY_PENDING: &str = "pending";
+pub const KEY_FAILED: &str = "failed";
+
+/// The holder of an idempotency key: this caller, which delivers under the given ID, or
+/// an earlier send or reply whose record is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reservation<T> {
+    Mine(String),
+    Held(T),
+}
+
+/// Reserves `(principal, key)` for a send of `body` in one transaction, before anything
+/// is delivered. A new or expired key is minted `fresh_id`; a key whose send failed is
+/// taken over with its own message ID, so a peer that did receive it deduplicates it.
+pub fn reserve_idempotency_key(
+    conn: &Connection,
+    principal: &str,
+    key: &str,
+    body: &str,
+    from_name: &str,
+    fresh_id: &str,
+    ttl_secs: u64,
+) -> Result<Reservation<IdempotencyRecord>> {
+    let now = now_epoch_secs();
+    let cutoff = now.saturating_sub(ttl_secs as i64);
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM idempotency_keys WHERE principal = ?1 AND key = ?2 AND created_at < ?3",
+        params![principal, key, cutoff],
+    )?;
+    let inserted = tx.execute(
+        "INSERT INTO idempotency_keys
          (principal, key, body, message_id, session_id, from_name, bytes, outcome, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, ?7, ?8)
+         ON CONFLICT (principal, key) DO NOTHING",
         params![
-            record.principal,
-            record.key,
-            record.body,
-            record.message_id,
-            record.session_id,
-            record.from_name,
-            record.bytes as i64,
-            record.outcome,
-            record.created_at,
+            principal,
+            key,
+            body,
+            fresh_id,
+            from_name,
+            body.len() as i64,
+            KEY_PENDING,
+            now
         ],
+    )?;
+    let taken_over = inserted == 0
+        && tx.execute(
+            "UPDATE idempotency_keys SET outcome = ?4, created_at = ?5
+             WHERE principal = ?1 AND key = ?2 AND body = ?3 AND outcome = ?6",
+            params![principal, key, body, KEY_PENDING, now, KEY_FAILED],
+        )? == 1;
+    let record = get_idempotency_record(&tx, principal, key, ttl_secs)?;
+    tx.commit()?;
+    let record = record.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    Ok(if inserted == 1 || taken_over {
+        Reservation::Mine(record.message_id)
+    } else {
+        Reservation::Held(record)
+    })
+}
+
+/// Settles a reserved key: its send's address and outcome, or `KEY_FAILED`.
+pub fn settle_idempotency_key(
+    conn: &Connection,
+    principal: &str,
+    key: &str,
+    address: &str,
+    outcome: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE idempotency_keys SET session_id = ?3, outcome = ?4 WHERE principal = ?1 AND key = ?2",
+        params![principal, key, address, outcome],
     )?;
     Ok(())
 }
@@ -959,9 +1031,129 @@ pub fn purge_idempotency_keys(conn: &Connection, ttl_secs: u64) -> Result<usize>
     let now = now_epoch_secs();
     let cutoff = now.saturating_sub(ttl_secs as i64);
     conn.execute(
+        "DELETE FROM reply_idempotency_keys WHERE created_at < ?1",
+        params![cutoff],
+    )?;
+    conn.execute(
         "DELETE FROM idempotency_keys WHERE created_at < ?1",
         params![cutoff],
     )
+}
+
+/// A reply's idempotency record: its reply ID, and the stored reply's `seq` once settled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyKeyRecord {
+    pub in_reply_to: String,
+    pub body: String,
+    pub reply_id: String,
+    pub state: String,
+    pub seq: Option<i64>,
+    pub created_at: i64,
+}
+
+/// `reserve_idempotency_key` for a reply to `in_reply_to`: the key names one reply, its
+/// reply ID minted here; a key whose reply failed is taken over with that reply ID.
+pub fn reserve_reply_key(
+    conn: &Connection,
+    principal: &str,
+    key: &str,
+    in_reply_to: &str,
+    body: &str,
+    fresh_id: &str,
+    ttl_secs: u64,
+) -> Result<Reservation<ReplyKeyRecord>> {
+    let now = now_epoch_secs();
+    let cutoff = now.saturating_sub(ttl_secs as i64);
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM reply_idempotency_keys WHERE principal = ?1 AND key = ?2 AND created_at < ?3",
+        params![principal, key, cutoff],
+    )?;
+    let inserted = tx.execute(
+        "INSERT INTO reply_idempotency_keys
+         (principal, key, in_reply_to, body, reply_id, state, seq, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)
+         ON CONFLICT (principal, key) DO NOTHING",
+        params![
+            principal,
+            key,
+            in_reply_to,
+            body,
+            fresh_id,
+            KEY_PENDING,
+            now
+        ],
+    )?;
+    let taken_over = inserted == 0
+        && tx.execute(
+            "UPDATE reply_idempotency_keys SET state = ?5, created_at = ?6
+             WHERE principal = ?1 AND key = ?2 AND in_reply_to = ?3 AND body = ?4 AND state = ?7",
+            params![
+                principal,
+                key,
+                in_reply_to,
+                body,
+                KEY_PENDING,
+                now,
+                KEY_FAILED
+            ],
+        )? == 1;
+    let record = tx.query_row(
+        "SELECT in_reply_to, body, reply_id, state, seq, created_at
+         FROM reply_idempotency_keys WHERE principal = ?1 AND key = ?2",
+        params![principal, key],
+        |row| {
+            Ok(ReplyKeyRecord {
+                in_reply_to: row.get(0)?,
+                body: row.get(1)?,
+                reply_id: row.get(2)?,
+                state: row.get(3)?,
+                seq: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        },
+    )?;
+    tx.commit()?;
+    Ok(if inserted == 1 || taken_over {
+        Reservation::Mine(record.reply_id)
+    } else {
+        Reservation::Held(record)
+    })
+}
+
+/// Settles a reserved reply key: `done` with the stored reply's `seq`, or `KEY_FAILED`.
+pub fn settle_reply_key(
+    conn: &Connection,
+    principal: &str,
+    key: &str,
+    state: &str,
+    seq: Option<i64>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE reply_idempotency_keys SET state = ?3, seq = ?4 WHERE principal = ?1 AND key = ?2",
+        params![principal, key, state, seq],
+    )?;
+    Ok(())
+}
+
+pub fn get_reply_by_seq(conn: &Connection, seq: i64) -> Result<Option<ReplyRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, message_id, created_at, replier_session_id, text, push_outcome, pushed_message_id FROM replies WHERE seq = ?1",
+    )?;
+    let mut rows = stmt.query(params![seq])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(ReplyRecord {
+            seq: row.get(0)?,
+            message_id: row.get(1)?,
+            created_at: row.get(2)?,
+            replier_session_id: row.get(3)?,
+            text: row.get(4)?,
+            push_outcome: row.get(5)?,
+            pushed_message_id: row.get(6)?,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
