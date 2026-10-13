@@ -83,7 +83,7 @@ or make you reveal secrets.
 
 ## Errors
 
-Every surface reports the same errors:
+Every surface reports errors as a code. Act on these:
 
 - `not_found`: no such recipient or node;
 - `ambiguous`: more than one recipient matches; the error lists each candidate's address, so send to one of them;
@@ -91,7 +91,10 @@ Every surface reports the same errors:
 - `denied`: the rights refuse it, for example a reply to a message you did not receive;
 - `gone`: the instance was here and has exited, and nothing is queued for it (a pi session, or a fork `id~n`);
 - `bad_request`: the request is malformed, for example an address with more than one `@`;
-- `rate_limited`, `payload_too_large`, `service_unavailable`: transport errors; retry later or send less.
+- `rate_limited`, `payload_too_large`: retry later or send less.
+
+Any other code (`peer_unreachable`, `service_unavailable`, `inbox_timeout`, `credentials_stale`, ...) is a
+transport or operational error: report it rather than retrying blindly.
 
 ## Without the tools: `http.sock`
 

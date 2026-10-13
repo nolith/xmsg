@@ -3,8 +3,11 @@
 #
 # - `agy-hook` (plan oracle 3): the command the module renders into agy's hooks.json, run by a
 #   fake agy against a real `xmsg serve`, registers the fake agy's conversation C, and C is
-#   addressed as C.
-# - `pi-extension`, `pi-paths`: the pi extension's own node tests (extensions/pi).
+#   addressed as C. Only Arm A is tested: here /proc/locks and the children file are readable,
+#   so the hook registers C itself. B′ (non-Linux, or no children file: the hook answers with an
+#   inject step) has no sandbox oracle.
+# - `pi-extension`, `pi-paths`: the pi extension's own node tests (extensions/pi). The
+#   extension's darwin `getconf DARWIN_USER_TEMP_DIR` fallback is not covered by CI.
 { inputs, ... }:
 {
   perSystem =
@@ -44,21 +47,16 @@
 
       # One agy turn, run by the fake agy (`flock`, holding C's presence lock): the
       # PreInvocation hook with C on stdin, then the turn's command with agy's language-server
-      # credentials in its environment. If the hook asked for an inject step, that step's
-      # command is the turn's first command, as agy runs it.
+      # credentials in its environment. The turn ends in a child without those credentials, so
+      # the lock holder outlives the turn but a later registration finds nothing to read.
       agyTurn = pkgs.writeShellScript "agy-turn" ''
         hook=$1 conv=$2 done=$3
         out=$(printf '{"conversationId":"%s"}' "$conv" | sh -c "$hook")
         echo "agy-hook: hook printed: $out"
-        step=$(printf '%s' "$out" | jq -Rr 'fromjson? | .injectSteps[0].userMessage // empty' | sed -n 's/^[^`]*`\([^`]*\)`.*$/\1/p')
         export ANTIGRAVITY_CONVERSATION_ID=$conv ANTIGRAVITY_LS_ADDRESS=127.0.0.1:1 ANTIGRAVITY_CSRF_TOKEN=fixture-token
-        if [ -n "$step" ]; then
-          echo "agy-hook: running the inject step: $step"
-          sh -c "$step"
-        fi
         sleep 1
         touch "$done"
-        exec sleep 120
+        exec env -u ANTIGRAVITY_LS_ADDRESS -u ANTIGRAVITY_CSRF_TOKEN sleep 120
       '';
 
       nodeCheck =
