@@ -409,9 +409,11 @@ async fn listed(node: &Node, id: &str) -> bool {
 
 // =============================================================================
 // Oracle 1 (A14). Claude fake X exits, and a send returns `queued`. When a new process
-// presents X, the message is delivered once, carrying its send time.
+// presents X, the message is delivered once, carrying its send time: the second it was
+// sent, not the second it was drained.
 // Mutant: refuse a non-running instance => RED.
 // Mutant: deliver again on the next observation => RED.
+// Mutant: stamp the delivery time => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_oracle_1_queue_then_deliver_once_with_send_time() {
@@ -432,6 +434,10 @@ async fn test_oracle_1_queue_then_deliver_once_with_send_time() {
     assert_eq!(body["address"], format!("{ID_X}@{}", node_name()), "{body}");
     let message_id = body["message_id"].as_str().unwrap().to_string();
     assert!(in_first.matching("queued-body").is_empty());
+
+    // The drain falls at least a second after the send, so a stamp taken at delivery
+    // cannot pass for the send time.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
 
     // A new process presents X: the next observation drains the queue into it.
     let second = Sleeper::new();
@@ -764,4 +770,143 @@ async fn test_oracle_7_filter_names_the_anonymous_principal() {
         .await;
     assert_eq!(status, 403, "anon:x is refused: {body}");
     assert_eq!(body["error"], "denied", "{body}");
+}
+
+// =============================================================================
+// Oracle 8 (D-2, A14). Process P presents X, switches to Y, and returns to X. The return is
+// a new observation: P holds X again, the message queued while P was on Y is delivered to
+// P, and a send to X while P presents it is delivered to P once.
+// Mutant: count released rows as observed => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_8_return_to_x_is_observed_again() {
+    let node = Node::start(Spec::default());
+    let p = Sleeper::new();
+    let inp = inbox();
+    claude_file(&node, "p", p.pid(), ID_X, "x", &inp.sock);
+    assert!(listed(&node, ID_X).await, "P holds X");
+
+    claude_file(&node, "p", p.pid(), ID_Y, "y", &inp.sock);
+    assert!(!listed(&node, ID_X).await, "P left X");
+    let (status, body) = node.send(ID_X, "while-on-y").await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["outcome"], "queued", "{body}");
+
+    claude_file(&node, "p", p.pid(), ID_X, "x", &inp.sock);
+    assert!(listed(&node, ID_X).await, "P back on X holds X");
+    let got = inp.wait_for("while-on-y").await;
+    assert_eq!(
+        got.len(),
+        1,
+        "the message queued while P was on Y reaches P: {got:?}"
+    );
+
+    let (status, body) = node.send(ID_X, "while-back-on-x").await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["outcome"], "delivered", "{body}");
+    let got = inp.wait_for("while-back-on-x").await;
+    assert_eq!(got.len(), 1, "delivered to P once: {got:?}");
+}
+
+// =============================================================================
+// Oracle 9 (D-2, D-4, D-5). P presents X and switches to Y; Q then takes plain X; P returns
+// to X and is a new observation behind a live holder, so it gets `X~2`. Q keeps plain X,
+// and a call on `http.sock` from P's child is attributed to `X~2`, never to plain X.
+// Mutant: count released rows as observed => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_9_return_behind_a_new_holder_is_a_fork() {
+    let node = Node::start(Spec::default());
+    let p = FakeParent::spawn(CHILD);
+    let q = Sleeper::new();
+    let (r, inr) = (Sleeper::new(), inbox());
+    let (inp, inq) = (inbox(), inbox());
+    claude_file(&node, "r", r.pid(), ID_R, "r", &inr.sock);
+    claude_file(&node, "p", p.pid(), ID_X, "x", &inp.sock);
+    assert!(listed(&node, ID_X).await, "P holds X");
+    claude_file(&node, "p", p.pid(), ID_Y, "y", &inp.sock);
+    node.list().await;
+    claude_file(&node, "q", q.pid(), ID_X, "x", &inq.sock);
+    assert!(listed(&node, ID_X).await, "Q holds X");
+    claude_file(&node, "p", p.pid(), ID_X, "x", &inp.sock);
+    let fork = format!("{ID_X}~2");
+    assert!(listed(&node, &fork).await, "P back on X holds X~2");
+
+    // Q stays plain X, and P is X~2.
+    let (status, body) = node.send(ID_X, "to-plain-x").await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["outcome"], "delivered", "{body}");
+    assert_eq!(inq.wait_for("to-plain-x").await.len(), 1, "Q holds plain X");
+    assert!(inp.matching("to-plain-x").is_empty(), "P is not plain X");
+    let (status, body) = node.send(&fork, "to-the-fork").await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(inp.wait_for("to-the-fork").await.len(), 1, "P holds X~2");
+
+    // P's child calls http.sock: attributed to X~2.
+    let (status, body) = p
+        .request(
+            &node.unix(),
+            "POST",
+            "/v1/messages",
+            Some(&json!({ "to": ID_R, "from": "spoofed", "text": "from-p" })),
+        )
+        .await;
+    assert_eq!(status, 202, "{body}");
+    let got = inr.wait_for("from-p").await;
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(
+        from_name(&got[0]),
+        format!("x · {fork}@{}", node_name()),
+        "P acts as X~2, not as plain X"
+    );
+}
+
+// =============================================================================
+// Oracle 10 (A14). A session file names Y for a process that died before any request
+// observed it: Y was never listed, so a send is `not_found`, as for an ID no file names.
+// Mutant: answer `gone` from the dead session file => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_10_dead_file_never_observed_is_not_found() {
+    let node = Node::start(Spec::default());
+    let p = Sleeper::new();
+    let inp = inbox();
+    claude_file(&node, "d", p.pid(), ID_Y, "y", &inp.sock);
+    p.end();
+    let (status, body) = node.send(ID_Y, "to-dead-file").await;
+    assert_eq!(status, 404, "a dead file never observed: {body}");
+    assert_eq!(body["error"], "not_found", "{body}");
+    let (status, body) = node.send(ID_NEVER, "control").await;
+    assert_eq!(status, 404, "control, an ID no file names: {body}");
+    assert_eq!(body["error"], "not_found", "{body}");
+}
+
+// =============================================================================
+// Oracle 11 (A15). A registered service's own process calls `http.sock`: the caller is
+// the service, found at the first step of the walk.
+// Mutant: start the walk at the caller's parent => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_11_service_process_is_the_service() {
+    let node = Node::start(Spec {
+        services: vec!["asker".to_string()],
+        ..Default::default()
+    });
+    let (r, inr) = (Sleeper::new(), inbox());
+    claude_file(&node, "r", r.pid(), ID_R, "r", &inr.sock);
+    // This test process registers as the service, then calls http.sock itself.
+    let (_asker, _) = Registration::open(
+        &node.register_sock,
+        json!({ "harness": "svc", "name": "asker" }),
+    )
+    .await;
+    let (status, body) = node.send(ID_R, "from-the-service").await;
+    assert_eq!(status, 202, "{body}");
+    let got = inr.wait_for("from-the-service").await;
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(
+        from_name(&got[0]),
+        format!("asker@{}", node_name()),
+        "the service's own process is the service"
+    );
 }

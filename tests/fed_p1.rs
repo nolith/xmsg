@@ -2166,6 +2166,7 @@ exit 0
         &node_b.db,
         &session_key,
         &conv_id,
+        Duration::from_secs(3600),
     )
     .await;
 

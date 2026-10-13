@@ -449,7 +449,15 @@ exit 0
     }
 
     // 4. Trigger queue flush
-    flush_agy_queue(&agy_config, &agy_store, &db, &session_key, &conv_id).await;
+    flush_agy_queue(
+        &agy_config,
+        &agy_store,
+        &db,
+        &session_key,
+        &conv_id,
+        Duration::from_secs(3600),
+    )
+    .await;
 
     // 5. Verify delivered in FIFO order
     assert!(
@@ -502,7 +510,15 @@ exit 0
     }
 
     // 7. Flush again: must NOT deliver again (exactly once!)
-    flush_agy_queue(&agy_config, &agy_store, &db, &session_key, &conv_id).await;
+    flush_agy_queue(
+        &agy_config,
+        &agy_store,
+        &db,
+        &session_key,
+        &conv_id,
+        Duration::from_secs(3600),
+    )
+    .await;
     let log_content_after = fs::read_to_string(&delivered_log).unwrap();
     let deliveries_after: Vec<&str> = log_content_after
         .split("===DELIVERY===\n")

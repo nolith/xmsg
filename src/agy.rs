@@ -765,12 +765,15 @@ pub fn attest_mcp_caller(
     ))
 }
 
+/// Delivers what is queued for a conversation that has just registered. A message older
+/// than `reply_ttl` is dropped unread, never delivered (A14).
 pub async fn flush_agy_queue(
     config: &AgyConfig,
     store: &AgyStore,
     db: &Arc<Mutex<rusqlite::Connection>>,
     session_key: &str,
     conv_id: &str,
+    reply_ttl: Duration,
 ) {
     let pending_msgs = {
         let db_lock = match db.lock() {
@@ -783,6 +786,10 @@ pub async fn flush_agy_queue(
         // A registration is an observation: the conversation is live now (A14).
         let _ =
             crate::storage::mark_live(&db_lock, conv_id, "agy", crate::storage::now_epoch_secs());
+        if let Err(e) = crate::storage::purge_agy_messages(&db_lock, reply_ttl.as_secs()) {
+            tracing::error!("failed to purge expired agy messages: {e}");
+            return;
+        }
         match crate::storage::fetch_undelivered_agy_messages(&db_lock, &[session_key, conv_id]) {
             Ok(msgs) => msgs,
             Err(e) => {
@@ -1192,6 +1199,7 @@ async fn register_from_subtree(
     holder_pid: u32,
     holder_st: &str,
     watch: &mut AgyProcWatch,
+    reply_ttl: Duration,
 ) -> Result<bool, AppError> {
     let proc_root = &config.proc_root;
     let st_of = |pid: u32| crate::process::starttime(proc_root, pid).ok();
@@ -1288,7 +1296,7 @@ async fn register_from_subtree(
                         .write()
                         .unwrap()
                         .insert(reg.session_key.clone(), session_info);
-                    flush_agy_queue(config, store, db, &reg.session_key, conv_id).await;
+                    flush_agy_queue(config, store, db, &reg.session_key, conv_id, reply_ttl).await;
                     return Ok(true);
                 }
                 Err(e) => {
@@ -1321,6 +1329,7 @@ pub async fn scan_and_register_agy_proc(
     my_uid: u32,
     conv_ids: &[String],
     watch: &mut AgyProcWatch,
+    reply_ttl: Duration,
 ) -> Result<Vec<String>, AppError> {
     if !locks_supported(&config.proc_locks_path) || config.trusted_agy_exes.is_empty() {
         return Ok(Vec::new());
@@ -1332,7 +1341,7 @@ pub async fn scan_and_register_agy_proc(
             continue;
         };
         if !register_from_subtree(
-            config, store, db, my_uid, conv_id, holder_pid, &holder_st, watch,
+            config, store, db, my_uid, conv_id, holder_pid, &holder_st, watch, reply_ttl,
         )
         .await?
         {
@@ -1352,6 +1361,7 @@ pub async fn run_agy_proc_watcher(
     db: Arc<Mutex<rusqlite::Connection>>,
     my_uid: u32,
     mut arm_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    reply_ttl: Duration,
 ) {
     if !locks_supported(&config.proc_locks_path) || config.trusted_agy_exes.is_empty() {
         tracing::info!(
@@ -1376,7 +1386,9 @@ pub async fn run_agy_proc_watcher(
             armed.insert(conv_id);
         }
         let ids: Vec<String> = armed.drain().collect();
-        match scan_and_register_agy_proc(&config, &store, &db, my_uid, &ids, &mut watch).await {
+        match scan_and_register_agy_proc(&config, &store, &db, my_uid, &ids, &mut watch, reply_ttl)
+            .await
+        {
             Ok(still) => armed.extend(still),
             Err(e) => {
                 tracing::debug!("agy proc scan failed: {e}");
@@ -1441,7 +1453,15 @@ pub async fn run_register_server(
     let watcher_store = store.clone();
     let watcher_db = db.clone();
     tokio::spawn(async move {
-        run_agy_proc_watcher(watcher_config, watcher_store, watcher_db, my_uid, arm_rx).await;
+        run_agy_proc_watcher(
+            watcher_config,
+            watcher_store,
+            watcher_db,
+            my_uid,
+            arm_rx,
+            reply_ttl,
+        )
+        .await;
     });
 
     loop {
@@ -1684,6 +1704,7 @@ pub async fn run_register_server(
                                         &db_clone,
                                         &reg.session_key,
                                         &req.conversation_id,
+                                        reply_ttl,
                                     )
                                     .await;
                                 }

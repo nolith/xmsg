@@ -313,8 +313,10 @@ async fn test_e2e_post_message_accepted_202() {
         .contains("from-name=\"claude · anon@test-host\""));
 }
 
+/// A dead session file that no request observed live was never listed, so its label
+/// answers `not_found` (A14), not `gone`.
 #[tokio::test]
-async fn test_e2e_post_message_dead_session_gone_410() {
+async fn test_e2e_post_message_dead_session_never_observed_not_found_404() {
     let harness = start_harness(65536).await;
     let client = reqwest::Client::new();
 
@@ -329,9 +331,9 @@ async fn test_e2e_post_message_dead_session_gone_410() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::GONE);
+    assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
     let err_val: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(err_val["error"], "gone");
+    assert_eq!(err_val["error"], "not_found");
 }
 
 #[tokio::test]

@@ -138,6 +138,7 @@ async fn scan(tree: &Tree, store: &AgyStore, convs: &[&str]) -> Result<Vec<Strin
         xmsg::agent::current_uid(),
         &ids,
         &mut AgyProcWatch::default(),
+        Duration::from_secs(3600),
     )
     .await
     .map_err(|e| e.to_string())

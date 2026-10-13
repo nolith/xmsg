@@ -199,7 +199,12 @@ pub(crate) async fn resolve_target(
                 crate::claim::resolve_claude_id_in(conn, pairs, node_name, ref_str),
                 crate::claim::claude_label_matches(pairs, ref_str),
                 crate::claim::claude_absence_in(conn, sessions_dirs, ref_str),
-                storage::seen_instance(conn, ref_str, now),
+                storage::seen_instance(
+                    conn,
+                    ref_str,
+                    now,
+                    reply_ttl.map_or(0, |t| t.as_secs() as i64),
+                ),
             )
         })
         .await?;

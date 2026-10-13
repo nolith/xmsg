@@ -123,6 +123,7 @@ async fn start_test_http_server(
     proc_locks: PathBuf,
     presence_dir: PathBuf,
     fake_agy_bin: PathBuf,
+    reply_ttl: Duration,
 ) -> TestHttpServer {
     let agy_config = AgyConfig {
         presence_dir,
@@ -151,7 +152,7 @@ async fn start_test_http_server(
         request_counter: AtomicU64::new(1),
         db: db.clone(),
         notify_tx,
-        reply_ttl: Duration::from_secs(3600),
+        reply_ttl,
         idempotency_ttl: Duration::from_secs(86400),
         long_poll_semaphore: Arc::new(tokio::sync::Semaphore::new(128)),
         fed_state: None,
@@ -214,6 +215,7 @@ async fn test_oracle_1_lock_held_unregistered_send_queues_and_flushes_once() {
         proc_locks,
         presence_dir,
         fake_agy_bin.clone(),
+        Duration::from_secs(3600),
     )
     .await;
 
@@ -280,6 +282,7 @@ async fn test_oracle_1_lock_held_unregistered_send_queues_and_flushes_once() {
         &server.db,
         &session_key,
         conv_id,
+        Duration::from_secs(3600),
     )
     .await;
 
@@ -320,6 +323,7 @@ async fn test_oracle_1_lock_held_unregistered_send_queues_and_flushes_once() {
         &server.db,
         &session_key,
         conv_id,
+        Duration::from_secs(3600),
     )
     .await;
 
@@ -375,6 +379,7 @@ async fn test_oracle_2_old_agy_key_with_matching_starttime_queues_recycled_fails
         proc_locks,
         presence_dir,
         fake_agy_bin.clone(),
+        Duration::from_secs(3600),
     )
     .await;
 
@@ -494,6 +499,7 @@ async fn test_oracle_3_lock_not_held_returns_not_found_nothing_stored() {
         proc_locks,
         presence_dir,
         fake_agy_bin.clone(),
+        Duration::from_secs(3600),
     )
     .await;
 
@@ -902,6 +908,7 @@ async fn test_oracle_4_federated_send_queues_unregistered_and_checks_starttime()
         &node_b.db,
         &session_key,
         &conv_id,
+        Duration::from_secs(3600),
     )
     .await;
 
@@ -924,5 +931,191 @@ async fn test_oracle_4_federated_send_queues_unregistered_and_checks_starttime()
         deliveries[0].contains("fed payload 1"),
         "delivery must contain federated message: {}",
         deliveries[0]
+    );
+}
+
+// =============================================================================
+// XA4 (A14, D-1): an agy conversation between turns. Conversation C registers and its agy
+// goes away, so C is listed nowhere. A send to C is queued (A14: an agy between turns);
+// past the reply TTL after C was last live, a send still queues while C's queue holds an
+// unexpired message (D-1: a parked listing lasts as long as its queue); when C registers
+// again, both are delivered once.
+// Mutant: agy never marked live => RED.
+// Mutant: C's lifetime ignores agy's queue => RED.
+// =============================================================================
+
+/// An agy conversation whose agy is fake process 7031 (start time "100"), served with
+/// `reply_ttl`.
+struct AgyBetweenTurns {
+    _tmp: TempDir,
+    proc_root: PathBuf,
+    lock_file: PathBuf,
+    fake_agy_bin: PathBuf,
+    delivered_log: PathBuf,
+    server: TestHttpServer,
+}
+
+const XA4_CONV: &str = "conv-xa4-between-turns";
+const XA4_PID: u32 = 7031;
+
+impl AgyBetweenTurns {
+    async fn start(reply_ttl: Duration) -> AgyBetweenTurns {
+        let tmp = tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let proc_locks = tmp.path().join("locks");
+        let presence_dir = tmp.path().join("presence");
+        let sess_dir = tmp.path().join("sessions");
+        fs::create_dir_all(&proc_root).unwrap();
+        fs::create_dir_all(&presence_dir).unwrap();
+        fs::create_dir_all(&sess_dir).unwrap();
+        fs::write(&proc_locks, "").unwrap();
+        let delivered_log = tmp.path().join("delivered.log");
+        let fake_agy_bin = create_fake_agy_bin(tmp.path(), &delivered_log);
+        setup_presence_lock(
+            &presence_dir,
+            &proc_locks,
+            &proc_root,
+            XA4_CONV,
+            XA4_PID,
+            "100",
+            &fake_agy_bin,
+        );
+        let server = start_test_http_server(
+            sess_dir,
+            proc_root.clone(),
+            proc_locks,
+            presence_dir.clone(),
+            fake_agy_bin.clone(),
+            reply_ttl,
+        )
+        .await;
+        AgyBetweenTurns {
+            lock_file: presence_dir.join(format!("{XA4_CONV}.lock")),
+            _tmp: tmp,
+            proc_root,
+            fake_agy_bin,
+            delivered_log,
+            server,
+        }
+    }
+
+    /// C's agy is running and C registers: the registration flushes C's queue.
+    async fn register(&self, reply_ttl: Duration) {
+        setup_mock_process(
+            &self.proc_root,
+            XA4_PID,
+            1,
+            Some(&self.fake_agy_bin),
+            Some(&self.lock_file),
+            "100",
+        );
+        let info = AgySessionInfo::new(
+            XA4_CONV.to_string(),
+            XA4_PID,
+            "100".to_string(),
+            Some(AgyCredentials {
+                ls_address: "127.0.0.1:9999".to_string(),
+                csrf_token: "secret-token-xa4".to_string(),
+                is_stale: false,
+            }),
+        );
+        let key = info.session_key.clone();
+        self.server
+            .agy_store
+            .write()
+            .unwrap()
+            .insert(key.clone(), info);
+        flush_agy_queue(
+            &self.server.agy_config,
+            &self.server.agy_store,
+            &self.server.db,
+            &key,
+            XA4_CONV,
+            reply_ttl,
+        )
+        .await;
+    }
+
+    /// C's agy goes away: C is listed nowhere.
+    fn park(&self) {
+        fs::remove_dir_all(self.proc_root.join(XA4_PID.to_string())).unwrap();
+    }
+
+    async fn send(&self, text: &str) -> (StatusCode, Value) {
+        let resp = reqwest::Client::new()
+            .post(format!("{}/v1/messages", self.server.base_url))
+            .json(&serde_json::json!({ "to": XA4_CONV, "from": "ci", "text": text }))
+            .send()
+            .await
+            .unwrap();
+        (resp.status(), resp.json().await.unwrap())
+    }
+
+    fn deliveries(&self, needle: &str) -> usize {
+        fs::read_to_string(&self.delivered_log)
+            .unwrap_or_default()
+            .split("===DELIVERY===\n")
+            .filter(|d| d.contains(needle))
+            .count()
+    }
+}
+
+async fn wait_until_epoch(t: i64) {
+    while storage::now_epoch_secs() < t {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_oracle_xa4_1_agy_between_turns_queues_while_its_queue_lives() {
+    let ttl = Duration::from_secs(4);
+    let c = AgyBetweenTurns::start(ttl).await;
+    c.register(ttl).await;
+    let registered = storage::now_epoch_secs();
+    c.park();
+
+    wait_until_epoch(registered + 1).await;
+    let (status, body) = c.send("between-turns-1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "an agy between turns: {body}");
+    assert_eq!(body["outcome"], "queued", "{body}");
+
+    // Past the reply TTL after C was last live, but within the TTL of the queued message.
+    wait_until_epoch(registered + 4).await;
+    let (status, body) = c.send("between-turns-2").await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "C lives as long as its queue: {body}"
+    );
+    assert_eq!(body["outcome"], "queued", "{body}");
+    assert_eq!(c.deliveries("between-turns"), 0, "nothing delivered yet");
+
+    c.register(ttl).await;
+    assert_eq!(c.deliveries("between-turns-1"), 1, "delivered once");
+    assert_eq!(c.deliveries("between-turns-2"), 1, "delivered once");
+}
+
+// =============================================================================
+// XA4 (A14): an agy message older than the reply TTL is dropped unread, not delivered
+// when its conversation registers again.
+// Mutant: no age limit at registration => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread")]
+async fn test_oracle_xa4_2_expired_agy_message_is_not_delivered() {
+    let ttl = Duration::from_secs(2);
+    let c = AgyBetweenTurns::start(ttl).await;
+    c.register(ttl).await;
+    c.park();
+    let (status, body) = c.send("expired-agy").await;
+    let sent = storage::now_epoch_secs();
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["outcome"], "queued", "{body}");
+
+    wait_until_epoch(sent + 3).await;
+    c.register(ttl).await;
+    assert_eq!(
+        c.deliveries("expired-agy"),
+        0,
+        "an expired agy message is dropped, not delivered"
     );
 }

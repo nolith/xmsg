@@ -265,11 +265,12 @@ pub fn sync_claims_entries(
         }
     }
 
-    // 2. Discover newly observed processes
+    // 2. Discover newly observed processes. A released (ID, process) row is not a holder:
+    //    a process that presents X again after switching away is a new observation (D-2).
     let mut new_observations_by_id: HashMap<String, Vec<SessionFileEntry>> = HashMap::new();
     for entry in &live_entries {
         let mut check_stmt = conn
-            .prepare("SELECT COUNT(*) FROM instance_claims WHERE id = ?1 AND pid = ?2 AND proc_start = ?3")
+            .prepare("SELECT COUNT(*) FROM instance_claims WHERE id = ?1 AND pid = ?2 AND proc_start = ?3 AND released = 0")
             .map_err(|e| AppError::Internal(e.to_string()))?;
         let count: i64 = check_stmt
             .query_row(
@@ -313,8 +314,10 @@ pub fn sync_claims_entries(
                 std::cmp::max(2, max_suffix + 1)
             };
 
+            // The key is (id, pid, proc_start), so a released row of this process is
+            // re-claimed in place, under the suffix just assigned.
             conn.execute(
-                "INSERT INTO instance_claims (id, pid, proc_start, suffix, released, created_at) VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                "INSERT INTO instance_claims (id, pid, proc_start, suffix, released, created_at) VALUES (?1, ?2, ?3, ?4, 0, ?5) ON CONFLICT(id, pid, proc_start) DO UPDATE SET suffix = excluded.suffix, released = 0, created_at = excluded.created_at",
                 params![id, entry.pid, entry.proc_start, suffix, now],
             )
             .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -684,8 +687,8 @@ pub fn claude_label_matches(
         .collect()
 }
 
-/// Why `ref_str` names no live Claude instance: `Gone` when it was claimed before or a
-/// dead session file still names it, `NotFound` otherwise.
+/// Why `ref_str` names no live Claude instance: `Gone` when it was claimed before, or when
+/// it was observed before and a dead session file still names it; `NotFound` otherwise.
 pub fn claude_absence_in(
     conn: &Connection,
     sessions_dirs: &(impl SessionDirs + ?Sized),
@@ -704,6 +707,13 @@ pub fn claude_absence_in(
             }
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(e) => return AppError::Internal(e.to_string()),
+    }
+    // A bare ID no process here was ever observed presenting is `not_found` (A14), even
+    // when a session file still names it.
+    match storage::seen_instance(conn, ref_str, 0, 0) {
+        Ok(None) => return AppError::NotFound(ref_str.to_string()),
+        Ok(Some(_)) => {}
         Err(e) => return AppError::Internal(e.to_string()),
     }
 

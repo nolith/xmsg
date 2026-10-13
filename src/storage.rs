@@ -1133,7 +1133,8 @@ pub fn mark_live(conn: &Connection, id: &str, harness: &str, now: i64) -> Result
 }
 
 /// An instance observed before: its harness, when it was last live, and whether it has an
-/// unexpired queued message at `now`.
+/// unexpired queued message at `now`: in A14's queue, or in agy's queue within `ttl_secs`
+/// of its send (D-1: a parked listing lasts as long as its queue).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeenInstance {
     pub harness: String,
@@ -1141,7 +1142,12 @@ pub struct SeenInstance {
     pub queued: bool,
 }
 
-pub fn seen_instance(conn: &Connection, id: &str, now: i64) -> Result<Option<SeenInstance>> {
+pub fn seen_instance(
+    conn: &Connection,
+    id: &str,
+    now: i64,
+    ttl_secs: i64,
+) -> Result<Option<SeenInstance>> {
     let row = conn.query_row(
         "SELECT harness, last_live FROM instance_seen WHERE id = ?1",
         params![id],
@@ -1153,8 +1159,8 @@ pub fn seen_instance(conn: &Connection, id: &str, now: i64) -> Result<Option<See
         Err(e) => return Err(e),
     };
     let queued: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM instance_queue WHERE instance_id = ?1 AND delivered_at IS NULL AND expires_at > ?2",
-        params![id, now],
+        "SELECT (SELECT COUNT(*) FROM instance_queue WHERE instance_id = ?1 AND delivered_at IS NULL AND expires_at > ?2) + (SELECT COUNT(*) FROM agy_pending_messages WHERE session_id = ?1 AND delivered_at IS NULL AND created_at >= ?2 - ?3)",
+        params![id, now, ttl_secs],
         |r| r.get(0),
     )?;
     Ok(Some(SeenInstance {
