@@ -2228,7 +2228,7 @@ async fn fed_send_message_handler(
                 thread_id: envelope.thread_id.clone(),
             };
             if let Ok(db) = fed_state.db.lock() {
-                let _ = storage::insert_message(&db, &pre_record);
+                let _ = storage::upsert_message(&db, &pre_record);
             }
             return Err(err);
         }
@@ -2242,40 +2242,7 @@ async fn fed_send_message_handler(
         return Err(AppError::RateLimited("Rate limit exceeded".to_string()));
     }
 
-    // 6. Idempotent delivery: check if id already recorded
     let body_len = envelope.body.len();
-    {
-        let db = fed_state
-            .db
-            .lock()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        if let Some(existing) = storage::get_message(&db, &envelope.id)
-            .map_err(|e| AppError::Internal(e.to_string()))?
-        {
-            // Already delivered or processed! Return stored outcome without writing to inbox again
-            return match existing.outcome.as_str() {
-                "delivered" | "queued" | "accepted" => Ok((
-                    StatusCode::ACCEPTED,
-                    Json(DeliveryResponse {
-                        session_id: existing.session_id,
-                        from_name: existing.from_name,
-                        bytes: existing.bytes,
-                        message_id: existing.id,
-                        outcome: Some(existing.outcome),
-                    }),
-                )
-                    .into_response()),
-                "not_found" => Err(AppError::NotFound(existing.session_id)),
-                "ambiguous" => Err(AppError::Ambiguous(existing.session_id)),
-                "gone" => Err(AppError::Gone {
-                    session_id: existing.session_id,
-                    pid: 0,
-                }),
-                other => Err(AppError::BadRequest(format!("outcome: {other}"))),
-            };
-        }
-    }
-
     let (target_session_id, recipient_harness) = match &target {
         crate::http::ResolvedTarget::Claude(s, _)
         | crate::http::ResolvedTarget::Parked { session: s, .. } => {
@@ -2286,7 +2253,11 @@ async fn fed_send_message_handler(
         crate::http::ResolvedTarget::Svc(s) => (s.session_id.clone(), "svc".to_string()),
     };
 
-    // Pre-record message as accepted before inbox delivery
+    // 6. Idempotent delivery (X1): an ID recorded as delivered, queued or being delivered
+    // is answered from its record, never delivered again. An ID recorded as a failure was
+    // not delivered, so it is delivered again (a keyed retry keeps its message ID).
+    // Checked and recorded `accepted` under one lock, so two concurrent deliveries of one ID
+    // deliver it once.
     let pre_record = MessageRecord {
         id: envelope.id.clone(),
         created_at: envelope.created_at,
@@ -2305,7 +2276,23 @@ async fn fed_send_message_handler(
             .db
             .lock()
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        storage::insert_message(&db, &pre_record).map_err(|e| AppError::Internal(e.to_string()))?;
+        if let Some(existing) = storage::get_message(&db, &envelope.id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .filter(|m| storage::outcome_reached(&m.outcome))
+        {
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(DeliveryResponse {
+                    session_id: existing.session_id,
+                    from_name: existing.from_name,
+                    bytes: existing.bytes,
+                    message_id: existing.id,
+                    outcome: Some(existing.outcome),
+                }),
+            )
+                .into_response());
+        }
+        storage::upsert_message(&db, &pre_record).map_err(|e| AppError::Internal(e.to_string()))?;
         if envelope.forwarded.is_some() {
             storage::insert_forwarded_message(&db, &envelope.id, &peer.name, envelope.created_at)
                 .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -3780,10 +3767,13 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
             Ok(Some(FedInboxItem::Message(msg))) => {
                 backoff_millis = 100;
 
-                // Idempotency: if message already processed, just ack and continue
+                // Idempotency (X1): a message already delivered or queued here is acked
+                // and skipped; one recorded as a failure is delivered again.
                 let already_processed = {
                     if let Ok(db) = fed_state.db.lock() {
-                        storage::get_message(&db, &msg.id).unwrap_or(None).is_some()
+                        storage::get_message(&db, &msg.id)
+                            .unwrap_or(None)
+                            .is_some_and(|m| storage::outcome_reached(&m.outcome))
                     } else {
                         false
                     }
@@ -3879,7 +3869,7 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
                         };
 
                         if let Ok(db) = fed_state.db.lock() {
-                            let _ = storage::insert_message(&db, &msg_record);
+                            let _ = storage::upsert_message(&db, &msg_record);
                         }
 
                         let mut ack_backoff = 100u64;
@@ -3947,7 +3937,7 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
                         };
 
                         if let Ok(db) = fed_state.db.lock() {
-                            let _ = storage::insert_message(&db, &msg_record);
+                            let _ = storage::upsert_message(&db, &msg_record);
                         }
 
                         let mut ack_backoff = 100u64;

@@ -585,14 +585,19 @@ One vocabulary on every surface, as `{"error": <code>, "detail": …}` (HTTP) or
 
 #### Idempotency
 
-- **Semantics**: Providing `idempotency_key` on a `send` or a `reply` (HTTP, `agent.sock`, and `register.sock`'s service and plugin frames, where a service's frame spells it `idempotencyKey`; not MCP) ensures at-most-once delivery across retries, concurrent ones included. The key is reserved, and the message ID (a reply's ID) minted, in one transaction before anything is delivered, so one key is one message:
+- **Semantics**: Providing `idempotency_key` on a `send` or a `reply` (HTTP, `agent.sock`, and `register.sock`'s service and plugin frames, where a service's frame spells it `idempotencyKey`; not MCP) makes retries, concurrent ones included, deliver at most once, except in the residues named below. The key is reserved, and the message ID (a reply's ID) minted, in one transaction before anything is delivered, so one key is one message. A send's message record is written before it is delivered, so a failure to write it fails the send with nothing delivered; once a message is delivered, a failure of the bookkeeping after it is logged, and the send still answers its delivered outcome:
   - a send with the key and the identical body, once the first has settled, returns the first send's result, its `message_id` included, with no second delivery;
   - while the first is still being delivered, it waits up to 2 seconds for it to settle, and otherwise returns `{"message_id": <the first send's ID>, "address": "", "outcome": "pending"}` (HTTP `202`; on `agent.sock` with `"status":"ok"`), delivering nothing. `pending` says the outcome is not known yet, not that the send failed; send again with the same key to read the outcome. The first send runs to its outcome even if its caller hung up;
-  - a send whose delivery failed (an error was returned) leaves the key free to be delivered again by the next send with it, under the same message ID, so a peer that did receive the first copy deduplicates it by that ID;
+  - a send whose delivery failed (an error was returned) leaves the key free to be delivered again by the next send with it, under the same message ID, so a peer that did receive the first copy deduplicates it by that ID, and a peer that recorded a failure delivers it (Between nodes, below);
   - a reply's key names one reply to one message: a retry returns the stored reply (the same `seq` and `pushedMessageId`), or while the first is still being pushed `{"seq": 0, "messageId", "createdAt", "replierSessionId", "text", "pushOutcome": "pending", "pushedMessageId": <its reply ID>}`;
-  - the same key with an altered body, or on a reply to another message, returns `409 conflict`;
-  - a send interrupted by the server stopping keeps its key `pending` until the key expires (`--idempotency-ttl`, default 24 h).
-- **Between nodes**: message-ID deduplication is separate and unchanged.
+  - the same key with an altered body, or to another `to` (compared as given), or on a reply to another message, returns `409 conflict`;
+  - a send or reply interrupted by the server stopping is settled when the server starts again, before it serves: a send whose message record shows it delivered or queued takes that outcome, and a reply that was stored takes it; any other is settled as failed, so the next send with the key delivers it.
+- **Residues** (delivery and its record are not one act, and these recipients do not deduplicate by message ID): a retry can deliver twice when
+  - a Claude inbox write timed out part-way (more than about 200 KB unread for 5 s): the send failed, the inbox may hold the partial line, and the retry writes it again;
+  - a live agy delivery timed out after agy accepted it;
+  - the server stopped after a Claude or live agy delivery wrote the message but before the outcome was recorded: the restart settles the key as failed;
+  - storing a reply failed after it was pushed to a local inbox: the key is failed, and the retry pushes it again.
+- **Between nodes** (X1): message-ID deduplication means a message was delivered once. A node that recorded an ID as `delivered`, `queued` or being delivered (`accepted`) answers a repeat of it from that record and delivers nothing; an ID it recorded as a failure (`not_found`, `gone`, `ambiguous`, `failed`, `delivery_failed`) was not delivered, so a repeat is delivered again, on `/fed/v2/messages` and on a leaf's pull alike. That is how a keyed retry, which keeps its message ID, reaches a recipient whose node failed it the first time.
 - **Scoping**: keys are scoped to the sender, a send's and a reply's apart: an attested session by its instance ID (a fork's `~n` included), a service by its name, and an anonymous HTTP caller by `anon:<from>` (A15).
 - **Limitation**: anonymous callers choose their own `from`, so two HTTP clients using the same `from` share a key namespace. Callers that need isolation send over `agent.sock`, attributed by process.
 

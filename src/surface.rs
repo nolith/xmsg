@@ -810,18 +810,18 @@ pub async fn send(
                 || {
                     let db = state.db.lock().map_err(db_err)?;
                     storage::reserve_idempotency_key(
-                        &db, &principal, key, text, &from_name, &fresh, ttl,
+                        &db, &principal, key, text, to, &from_name, &fresh, ttl,
                     )
                     .map_err(db_err)
                 },
-                |r| r.body == text && r.outcome == storage::KEY_PENDING,
+                |r| r.body == text && r.to_ref == to && r.outcome == storage::KEY_PENDING,
             )
             .await?;
             match held {
                 Reservation::Mine(id) => id,
-                Reservation::Held(r) if r.body != text => {
+                Reservation::Held(r) if r.body != text || r.to_ref != to => {
                     return Err(AppError::Conflict(format!(
-                        "idempotency key '{key}' was already used with a different message body"
+                        "idempotency key '{key}' was already used with a different message body or recipient"
                     )))
                 }
                 Reservation::Held(r) => {
@@ -894,50 +894,81 @@ async fn deliver_send(
         (None, None) => Dest::Local,
     };
 
-    let (address, recipient_harness, outcome, return_host) = loop {
-        let Dest::Peer {
-            node: peer_key,
-            key,
-            cached,
-            id,
-        } = dest
-        else {
-            let target = crate::http::resolve_target_session(state, target_ref).await?;
-            let (id, harness, outcome) = deliver(
-                &state.local(),
-                &target,
-                &from_name,
-                &message_id,
-                text,
-                sender.origin(&state.node_name),
+    // The record is written before anything is delivered, so a failure to write it fails
+    // the send with nothing delivered; once delivered, its completion is bookkeeping that
+    // cannot fail the send (a key settled `failed` would deliver it again).
+    let session_id_of = |address: &str| {
+        address
+            .rsplit_once('@')
+            .map_or(address, |(id, _)| id)
+            .to_string()
+    };
+    {
+        let db = state.db.lock().map_err(db_err)?;
+        storage::upsert_message(
+            &db,
+            &MessageRecord {
+                id: message_id.clone(),
+                created_at: now,
+                session_id: String::new(),
+                from_name: from_name.clone(),
+                bytes: text.len(),
+                outcome: storage::KEY_PENDING.to_string(),
+                recipient_harness: String::new(),
+                return_harness: ret_harness.clone(),
+                return_session_id: ret_session_id.clone(),
+                thread_id: message_id.clone(),
+                return_host: None,
+            },
+        )
+        .map_err(db_err)?;
+    }
+    let delivered: Result<_, AppError> = async {
+        Ok(loop {
+            let Dest::Peer {
+                node: peer_key,
+                key,
+                cached,
+                id,
+            } = dest
+            else {
+                let target = crate::http::resolve_target_session(state, target_ref).await?;
+                let (id, harness, outcome) = deliver(
+                    &state.local(),
+                    &target,
+                    &from_name,
+                    &message_id,
+                    text,
+                    sender.origin(&state.node_name),
+                )
+                .await?;
+                break (
+                    format!("{id}@{}", state.node_name),
+                    harness.to_string(),
+                    outcome.to_string(),
+                    None,
+                );
+            };
+            let fed_state = state
+                .fed_state
+                .as_ref()
+                .ok_or_else(|| AppError::UnknownPeer(peer_key.clone()))?
+                .clone();
+            let envelope = crate::fed::FedEnvelope {
+                v: crate::fed::WIRE_VERSION,
+                id: message_id.clone(),
+                // Its node is attested by the receiver (N-2).
+                origin: sender.origin(&state.node_name),
+                to: crate::fed::FedTarget { r#ref: key.clone() },
+                body: text.to_string(),
+                thread_id: message_id.clone(),
+                created_at: now,
+                forwarded: None,
+            };
+            let resp = match crate::fed::send_federated_message_with(
+                &fed_state, &peer_key, &envelope, cached,
             )
-            .await?;
-            break (
-                format!("{id}@{}", state.node_name),
-                harness.to_string(),
-                outcome.to_string(),
-                None,
-            );
-        };
-        let fed_state = state
-            .fed_state
-            .as_ref()
-            .ok_or_else(|| AppError::UnknownPeer(peer_key.clone()))?
-            .clone();
-        let envelope = crate::fed::FedEnvelope {
-            v: crate::fed::WIRE_VERSION,
-            id: message_id.clone(),
-            // Its node is attested by the receiver (N-2).
-            origin: sender.origin(&state.node_name),
-            to: crate::fed::FedTarget { r#ref: key.clone() },
-            body: text.to_string(),
-            thread_id: message_id.clone(),
-            created_at: now,
-            forwarded: None,
-        };
-        let resp =
-            match crate::fed::send_federated_message_with(&fed_state, &peer_key, &envelope, cached)
-                .await
+            .await
             {
                 Ok(resp) => resp,
                 Err(e) if node.is_none() => {
@@ -952,72 +983,82 @@ async fn deliver_send(
                 }
                 Err(e) => return Err(e),
             };
-        let outcome = resp.outcome.unwrap_or_else(|| "delivered".to_string());
-        // Only a fresh resolution is cached, so a location is at most the TTL old (A-12).
-        if id && !cached && outcome == "delivered" {
-            crate::mesh::remember(state, &key, &peer_key);
-        }
-        let address = format!("{}@{peer_key}", resp.session_id);
-        // A-2: the outbound reply poller is armed by the sender's kind.
-        if ret_harness.is_some()
-            && fed_state
-                .peers
-                .get(&peer_key)
-                .is_some_and(|p| p.is_outbound())
-        {
-            crate::fed::spawn_outbound_reply_poller(
-                fed_state.clone(),
-                peer_key.clone(),
-                message_id.clone(),
+            let outcome = resp.outcome.unwrap_or_else(|| "delivered".to_string());
+            // Only a fresh resolution is cached, so a location is at most the TTL old (A-12).
+            if id && !cached && outcome == "delivered" {
+                crate::mesh::remember(state, &key, &peer_key);
+            }
+            let address = format!("{}@{peer_key}", resp.session_id);
+            // A-2: the outbound reply poller is armed by the sender's kind.
+            if ret_harness.is_some()
+                && fed_state
+                    .peers
+                    .get(&peer_key)
+                    .is_some_and(|p| p.is_outbound())
+            {
+                crate::fed::spawn_outbound_reply_poller(
+                    fed_state.clone(),
+                    peer_key.clone(),
+                    message_id.clone(),
+                );
+            }
+            if let Ok(db) = state.db.lock() {
+                let _ =
+                    storage::insert_outbound(&db, &message_id, &peer_key, &address, &outcome, now);
+                if node.is_none() {
+                    // Resolved here: the record holds the recipient's own key (XA5's reply rule).
+                    let _ = storage::mark_outbound_resolved(&db, &message_id);
+                }
+            }
+            break (
+                address,
+                "fed".to_string(),
+                outcome,
+                Some(state.node_name.clone()),
             );
+        })
+    }
+    .await;
+    let (address, recipient_harness, outcome, return_host) = match delivered {
+        Ok(d) => d,
+        Err(e) => {
+            if let Err(de) = state
+                .db
+                .lock()
+                .map_err(db_err)
+                .and_then(|db| storage::delete_message(&db, &message_id).map_err(db_err))
+            {
+                tracing::warn!(target: "xmsg", message_id = %message_id, "undelivered message's record not removed: {de}");
+            }
+            return Err(e);
         }
-        let db = state.db.lock().map_err(db_err)?;
-        let _ = storage::insert_outbound(&db, &message_id, &peer_key, &address, &outcome, now);
-        if node.is_none() {
-            // Resolved here: the record holds the recipient's own key (XA5's reply rule).
-            let _ = storage::mark_outbound_resolved(&db, &message_id);
-        }
-        break (
-            address,
-            "fed".to_string(),
-            outcome,
-            Some(state.node_name.clone()),
-        );
     };
-
-    let session_id = address
-        .rsplit_once('@')
-        .map_or(address.as_str(), |(id, _)| id)
-        .to_string();
-    {
-        let db = state.db.lock().map_err(db_err)?;
-        storage::insert_message(
-            &db,
-            &MessageRecord {
-                id: message_id.clone(),
-                created_at: now,
-                session_id,
-                from_name: from_name.clone(),
-                bytes: text.len(),
-                outcome: outcome.clone(),
-                recipient_harness,
-                return_harness: ret_harness,
-                return_session_id: ret_session_id,
-                thread_id: message_id.clone(),
-                return_host,
-            },
-        )
-        .map_err(db_err)?;
-        let _ = storage::purge_idempotency_keys(&db, state.idempotency_ttl.as_secs());
-        let ttl = state.reply_ttl.as_secs();
-        let _ = storage::purge_messages(&db, ttl);
-        let _ = storage::purge_replies(&db, ttl);
-        let _ = storage::purge_pi_messages(&db, ttl);
-        let _ = storage::purge_agy_messages(&db, ttl);
-        let _ = storage::purge_svc_messages(&db, ttl);
-        let _ = storage::purge_peer_mailbox(&db, ttl);
-        let _ = storage::purge_forwarded_messages(&db, ttl);
-        let _ = storage::purge_instance_queue(&db, ttl);
+    match state.db.lock() {
+        Ok(db) => {
+            if let Err(e) = storage::complete_message(
+                &db,
+                &message_id,
+                &session_id_of(&address),
+                &outcome,
+                &recipient_harness,
+                return_host.as_deref(),
+            ) {
+                tracing::warn!(target: "xmsg", message_id = %message_id, "delivered message's record not completed: {e}");
+            }
+            let _ = storage::purge_idempotency_keys(&db, state.idempotency_ttl.as_secs());
+            let ttl = state.reply_ttl.as_secs();
+            let _ = storage::purge_messages(&db, ttl);
+            let _ = storage::purge_replies(&db, ttl);
+            let _ = storage::purge_pi_messages(&db, ttl);
+            let _ = storage::purge_agy_messages(&db, ttl);
+            let _ = storage::purge_svc_messages(&db, ttl);
+            let _ = storage::purge_peer_mailbox(&db, ttl);
+            let _ = storage::purge_forwarded_messages(&db, ttl);
+            let _ = storage::purge_instance_queue(&db, ttl);
+        }
+        Err(e) => {
+            tracing::warn!(target: "xmsg", message_id = %message_id, "delivered message's record not completed: {e}");
+        }
     }
 
     // Invariant: message bodies are never logged.
@@ -1179,7 +1220,7 @@ pub async fn reply(
             .await;
             if let Some(key) = key {
                 let (st, seq) = match &res {
-                    Ok(r) => ("done", Some(r.seq)),
+                    Ok(r) => (storage::KEY_DONE, Some(r.seq)),
                     Err(_) => (storage::KEY_FAILED, None),
                 };
                 let settled = state.db.lock().map_err(db_err).and_then(|db| {

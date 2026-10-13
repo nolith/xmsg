@@ -188,6 +188,11 @@ struct Inbox {
 fn inbox(delay: Duration) -> Inbox {
     let dir = tempdir().unwrap();
     let sock = dir.path().join("inbox.sock");
+    bind_inbox(dir, sock, delay)
+}
+
+/// An inbox at `sock` in `dir`, bound now (a target whose inbox was down comes back).
+fn bind_inbox(dir: TempDir, sock: PathBuf, delay: Duration) -> Inbox {
     let listener = UnixListener::bind(&sock).unwrap();
     let lines = Arc::new(Mutex::new(Vec::new()));
     let rx = lines.clone();
@@ -516,4 +521,181 @@ async fn test_oracle_4_different_principals_same_key_independent() {
         2,
         "two principals, two deliveries"
     );
+}
+
+/// One keyed send over `http.sock`, anonymous as `ci`: its status and body.
+async fn keyed(node: &Node, to: &str, text: &str, key: &str) -> (u16, serde_json::Value) {
+    node.http_within(
+        "POST",
+        "/v1/messages",
+        Some(serde_json::json!({"to": to, "from": "ci", "text": text, "idempotency_key": key})),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("http.sock send")
+}
+
+/// A Claude fake `ID_T` whose inbox is down: the directory and path to bind it at later.
+fn down_target(node: &Node) -> (Sleeper, TempDir, PathBuf) {
+    let sleeper = Sleeper::new();
+    let dir = tempdir().unwrap();
+    let sock = dir.path().join("inbox.sock");
+    claude_file(node, "target", sleeper.0.id(), ID_T, &sock);
+    (sleeper, dir, sock)
+}
+
+// =============================================================================
+// Oracle 5 (gate idem-verify-v0 F1). A failure to record the message never makes a
+// delivered message's key `failed`: the record is written before delivery, so a failure
+// to write it fails the send with nothing delivered.
+// Mutant: write the record after delivery, its error returned => RED (2 deliveries).
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_5_record_write_fails_nothing_delivered_twice() {
+    let tmp = tempdir().unwrap();
+    let node = Node::start(tmp.path(), &[]);
+    let (_t, target) = slow_target(&node, Duration::ZERO);
+    let db = rusqlite::Connection::open(tmp.path().join("xmsg.db")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER gate_fail BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'gate'); END;",
+    )
+    .unwrap();
+    let (st1, r1) = keyed(&node, ID_T, "once", "k-if").await;
+    let after_first = target.settled_count(Duration::from_millis(800)).await;
+    db.execute_batch("DROP TRIGGER gate_fail;").unwrap();
+    let (st2, r2) = keyed(&node, ID_T, "once", "k-if").await;
+    let after_retry = target.settled_count(Duration::from_millis(800)).await;
+    assert_eq!((st1, after_first), (500, 0), "{r1}");
+    assert_eq!(st2, 202, "{r2}");
+    assert_eq!(after_retry, 1, "one key, one delivery");
+}
+
+// =============================================================================
+// Oracle 6 (F1). A step after a delivery that fails (completing the record) is logged,
+// and the send answers its delivered outcome: a retry returns it, delivering nothing.
+// Mutant: return the completion's error => RED (the retry delivers again).
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_6_post_delivery_failure_still_delivered() {
+    let tmp = tempdir().unwrap();
+    let node = Node::start(tmp.path(), &[]);
+    let (_t, target) = slow_target(&node, Duration::ZERO);
+    let db = rusqlite::Connection::open(tmp.path().join("xmsg.db")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER gate_fail BEFORE UPDATE ON messages BEGIN SELECT RAISE(ABORT, 'gate'); END;",
+    )
+    .unwrap();
+    let (st1, r1) = keyed(&node, ID_T, "once", "k-uf").await;
+    db.execute_batch("DROP TRIGGER gate_fail;").unwrap();
+    let (st2, r2) = keyed(&node, ID_T, "once", "k-uf").await;
+    let n = target.settled_count(Duration::from_millis(800)).await;
+    assert_eq!(
+        (st1, &r1["outcome"]),
+        (202, &serde_json::json!("delivered")),
+        "{r1}"
+    );
+    assert_eq!(r2, r1, "the retry answers the first send's result");
+    assert_eq!((st2, n), (202, 1), "one key, one delivery");
+}
+
+// =============================================================================
+// Oracle 7 (F2). The server dies mid-delivery; at restart the key is settled from the
+// message record (here: not delivered, so `failed`), and the retry delivers it once.
+// Mutant: no reconciliation at startup => RED (the key stays `pending`).
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_7_restart_mid_delivery_retry_delivers() {
+    let tmp = tempdir().unwrap();
+    let mut node = Node::start(tmp.path(), &[]);
+    let (_t, target) = slow_target(&node, Duration::from_millis(4000));
+    let text = "r".repeat(SLOW_BODY_LEN);
+    let sock = node.http_sock.clone();
+    let body =
+        serde_json::json!({"to": ID_T, "from": "ci", "text": text, "idempotency_key": "k-rs"});
+    let b2 = body.to_string();
+    let first = tokio::task::spawn_blocking(move || {
+        xmsg::http::http_request_unix_within(
+            &sock,
+            "POST",
+            "/v1/messages",
+            Some(&b2),
+            Duration::from_secs(30),
+        )
+    });
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let _ = node.child.kill();
+    let _ = node.child.wait();
+    let _ = first.await;
+    for s in [&node.http_sock, &node.agent_sock, &node.register_sock] {
+        let _ = fs::remove_file(s);
+    }
+    let node2 = Node::start(tmp.path(), &[]);
+    // The killed delivery's partial line is read 4 s after its connection.
+    let before = target.settled_count(Duration::from_millis(4500)).await;
+    let (st, r) = node2
+        .http_within("POST", "/v1/messages", Some(body), Duration::from_secs(30))
+        .await
+        .unwrap();
+    let after = target.settled_count(Duration::from_millis(5000)).await;
+    assert_eq!(
+        (st, &r["outcome"]),
+        (202, &serde_json::json!("delivered")),
+        "{r}"
+    );
+    assert_eq!(after, before + 1, "the retry delivers once");
+    let last = target.lines.lock().unwrap().last().unwrap().len();
+    assert!(last > SLOW_BODY_LEN, "the whole message: {last} bytes");
+}
+
+// =============================================================================
+// Oracle 8 (gate P1). A key whose send failed is taken over only by the same body: another
+// body is a conflict, and the same body, once the recipient is back, is delivered once.
+// Mutants: the takeover ignores the body => RED; a failure leaves the key `pending` => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_8_failed_key_other_body_conflicts() {
+    let tmp = tempdir().unwrap();
+    let node = Node::start(tmp.path(), &[]);
+    let (_t, dir, sock) = down_target(&node);
+    let (st1, r1) = keyed(&node, ID_T, "a", "k-fb").await;
+    let (st2, r2) = keyed(&node, ID_T, "b", "k-fb").await;
+    let target = bind_inbox(dir, sock, Duration::ZERO);
+    let (st3, r3) = keyed(&node, ID_T, "a", "k-fb").await;
+    let n = target.settled_count(Duration::from_millis(800)).await;
+    assert_ne!(st1, 202, "the inbox is down: {r1}");
+    assert_eq!(st2, 409, "{r2}");
+    assert_eq!(
+        (st3, &r3["outcome"]),
+        (202, &serde_json::json!("delivered")),
+        "{r3}"
+    );
+    assert_eq!(n, 1);
+}
+
+// =============================================================================
+// Oracle 9 (gate P3). A key binds `to` as well as the body: the same key and body to
+// another recipient is a conflict, whether the first send settled or failed.
+// Mutants: the replay ignores `to` => RED; the takeover ignores `to` => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_9_key_binds_recipient() {
+    let tmp = tempdir().unwrap();
+    let node = Node::start(tmp.path(), &[]);
+    let (_t, target) = slow_target(&node, Duration::ZERO);
+    let gone = "d7d7d7d7-0000-4000-8000-00000000000d";
+
+    let (st1, r1) = keyed(&node, ID_T, "x", "k-to").await;
+    let (st2, r2) = keyed(&node, gone, "x", "k-to").await;
+    assert_eq!(
+        (st1, &r1["outcome"]),
+        (202, &serde_json::json!("delivered")),
+        "{r1}"
+    );
+    assert_eq!(st2, 409, "settled key, another recipient: {r2}");
+
+    let (st3, r3) = keyed(&node, gone, "y", "k-tf").await;
+    let (st4, r4) = keyed(&node, ID_T, "y", "k-tf").await;
+    assert_eq!(st3, 404, "{r3}");
+    assert_eq!(st4, 409, "failed key, another recipient: {r4}");
+    assert_eq!(target.settled_count(Duration::from_millis(800)).await, 1);
 }

@@ -693,6 +693,19 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     info!(node_name = %node_name, "node name");
 
+    // Keys a stopped server left `pending` are settled before anything is served.
+    {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let settled = storage::reconcile_pending_keys(&conn, &node_name)
+            .map_err(|e| format!("cannot settle pending idempotency keys: {e}"))?;
+        if settled > 0 {
+            info!(
+                settled,
+                "settled idempotency keys left pending by a stopped server"
+            );
+        }
+    }
+
     let fed_state = if let Some(peers_file) = args.peers_file {
         let peers = xmsg::fed::PeersMap::load_from_file_for(&peers_file, own.as_ref())
             .map_err(|e| format!("failed to load peers file: {e}"))?;

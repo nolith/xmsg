@@ -1337,3 +1337,106 @@ async fn test_oracle_11_reply_only_from_the_recorded_recipient() {
     })
     .await;
 }
+
+// =============================================================================
+// Idempotency (gate idem-verify-v0 F3): message-ID deduplication means the message was
+// delivered once. A recorded failure is not a delivery, so a keyed retry (the same
+// message ID) after the peer failed to deliver is delivered.
+// Mutant: answer a recorded failure from its record => RED.
+// =============================================================================
+
+/// A Claude fake on `sessions_dir` whose inbox socket is bound only when `bind` is called.
+fn late_session(sessions_dir: &Path, session_id: &str, name: &str) -> PathBuf {
+    let sock_path = short_sock::sock_path(sessions_dir, "late");
+    let pid = std::process::id();
+    let proc_start =
+        xmsg::process::starttime(Path::new(xmsg::process::LIVE_PROC_ROOT), pid).unwrap();
+    let session = json!({
+        "pid": pid, "sessionId": session_id, "name": name, "cwd": "/workspace",
+        "status": "idle", "kind": "interactive", "startedAt": 1000, "updatedAt": 2000,
+        "procStart": proc_start, "messagingSocketPath": sock_path.display().to_string(),
+    });
+    fs::write(
+        sessions_dir.join(format!("{pid}-{session_id}.json")),
+        session.to_string(),
+    )
+    .unwrap();
+    sock_path
+}
+
+fn bind_inbox(sock_path: &Path) -> Arc<Mutex<Vec<String>>> {
+    let listener = UnixListener::bind(sock_path).unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let rx = received.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf).await;
+            if let Ok(s) = String::from_utf8(buf) {
+                rx.lock().unwrap().push(s);
+            }
+        }
+    });
+    received
+}
+
+async fn keyed_send(node: &Node, to: &str, text: &str, key: Option<&str>) -> (u16, Value) {
+    let url = format!("http://127.0.0.1:{}/v1/messages", node.http_port);
+    let mut body = json!({ "to": to, "from": "ci", "text": text });
+    if let Some(k) = key {
+        body["idempotency_key"] = json!(k);
+    }
+    let resp = reqwest::Client::new()
+        .post(url)
+        .json(&body)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .unwrap();
+    (
+        resp.status().as_u16(),
+        resp.json().await.unwrap_or(Value::Null),
+    )
+}
+
+/// A federated send whose peer failed to deliver (the recipient's inbox was down) is
+/// retried with its key once the inbox is back. Arm K: keyed (same message ID). Arm U:
+/// unkeyed (a fresh ID), the control that the recipient is deliverable again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_idem_keyed_retry_after_peer_delivery_failure_delivers() {
+    run_with_port_retry(|| async {
+        let m = mesh(true, true).await;
+        let kid = "dd0d0d0d-0000-4000-8000-0000000000d1";
+        let uid = "dd0d0d0d-0000-4000-8000-0000000000d2";
+        let ksock = late_session(&m._b.sessions_dir, kid, "Kay");
+        let usock = short_sock::sock_path(&m._b.sessions_dir, "late2");
+        {
+            let pid = std::process::id();
+            let proc_start =
+                xmsg::process::starttime(Path::new(xmsg::process::LIVE_PROC_ROOT), pid).unwrap();
+            let session = json!({
+                "pid": pid, "sessionId": uid, "name": "Uma", "cwd": "/workspace",
+                "status": "idle", "kind": "interactive", "startedAt": 1000, "updatedAt": 2000,
+                "procStart": proc_start, "messagingSocketPath": usock.display().to_string(),
+            });
+            fs::write(m._b.sessions_dir.join(format!("{pid}-{uid}.json")), session.to_string()).unwrap();
+        }
+        let kto = format!("{kid}@eve.b");
+        let uto = format!("{uid}@eve.b");
+        let k1 = keyed_send(&m.a, &kto, "fed-k", Some("k-fed")).await;
+        let u1 = keyed_send(&m.a, &uto, "fed-u", None).await;
+        let krx = bind_inbox(&ksock);
+        let urx = bind_inbox(&usock);
+        let k2 = keyed_send(&m.a, &kto, "fed-k", Some("k-fed")).await;
+        let u2 = keyed_send(&m.a, &uto, "fed-u", None).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let kn = krx.lock().unwrap().len();
+        let un = urx.lock().unwrap().len();
+        eprintln!("K first={k1:?} retry={k2:?} delivered={kn} | U first={u1:?} retry={u2:?} delivered={un}");
+        assert_ne!(k1.0, 202, "the inbox is down: {k1:?}");
+        assert_eq!(k2.0, 202, "{k2:?}");
+        assert_eq!(un, 1, "control: the recipient is deliverable again");
+        assert_eq!(kn, 1, "a keyed retry after a peer-side failure delivers");
+    })
+    .await;
+}

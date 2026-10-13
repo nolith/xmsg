@@ -165,6 +165,8 @@ pub struct IdempotencyRecord {
     pub principal: String,
     pub key: String,
     pub body: String,
+    /// The send's `to`, as given: one key names one body to one recipient.
+    pub to_ref: String,
     pub message_id: String,
     pub session_id: String,
     pub from_name: String,
@@ -284,6 +286,7 @@ const SCHEMA_N: &str = r#"
             bytes INTEGER NOT NULL,
             outcome TEXT NOT NULL,
             created_at INTEGER NOT NULL,
+            to_ref TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (principal, key)
         );
 
@@ -394,7 +397,20 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // Plugin registrations end with this connection, so their tables are not schema N's.
     conn.execute_batch(crate::plugin::SCHEMA)?;
     if version == SCHEMA_VERSION {
-        return conn.execute_batch(SCHEMA_N);
+        conn.execute_batch(SCHEMA_N)?;
+        // A column schema N has since been extended with. A key recorded before it binds
+        // no recipient, so its replay with any `to` is a conflict, never a second delivery.
+        let has_to_ref: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('idempotency_keys') WHERE name = 'to_ref'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_to_ref {
+            conn.execute_batch(
+                "ALTER TABLE idempotency_keys ADD COLUMN to_ref TEXT NOT NULL DEFAULT ''",
+            )?;
+        }
+        return Ok(());
     }
     if version > SCHEMA_VERSION {
         return Err(rusqlite::Error::SqliteFailure(
@@ -414,8 +430,59 @@ pub fn init_db(conn: &Connection) -> Result<()> {
 }
 
 pub fn insert_message(conn: &Connection, msg: &MessageRecord) -> Result<()> {
+    write_message(conn, msg, "")
+}
+
+/// `insert_message`, replacing the record of an earlier attempt under the same ID (a
+/// keyed send's takeover, or a redelivery after a recorded failure).
+pub fn upsert_message(conn: &Connection, msg: &MessageRecord) -> Result<()> {
+    write_message(
+        conn,
+        msg,
+        " ON CONFLICT (id) DO UPDATE SET created_at = excluded.created_at,
+         session_id = excluded.session_id, from_name = excluded.from_name,
+         bytes = excluded.bytes, outcome = excluded.outcome,
+         recipient_harness = excluded.recipient_harness,
+         return_harness = excluded.return_harness,
+         return_session_id = excluded.return_session_id,
+         thread_id = excluded.thread_id, return_host = excluded.return_host",
+    )
+}
+
+/// A send's record is written, with the outcome `pending`, before it is delivered; once
+/// delivered it is completed with the recipient and the outcome.
+pub fn complete_message(
+    conn: &Connection,
+    id: &str,
+    session_id: &str,
+    outcome: &str,
+    recipient_harness: &str,
+    return_host: Option<&str>,
+) -> Result<()> {
     conn.execute(
-        "INSERT INTO messages (id, created_at, session_id, from_name, bytes, outcome, recipient_harness, return_harness, return_session_id, thread_id, return_host) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "UPDATE messages SET session_id = ?2, outcome = ?3, recipient_harness = ?4, return_host = ?5
+         WHERE id = ?1",
+        params![id, session_id, outcome, recipient_harness, return_host.unwrap_or("")],
+    )?;
+    Ok(())
+}
+
+pub fn delete_message(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Whether a message record says its message reached the recipient, or is being
+/// delivered there: `delivered`, `queued`, `accepted`. Message-ID deduplication answers
+/// from such a record. A recorded failure (`not_found`, `gone`, `ambiguous`, `failed`,
+/// `delivery_failed`) says the message was not delivered, so its ID may be delivered again.
+pub fn outcome_reached(outcome: &str) -> bool {
+    matches!(outcome, "delivered" | "queued" | "accepted")
+}
+
+fn write_message(conn: &Connection, msg: &MessageRecord, on_conflict: &str) -> Result<()> {
+    conn.execute(
+        &format!("INSERT INTO messages (id, created_at, session_id, from_name, bytes, outcome, recipient_harness, return_harness, return_session_id, thread_id, return_host) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11){on_conflict}"),
         params![
             msg.id,
             msg.created_at,
@@ -925,7 +992,7 @@ pub fn get_idempotency_record(
     let now = now_epoch_secs();
     let cutoff = now.saturating_sub(ttl_secs as i64);
     let mut stmt = conn.prepare(
-        "SELECT principal, key, body, message_id, session_id, from_name, bytes, outcome, created_at
+        "SELECT principal, key, body, message_id, session_id, from_name, bytes, outcome, created_at, to_ref
          FROM idempotency_keys
          WHERE principal = ?1 AND key = ?2 AND created_at >= ?3",
     )?;
@@ -942,6 +1009,7 @@ pub fn get_idempotency_record(
             bytes: bytes_i64 as usize,
             outcome: row.get(7)?,
             created_at: row.get(8)?,
+            to_ref: row.get(9)?,
         }))
     } else {
         Ok(None)
@@ -952,6 +1020,8 @@ pub fn get_idempotency_record(
 /// once it failed (the next send with the key delivers again, under the same message ID).
 pub const KEY_PENDING: &str = "pending";
 pub const KEY_FAILED: &str = "failed";
+/// A reply key's state once its reply is stored.
+pub const KEY_DONE: &str = "done";
 
 /// The holder of an idempotency key: this caller, which delivers under the given ID, or
 /// an earlier send or reply whose record is returned.
@@ -961,14 +1031,17 @@ pub enum Reservation<T> {
     Held(T),
 }
 
-/// Reserves `(principal, key)` for a send of `body` in one transaction, before anything
-/// is delivered. A new or expired key is minted `fresh_id`; a key whose send failed is
-/// taken over with its own message ID, so a peer that did receive it deduplicates it.
+/// Reserves `(principal, key)` for a send of `body` to `to` in one transaction, before
+/// anything is delivered. A new or expired key is minted `fresh_id`; a key whose send of
+/// the same body to the same `to` failed is taken over with its own message ID, so a peer
+/// that did receive it deduplicates it.
+#[allow(clippy::too_many_arguments)]
 pub fn reserve_idempotency_key(
     conn: &Connection,
     principal: &str,
     key: &str,
     body: &str,
+    to: &str,
     from_name: &str,
     fresh_id: &str,
     ttl_secs: u64,
@@ -982,8 +1055,8 @@ pub fn reserve_idempotency_key(
     )?;
     let inserted = tx.execute(
         "INSERT INTO idempotency_keys
-         (principal, key, body, message_id, session_id, from_name, bytes, outcome, created_at)
-         VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, ?7, ?8)
+         (principal, key, body, message_id, session_id, from_name, bytes, outcome, created_at, to_ref)
+         VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT (principal, key) DO NOTHING",
         params![
             principal,
@@ -993,14 +1066,15 @@ pub fn reserve_idempotency_key(
             from_name,
             body.len() as i64,
             KEY_PENDING,
-            now
+            now,
+            to
         ],
     )?;
     let taken_over = inserted == 0
         && tx.execute(
             "UPDATE idempotency_keys SET outcome = ?4, created_at = ?5
-             WHERE principal = ?1 AND key = ?2 AND body = ?3 AND outcome = ?6",
-            params![principal, key, body, KEY_PENDING, now, KEY_FAILED],
+             WHERE principal = ?1 AND key = ?2 AND body = ?3 AND outcome = ?6 AND to_ref = ?7",
+            params![principal, key, body, KEY_PENDING, now, KEY_FAILED, to],
         )? == 1;
     let record = get_idempotency_record(&tx, principal, key, ttl_secs)?;
     tx.commit()?;
@@ -1025,6 +1099,51 @@ pub fn settle_idempotency_key(
         params![principal, key, address, outcome],
     )?;
     Ok(())
+}
+
+/// Settles every key a stopped server left `pending` (run at startup, before any send).
+/// A send key whose message record shows it reached its recipient takes that record's
+/// outcome and address; any other (its delivery was interrupted, or never began) is
+/// `failed`, so the next send with it delivers. A reply key whose reply was stored is
+/// `done` with it; any other is `failed`. Returns the number of keys settled.
+pub fn reconcile_pending_keys(conn: &Connection, node_name: &str) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let pending: Vec<(String, String, String)> = tx
+        .prepare("SELECT principal, key, message_id FROM idempotency_keys WHERE outcome = ?1")?
+        .query_map(params![KEY_PENDING], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<Result<_>>()?;
+    let mut settled = pending.len();
+    for (principal, key, message_id) in pending {
+        let (address, outcome) = match get_message(&tx, &message_id)? {
+            Some(m) if outcome_reached(&m.outcome) => {
+                let address = if m.recipient_harness == "fed" {
+                    get_outbound(&tx, &message_id)?.map_or(String::new(), |o| o.target_ref)
+                } else {
+                    format!("{}@{node_name}", m.session_id)
+                };
+                (address, m.outcome)
+            }
+            _ => (String::new(), KEY_FAILED.to_string()),
+        };
+        settle_idempotency_key(&tx, &principal, &key, &address, &outcome)?;
+    }
+    let pending: Vec<(String, String, String)> = tx
+        .prepare("SELECT principal, key, reply_id FROM reply_idempotency_keys WHERE state = ?1")?
+        .query_map(params![KEY_PENDING], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<Result<_>>()?;
+    settled += pending.len();
+    for (principal, key, reply_id) in pending {
+        match get_reply_by_pushed_id(&tx, &reply_id)? {
+            Some(r) => settle_reply_key(&tx, &principal, &key, KEY_DONE, Some(r.seq))?,
+            None => settle_reply_key(&tx, &principal, &key, KEY_FAILED, None)?,
+        }
+    }
+    tx.commit()?;
+    Ok(settled)
 }
 
 pub fn purge_idempotency_keys(conn: &Connection, ttl_secs: u64) -> Result<usize> {
@@ -1610,6 +1729,69 @@ pub fn utc_rfc3339(secs: i64) -> String {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+
+    fn msg(id: &str, session_id: &str, outcome: &str, harness: &str) -> MessageRecord {
+        MessageRecord {
+            id: id.into(),
+            created_at: now_epoch_secs(),
+            session_id: session_id.into(),
+            from_name: "f".into(),
+            bytes: 1,
+            outcome: outcome.into(),
+            recipient_harness: harness.into(),
+            return_harness: None,
+            return_session_id: None,
+            thread_id: id.into(),
+            return_host: None,
+        }
+    }
+
+    /// F2: keys left `pending` settle from what the database says reached the recipient.
+    #[test]
+    fn reconcile_settles_pending_keys_from_their_records() {
+        let c = Connection::open_in_memory().unwrap();
+        init_db(&c).unwrap();
+        let reserve = |key: &str, id: &str| {
+            reserve_idempotency_key(&c, "p", key, "b", "t", "f", id, 60).unwrap()
+        };
+        reserve("none", "M0"); // no record: delivery never began
+        reserve("mid", "M1"); // record written, delivery interrupted
+        upsert_message(&c, &msg("M1", "", KEY_PENDING, "")).unwrap();
+        reserve("local", "M2");
+        insert_message(&c, &msg("M2", "s2", "delivered", "claude")).unwrap();
+        reserve("fed", "M3");
+        insert_message(&c, &msg("M3", "s3", "queued", "fed")).unwrap();
+        insert_outbound(&c, "M3", "peer", "s3@peer", "queued", 0).unwrap();
+        reserve_reply_key(&c, "p", "rdone", "M2", "r", "R1", 60).unwrap();
+        insert_reply(&c, "M2", "s", "r", Some("pushed"), Some("R1")).unwrap();
+        reserve_reply_key(&c, "p", "rnone", "M2", "r", "R2", 60).unwrap();
+
+        assert_eq!(reconcile_pending_keys(&c, "n").unwrap(), 6);
+        let got = |key: &str| {
+            let r = get_idempotency_record(&c, "p", key, 60).unwrap().unwrap();
+            (r.session_id, r.outcome)
+        };
+        assert_eq!(got("none"), (String::new(), KEY_FAILED.into()));
+        assert_eq!(got("mid"), (String::new(), KEY_FAILED.into()));
+        assert_eq!(got("local"), ("s2@n".into(), "delivered".into()));
+        assert_eq!(got("fed"), ("s3@peer".into(), "queued".into()));
+        let state = |key: &str| -> (String, Option<i64>) {
+            c.query_row(
+                "SELECT state, seq FROM reply_idempotency_keys WHERE key = ?1",
+                [key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(state("rdone").0, KEY_DONE);
+        assert!(state("rdone").1.is_some());
+        assert_eq!(state("rnone"), (KEY_FAILED.into(), None));
+        assert_eq!(
+            reconcile_pending_keys(&c, "n").unwrap(),
+            0,
+            "nothing left pending"
+        );
+    }
 
     #[test]
     fn utc_rfc3339_known_instants() {
