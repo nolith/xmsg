@@ -138,7 +138,7 @@ pub(crate) async fn resolve_target(
     agy_store: &crate::agy::AgyStore,
     pi_store: &crate::pi::PiStore,
     svc_store: &crate::svc::SvcStore,
-    db: &std::sync::Mutex<rusqlite::Connection>,
+    db: &Arc<Mutex<rusqlite::Connection>>,
     host_label: &str,
     ref_str: &str,
 ) -> Result<ResolvedTarget, AppError> {

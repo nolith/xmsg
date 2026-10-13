@@ -953,7 +953,7 @@ async fn test_oracle_6b_fork_notice_once_under_concurrent_scans() {
     let f = fork_fixture("0199cecf-0006-7000-8000-00000000000b").await;
     let conn = rusqlite::Connection::open(&f.db_path).unwrap();
     init_db(&conn).unwrap();
-    let db = std::sync::Mutex::new(conn);
+    let db = Arc::new(std::sync::Mutex::new(conn));
 
     let (a, b) = tokio::join!(
         xmsg::claim::sync_claims(&db, &f.proc_root, &f.sessions_dir, "test-node"),
@@ -989,7 +989,7 @@ async fn test_oracle_6e_failed_fork_notice_retried_once() {
     write_claude_session_file(&f.sessions_dir, 1002, conv, "second", "200", &missing);
     let conn = rusqlite::Connection::open(&f.db_path).unwrap();
     init_db(&conn).unwrap();
-    let db = std::sync::Mutex::new(conn);
+    let db = Arc::new(std::sync::Mutex::new(conn));
 
     xmsg::claim::sync_claims(&db, &f.proc_root, &f.sessions_dir, "test-node")
         .await
@@ -1017,6 +1017,87 @@ async fn test_oracle_6e_failed_fork_notice_retried_once() {
     assert_eq!(
         n2, 1,
         "P2's failed notice must be delivered exactly once later"
+    );
+}
+
+// =============================================================================
+// Oracle 6f: a scan whose future is dropped after its claims commit still
+// delivers each notice once.
+// Mutant: deliver on the caller's future (b537d10's with_claims) => RED
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_6f_fork_notice_survives_cancelled_scan() {
+    let f = fork_fixture("0199cecf-0006-7000-8000-00000000000f").await;
+    let conn = rusqlite::Connection::open(&f.db_path).unwrap();
+    init_db(&conn).unwrap();
+    let db = Arc::new(std::sync::Mutex::new(conn));
+
+    // First poll commits the claims; the future is then dropped.
+    let cancelled = tokio::time::timeout(
+        Duration::ZERO,
+        xmsg::claim::sync_claims(&db, &f.proc_root, &f.sessions_dir, "test-node"),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the scan must be dropped before delivery"
+    );
+    for _ in 0..2 {
+        xmsg::claim::sync_claims(&db, &f.proc_root, &f.sessions_dir, "test-node")
+            .await
+            .unwrap();
+    }
+
+    let (n1, n2) = settle_notices(&f.p1, &f.p2, Duration::from_secs(2)).await;
+    assert_eq!(
+        n1, 1,
+        "P1 must receive exactly one notice after a cancelled scan"
+    );
+    assert_eq!(
+        n2, 1,
+        "P2 must receive exactly one notice after a cancelled scan"
+    );
+}
+
+// =============================================================================
+// Oracle 6g: a poisoned DB lock does not keep a failed notice's claim.
+// Mutant: skip bookkeeping on a poisoned lock (b537d10) => RED
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_6g_poisoned_lock_releases_failed_claim() {
+    let conv = "0199cecf-0006-7000-8000-000000000010";
+    let f = fork_fixture(conv).await;
+    let missing = f.db_path.with_file_name("p2-not-yet.sock");
+    write_claude_session_file(&f.sessions_dir, 1002, conv, "second", "200", &missing);
+    let conn = rusqlite::Connection::open(&f.db_path).unwrap();
+    init_db(&conn).unwrap();
+    let db = Arc::new(std::sync::Mutex::new(conn));
+
+    let (_, notices) = sync_claims_db(
+        &db.lock().unwrap(),
+        &f.proc_root,
+        &f.sessions_dir,
+        "test-node",
+    )
+    .unwrap();
+    assert_eq!(notices.len(), 2);
+    let poison = Arc::clone(&db);
+    let _ = std::thread::spawn(move || {
+        let _g = poison.lock().unwrap();
+        panic!("poison the DB lock");
+    })
+    .join();
+    assert!(db.is_poisoned());
+
+    xmsg::claim::deliver_fork_notices(&db, notices).await;
+    let rows: i64 = db
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .query_row("SELECT COUNT(*) FROM fork_notices", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        rows, 1,
+        "P2's failed claim must be released under a poisoned lock"
     );
 }
 

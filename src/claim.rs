@@ -2,6 +2,7 @@ use rusqlite::{params, Connection, Result};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tracing::warn;
 
 use crate::error::AppError;
@@ -415,13 +416,9 @@ pub async fn deliver_fork_notices(
         outcomes.push((notice, res.is_ok()));
     }
 
-    let conn = match db.lock() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("Fork notice bookkeeping skipped, DB lock poisoned: {}", e);
-            return;
-        }
-    };
+    // A poisoned lock still holds a usable connection; recover it so a failed
+    // notice's claim is released rather than kept forever.
+    let conn = db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     for (notice, delivered) in outcomes {
         let res = if delivered {
             let msg_id = ulid::Ulid::new().to_string();
@@ -462,8 +459,12 @@ pub async fn deliver_fork_notices(
 /// under the DB lock; then delivers the fork notices that scan claimed.
 /// Every surface that observes the claim table goes through here, so none can
 /// observe a fork and drop its notice.
+///
+/// Delivery runs on its own task, so dropping this future (a client that
+/// disconnects mid-request) neither loses a claimed notice nor keeps its
+/// claim. A caller that runs to completion returns after delivery.
 pub async fn with_claims<T>(
-    db: &std::sync::Mutex<Connection>,
+    db: &Arc<Mutex<Connection>>,
     proc_root: &Path,
     sessions_dirs: &(impl SessionDirs + ?Sized),
     host_label: &str,
@@ -474,12 +475,18 @@ pub async fn with_claims<T>(
         let (pairs, notices) = sync_claims_db(&conn, proc_root, sessions_dirs, host_label)?;
         (f(&conn, &pairs), notices)
     };
-    deliver_fork_notices(db, notices).await;
+    if !notices.is_empty() {
+        let db = Arc::clone(db);
+        let delivery = tokio::spawn(async move { deliver_fork_notices(&db, notices).await });
+        if let Err(e) = delivery.await {
+            warn!("Fork notice delivery task failed: {}", e);
+        }
+    }
     Ok(out)
 }
 
 pub async fn sync_claims(
-    db: &std::sync::Mutex<Connection>,
+    db: &Arc<Mutex<Connection>>,
     proc_root: &Path,
     sessions_dirs: &(impl SessionDirs + ?Sized),
     host_label: &str,
@@ -606,7 +613,7 @@ pub fn resolve_claude_in(
 }
 
 pub async fn resolve_claude_session_and_deliver(
-    db: &std::sync::Mutex<Connection>,
+    db: &Arc<Mutex<Connection>>,
     proc_root: &Path,
     sessions_dirs: &(impl SessionDirs + ?Sized),
     host_label: &str,
