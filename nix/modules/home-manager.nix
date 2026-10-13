@@ -1,11 +1,12 @@
 # homeManagerModules.xmsg: the `xmsg serve` user service and the per-harness pieces
-# (MCP entry, skill, agy hook, pi extension, opencode plugin).
+# (MCP entry, skill, agy hook, pi extension, opencode plugin, hermes plugin).
 #
 # `packages` is this flake's `packages` output, the default for `programs.xmsg.package`.
 { packages }:
 {
   config,
   lib,
+  options,
   pkgs,
   ...
 }:
@@ -22,6 +23,14 @@ let
   fed = srv.federation;
   exe = lib.getExe cfg.package;
   skill = ./skills/xmsg;
+
+  # The hermes plugin directory (plugin.yaml and __init__.py). `extraPlugins` links it as
+  # `plugins/nix-managed-<name>`; hermes keys a plugin by its manifest name, `xmsg`.
+  hermesPlugin = pkgs.runCommand "xmsg" { } ''
+    mkdir $out
+    cp ${../../extensions/hermes/plugin.yaml} $out/plugin.yaml
+    cp ${../../extensions/hermes/__init__.py} $out/__init__.py
+  '';
 
   # The MCP server every MCP harness runs: `xmsg mcp`, a stdio server.
   mcpEntry = {
@@ -258,6 +267,7 @@ in
       agy.enable = mkEnableOption "the xmsg MCP server, skill and PreInvocation hook in Antigravity (`programs.antigravity-cli`); the module owns `~/.gemini/config/hooks.json`";
       pi.enable = mkEnableOption "the xmsg pi extension and skill (`~/.pi/agent`)";
       opencode.enable = mkEnableOption "the xmsg opencode plugin and skill (`$XDG_CONFIG_HOME/opencode`); no MCP entry and no `opencode.json`";
+      hermes.enable = mkEnableOption "the xmsg hermes plugin and skill (`services.hermes-agent`); the plugin may inject on the TUI and desktop host (`plugins.entries.xmsg.allow_gateway_injection`)";
     };
   };
 
@@ -271,6 +281,11 @@ in
         )
         ++ lib.optional cfg.harnesses.agy.enable (
           requireHarness "agy" "programs.antigravity-cli.enable" config.programs.antigravity-cli.enable
+        )
+        ++ lib.optional cfg.harnesses.hermes.enable (
+          requireHarness "hermes" "services.hermes-agent.enable" (
+            config.services.hermes-agent.enable or false
+          )
         )
         ++ lib.concatLists (
           lib.mapAttrsToList (
@@ -387,5 +402,23 @@ in
       xdg.configFile."opencode/plugin/xmsg.ts".source = ../../extensions/opencode/xmsg.ts;
       xdg.configFile."opencode/skills/xmsg/SKILL.md".source = skill + "/SKILL.md";
     })
+
+    # hermes-agent's own home-manager module (`services.hermes-agent`) installs the plugin and
+    # writes config.yaml. `settings` merges by `lib.recursiveUpdate`, so a `plugins.enabled`
+    # list defined elsewhere replaces this one rather than joining it. Defined only where that
+    # module is imported; elsewhere the switch's assertion names the option.
+    (lib.optionalAttrs (options ? services.hermes-agent) (
+      mkIf cfg.harnesses.hermes.enable {
+        services.hermes-agent = {
+          extraPlugins = [ hermesPlugin ];
+          settings.plugins = {
+            enabled = [ "xmsg" ];
+            # Without it the TUI and desktop host refuses every injection (hermes_cli/plugins_injection.py).
+            entries.xmsg.allow_gateway_injection = true;
+          };
+          hermesHomeFiles."skills/xmsg/SKILL.md" = skill + "/SKILL.md";
+        };
+      }
+    ))
   ]);
 }

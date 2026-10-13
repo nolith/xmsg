@@ -9,6 +9,9 @@
 # - `opencode-plugin` (XH2 oracles 8-11, release, restart): the real opencode, with the plugin file the module
 #   renders, against a real `xmsg serve` and a mock model on loopback
 #   (extensions/opencode/check.py).
+# - `hermes-plugin` (XH3 oracles 1-6): the real hermes CLI on a pty, and hermes's tui_gateway
+#   (the desktop host), with the plugin and config.yaml settings the module renders, against a
+#   real `xmsg serve` and a mock model on loopback (extensions/hermes/check.py).
 # - `pi-extension`, `pi-paths`: the pi extension's own node tests (extensions/pi). The
 #   extension's darwin `getconf DARWIN_USER_TEMP_DIR` fallback is not covered by CI.
 { inputs, ... }:
@@ -21,7 +24,7 @@
       ...
     }:
     let
-      inherit (inputs) xmsg home-manager;
+      inherit (inputs) xmsg home-manager hermes-agent;
       xmsgPkg = xmsg.packages.${system}.default;
 
       hooksJson =
@@ -82,6 +85,31 @@
           ];
         }).config.xdg.configFile."opencode/plugin/xmsg.ts".source;
 
+      # The hermes switch's rendering: its one plugin and its config.yaml settings.
+      hermesCfg =
+        (home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            xmsg.homeManagerModules.xmsg
+            hermes-agent.homeManagerModules.default
+            {
+              home = {
+                username = "alice";
+                homeDirectory = "/home/alice";
+                stateVersion = "25.11";
+                enableNixpkgsReleaseCheck = false;
+              };
+              services.hermes-agent.enable = true;
+              programs.xmsg = {
+                enable = true;
+                harnesses.hermes.enable = true;
+              };
+            }
+          ];
+        }).config.services.hermes-agent;
+      hermesPlugin = lib.head hermesCfg.extraPlugins;
+      hermesSettings = pkgs.writeText "hermes-settings.json" (builtins.toJSON hermesCfg.settings);
+
       nodeCheck =
         name: script:
         pkgs.runCommand "xmsg-${name}"
@@ -107,6 +135,20 @@
           pkgs.runCommand "xmsg-opencode-plugin" { nativeBuildInputs = [ pkgs.python3 ]; }
             ''
               python3 ${../../extensions/opencode/check.py} ${lib.getExe xmsgPkg} ${lib.getExe pkgs.opencode} ${opencodePlugin}
+              touch $out
+            '';
+
+        hermes-plugin =
+          pkgs.runCommand "xmsg-hermes-plugin"
+            {
+              nativeBuildInputs = [
+                pkgs.python3
+              ];
+            }
+            ''
+              python3 ${../../extensions/hermes/check.py} ${lib.getExe xmsgPkg} ${
+                lib.getExe' hermes-agent.packages.${system}.default "hermes"
+              } ${hermesPlugin} ${hermesSettings}
               touch $out
             '';
 

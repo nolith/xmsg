@@ -1,0 +1,12 @@
+name: xmsg
+version: 0.1.0
+description: "xmsg: message other agent sessions (list, send, reply, replies) and receive their messages."
+author: sini
+provides_tools:
+  - xmsg_list
+  - xmsg_send
+  - xmsg_reply
+  - xmsg_replies
+provides_hooks:
+  - pre_llm_call
+  - on_session_reset

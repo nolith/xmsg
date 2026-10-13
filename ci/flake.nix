@@ -12,6 +12,9 @@
       url = "github:nix-community/home-manager/fae6e9e42c3b762ab47635cddcfaf6f52374a61b";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # The hermes switch and the hermes-plugin check run against hermes-agent at nix-config's pin
+    # (its `hermes-agent` node). Its own lock is kept, so its package is nix-config's.
+    hermes-agent.url = "github:NousResearch/hermes-agent/c538ec5f402e8078248becacd474e47a08c6e79a";
   };
 
   outputs =

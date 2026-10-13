@@ -124,16 +124,16 @@ Used by non-Claude harnesses for registration and polling, and by services:
 - **Antigravity Registration:** `xmsg register agy` sends session credentials (`conversation_id`, `ls_address`, `csrf_token`) over this socket to enable outbound HTTP message injection into Antigravity.
 - **Pi Registration & Polling:** The Pi extension registers its process and enters an event-driven long-poll loop to receive inbound messages (`poll`, `ack`).
 - **Services:** a registration's `ok` frame is `{"status":"ok","address":"<name>@<node>","node":"<node>"}`. A service then uses `poll`, `ack` and `reply` here; it runs `list`, `send` and `replies` over `agent.sock`. `register.sock` carries registration, `poll`, `ack` and `reply` only, and its frames refuse unknown fields too.
-- **Plugin harnesses (opencode):** see 2.3.1.
+- **Plugin harnesses (opencode, hermes):** see 2.3.1.
 
 #### 2.3.1 Plugin registration: many sessions on one connection
 
-A plugin harness (opencode) runs many sessions in one process, so its plugin holds **one** `register.sock`
+A plugin harness (opencode, hermes) runs many sessions in one process, so its plugin holds **one** `register.sock`
 connection and registers each session on it; each gets its own server-minted address (A18, HA4). The plugin's
 tools travel on the same connection, as frames naming the session they act as, so a call is attributed to that
 session's address and to no other.
 
-The connection opens with `{"harness":"opencode"}`, answered `{"status":"ok","node":"<node>"}`. Every later frame
+The connection opens with `{"harness":"opencode"}` or `{"harness":"hermes"}`, answered `{"status":"ok","node":"<node>"}`. Every later frame
 carries a `request_id` of the plugin's choosing, and its answer carries it back: answers to tool frames and the
 delivery that ends a pending `poll` arrive on one connection, in whatever order they are ready, and **a tool frame
 is answered while a `poll` is pending**. Every frame refuses unknown fields (`bad_request`, naming them).
@@ -244,6 +244,40 @@ opencode process (2.3.1):
   can still deliver to every session it registered.
 
 There is no MCP entry for opencode: the plugin's tools are the attested path.
+
+### 3.2.2 hermes plugin: `extensions/hermes/`
+
+hermes loads the plugin directory (`plugin.yaml`, `__init__.py`) from `$HERMES_HOME/plugins/` when
+`plugins.enabled` names it, by its manifest name `xmsg`. The plugin holds one `register.sock` connection per
+hermes process (2.3.1):
+
+- **Registration.** A session registers at the first `pre_llm_call` hook or xmsg tool call that carries its
+  `session_id`. A delegate (a `delegate_task` subagent, whose `pre_llm_call` names its parent) acts as its root
+  conversation and is never registered (HA7).
+- **Tools.** `xmsg_list`, `xmsg_send`, `xmsg_reply` and `xmsg_replies`, in the toolset `xmsg`, sent as frames under
+  the calling session (the tool's `session_id`). hermes defers plugin tools behind its Tool Search bridge by default
+  (`tools.tool_search`), so the model reaches them through `tool_search` and `tool_call`.
+- **Switching sessions (the classic CLI).** One session is live per CLI process. `/new` releases the old session's
+  address and registers the new session (hermes's `on_session_reset`). `/resume` and `/branch` fire no plugin hook,
+  so the plugin sees the switch at the next hook, tool call or push, by the CLI's `session_id`, releases the old
+  address then, and never injects one session's message into another.
+- **Compression.** With `compression.in_place: false`, a compression continues the conversation under a new
+  session id; the plugin then moves the address with `continues` (A19). It reads hermes's session store for this
+  (`SessionDB(read_only=True).get_compression_chain`), which is internal hermes API: a change there breaks
+  continuation, and CI's `hermes-plugin` check pins it. hermes's default, in-place compaction keeps the session id,
+  and the address with it.
+- **Push, in the classic CLI.** While a turn runs, a delivered message goes through the CLI's own handling of a
+  line typed while busy, so `display.busy_input_mode` (or `/busy`) decides exactly as for typed input: `queue` runs
+  it as the next turn, `interrupt` redirects the running turn, and `steer` adds it to the running turn after its
+  current tool call. When no turn runs it starts one. This uses hermes's private CLI names (`_manager._cli_ref`,
+  `_agent_running`, `_tui_enter_while_busy`), which the CI check pins.
+- **Push, on the TUI and desktop host.** hermes's `inject_message` queues the message on its session in every busy
+  mode ("a notice must not cancel in-flight work"), so there `interrupt` and `steer` behave as `queue`. It needs
+  `plugins.entries.xmsg.allow_gateway_injection: true`, which the switch sets; without it hermes refuses every
+  injection and the message stays pending.
+- **Acks.** The plugin acks a message only once hermes accepted it; a refused one is offered again.
+
+The messaging gateway is not covered: its `session_key` differs from the tools' `session_id`.
 
 ### 3.3 Antigravity Integration: Automatic Registration & Hooks
 
@@ -493,7 +527,7 @@ A `to` with `@node` is resolved by that node alone (`@` this node: the steps abo
 ### Delivery and the queue (A14)
 
 - **Outcomes.** A send returns `delivered` (it reached a live recipient) or `queued` (it is held for an instance that is not running).
-- **What queues.** A send to an instance ID this node has observed, while it is not running: a closed Claude conversation, or an agy conversation between turns. "Observed" is the claim table (a Claude process presenting the ID) plus agy registrations. A pi ID, a released or closed plugin session's address (opencode) and an exited `X~n` are `gone`, never queue and are never listed `parked`.
+- **What queues.** A send to an instance ID this node has observed, while it is not running: a closed Claude conversation, or an agy conversation between turns. "Observed" is the claim table (a Claude process presenting the ID) plus agy registrations. A pi ID, a released or closed plugin session's address (opencode, hermes) and an exited `X~n` are `gone`, never queue and are never listed `parked`.
 - **How long.** A message is held for the reply TTL (`--reply-ttl`, 7 days by default) and dropped unread after it. The ID stays parked, so sends to it queue, for the reply TTL after the conversation was last live, or as long as its queue holds a message, whichever is longer; after that it is `not_found` (D-1's lifetime). Discovery is on demand, so for Claude "last live" is the scan that found the conversation gone, and for agy its last registration.
 - **Delivery.** The queue drains when the conversation is next observed: a new Claude process presenting the ID (the next scan of the session files, which every `list`, `send` and MCP start runs), or an agy registration. Each message is delivered once, in the order sent, and shows when it was sent: `[xmsg] message_id=<id> sent=<RFC 3339 UTC time>`. Its outcome then reads `delivered`.
 - **Across nodes.** A send from another node to a conversation parked here queues here, as a local one does (XA6's resolution picks the node). The queue then follows the conversation across the user's machines, below.
@@ -934,8 +968,17 @@ option, so it composes with the rest of your configuration:
   real `xmsg serve` and a mock model, and checks registration, attribution for two sessions and a child session,
   push, and release on delete.
 
-A Claude or agy switch whose harness module is off fails evaluation, naming the option it needs, rather than
-installing nothing. The pi and opencode switches write files and need no harness module.
+- `programs.xmsg.harnesses.hermes.enable`: through hermes-agent's own home-manager module, the plugin
+  (`extensions/hermes/`) in `services.hermes-agent.extraPlugins` (linked as `plugins/nix-managed-xmsg`),
+  `settings.plugins.enabled = [ "xmsg" ]`, `settings.plugins.entries.xmsg.allow_gateway_injection = true`, and the
+  skill as `hermesHomeFiles."skills/xmsg/SKILL.md"`. **Cost:** hermes's `settings` merges with
+  `lib.recursiveUpdate`, which replaces lists, so a `settings.plugins.enabled` defined elsewhere replaces this one;
+  list `xmsg` there too. CI runs the real hermes CLI (on a pty) and its desktop backend with the rendered plugin
+  and settings against a real `xmsg serve` and a mock model, and checks registration and attribution, `/new`,
+  a compression, a delegate, the three busy modes, and a refused injection.
+
+A Claude, agy or hermes switch whose harness module is off fails evaluation, naming the option it needs, rather
+than installing nothing. The pi and opencode switches write files and need no harness module.
 
 The skill (`nix/modules/skills/xmsg/SKILL.md`, the same file for every harness) teaches the four tools (`list`,
 `send`, `reply`, `replies`), addresses and sender labels (`label · id[~n]@node`, `name@node`,

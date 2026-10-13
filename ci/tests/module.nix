@@ -2,7 +2,12 @@
 # home-manager at nix-config's pin. Cells are evaluations; `peers-render` builds.
 { lib, inputs, ... }:
 let
-  inherit (inputs) xmsg home-manager nixpkgs;
+  inherit (inputs)
+    xmsg
+    home-manager
+    nixpkgs
+    hermes-agent
+    ;
 
   # home-manager's own evaluation (its modules/default.nix) without the wrapper that throws
   # on a failed assertion, so a cell can read `assertions` as data.
@@ -23,6 +28,7 @@ let
         }
         ++ [
           xmsg.homeManagerModules.xmsg
+          hermes-agent.homeManagerModules.default
           (
             { pkgs, ... }:
             {
@@ -41,6 +47,7 @@ let
                 enable = true;
                 package = pkgs.runCommand "antigravity-cli-fixture" { } "mkdir -p $out/bin; touch $out/bin/agy";
               };
+              services.hermes-agent.enable = true;
               programs.xmsg = {
                 enable = true;
                 harnesses = {
@@ -48,6 +55,7 @@ let
                   agy.enable = true;
                   pi.enable = true;
                   opencode.enable = true;
+                  hermes.enable = true;
                 };
                 server = {
                   httpSocket = "/run/user/1000/xmsg/http.sock";
@@ -234,6 +242,23 @@ in
         programsOpencode = false;
       };
     };
+    # XH3: the hermes switch adds its plugin (linked as `nix-managed-xmsg`), enables it by its
+    # manifest name, allows injection on the TUI and desktop host, and installs the skill.
+    test-hermes = {
+      expr = {
+        plugins = map lib.getName linux.services.hermes-agent.extraPlugins;
+        settings = linux.services.hermes-agent.settings.plugins;
+        skill = linux.services.hermes-agent.hermesHomeFiles."skills/xmsg/SKILL.md";
+      };
+      expected = {
+        plugins = [ "xmsg" ];
+        settings = {
+          enabled = [ "xmsg" ];
+          entries.xmsg.allow_gateway_injection = true;
+        };
+        skill = ../../nix/modules/skills/xmsg + "/SKILL.md";
+      };
+    };
 
     # Oracle 7: the installed skill teaches A13's four tools, A12's labels and the error
     # vocabulary, and the http.sock limits (A15, HA2); nothing of the retired surface or of an
@@ -349,17 +374,19 @@ in
       expected = badMsg "from must hold at least one CIDR, or be null.";
     };
 
-    # D19: a switch whose harness module is off is refused, naming the option.
+    # D19 (and XH3 oracle 7): a switch whose harness module is off is refused, naming the option.
     test-switch-needs-harness = {
       expr = failedAssertions (
         hmEval "x86_64-linux" {
           programs.claude-code.enable = lib.mkForce false;
           programs.antigravity-cli.enable = lib.mkForce false;
+          services.hermes-agent.enable = lib.mkForce false;
         }
       );
       expected = [
         "programs.xmsg.harnesses.claude.enable needs programs.claude-code.enable = true."
         "programs.xmsg.harnesses.agy.enable needs programs.antigravity-cli.enable = true."
+        "programs.xmsg.harnesses.hermes.enable needs services.hermes-agent.enable = true."
       ];
     };
 

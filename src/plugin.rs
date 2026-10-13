@@ -1,8 +1,9 @@
 //! Plugin registrations on `register.sock` (HA2, HA4, A18, A19; plan XH2): one connection
 //! per plugin process, many sessions on it, each with a server-minted address.
 //!
-//! The connection opens with `{"harness":"opencode"}`, answered `{"status":"ok","node":N}`.
-//! Every later frame carries a `request_id`, and its answer carries it back, so an answer
+//! The connection opens with `{"harness":"opencode"}` (or `"hermes"`), answered
+//! `{"status":"ok","node":N}`. Every later frame carries a `request_id`, and its answer
+//! carries it back, so an answer
 //! to a tool frame and a delivery to the pending `poll` are told apart on the one
 //! connection. Tool frames are answered while a `poll` is pending.
 //!
@@ -37,7 +38,7 @@ use crate::storage::{self, now_epoch_secs};
 use crate::surface;
 
 /// The harnesses that register by plugin.
-pub const HARNESSES: &[&str] = &["opencode"];
+pub const HARNESSES: &[&str] = &["opencode", "hermes"];
 
 /// `name` as a plugin harness, if it is one.
 pub fn harness(name: &str) -> Option<&'static str> {
