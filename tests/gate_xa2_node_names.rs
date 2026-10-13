@@ -576,23 +576,10 @@ async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
         let c_name = node_name_from_pin(&c_creds.pin).unwrap();
         assert_eq!(l_name.len(), 16);
 
-        // H is started last: L and C dial it, it dials them.
+        // H is started last: L and C dial it, it dials them. L also knows C, as `cee`.
         let l_dir = node_dir();
         let c_dir = node_dir();
         let h_fed = get_free_port();
-        let l = start(
-            NodeSpec {
-                creds: Some(l_creds.clone()),
-                peers: Some(
-                    json!({ "hub": pin_entry(&addr(h_fed), &h_creds.pin, &["send", "reply"]) })
-                        .to_string(),
-                ),
-                fed: true,
-                ..Default::default()
-            },
-            Some(l_dir),
-        )
-        .await;
         let c = start(
             NodeSpec {
                 creds: Some(c_creds.clone()),
@@ -604,6 +591,22 @@ async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
                 ..Default::default()
             },
             Some(c_dir),
+        )
+        .await;
+        let l = start(
+            NodeSpec {
+                creds: Some(l_creds.clone()),
+                peers: Some(
+                    json!({
+                        "hub": pin_entry(&addr(h_fed), &h_creds.pin, &["send", "reply"]),
+                        "cee": pin_entry(&addr(c.fed_port), &c_creds.pin, &["send", "reply"]),
+                    })
+                    .to_string(),
+                ),
+                fed: true,
+                ..Default::default()
+            },
+            Some(l_dir),
         )
         .await;
         let h_peers = json!({
@@ -637,6 +640,20 @@ async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
             !line.contains("laptop"),
             "H's nickname for L must not cross the wire: {line}"
         );
+
+        // L types its own nickname for C in a hop destination: the hub, which has no
+        // `cee`, receives C's canonical name (verifier P1).
+        let (status, body) = http_send(&l, "bob@cee@hub", "by L's nickname").await;
+        assert_eq!(status, 202, "L's nickname for C goes on the wire canonical: {body}");
+        let mut got = false;
+        for _ in 0..100 {
+            if bob.lock().unwrap().iter().any(|l| l.contains("by L's nickname")) {
+                got = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(got, "bob on C receives the send addressed by L's nickname");
 
         // H types L's nickname.
         let (status, body) = http_send(&h, "alice@laptop", "by nickname").await;
@@ -727,7 +744,7 @@ async fn test_oracle_5_name_shaped_nicknames_refused() {
 // is refused: by the handshake in each direction, naming both entries, and by the loader
 // where it can know (an entry pinning this node's own key).
 // Mutant M6a: drop the inbound check => RED. M6b: drop the outbound check => RED.
-// M6c: drop the loader's own-key check => RED.
+// M6c: drop the loader's own-key check => RED. M6d: a pinned dial checks only the pin => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_oracle_6_one_node_one_canonical_name() {
@@ -782,6 +799,14 @@ async fn test_oracle_6_one_node_one_canonical_name() {
         assert!(
             body.contains("'laptop'") && body.contains("'sini.bitstream'"),
             "the outbound refusal must name both entries: {body}"
+        );
+        // Outbound from N through its pinned entry: X's certificate also authenticates as
+        // N's CA entry sini.bitstream.
+        let (status, body) = http_send(&n, "alice@laptop", "pinned dial").await;
+        assert_ne!(status, 202, "N must refuse X through the pin too: {body}");
+        assert!(
+            body.contains("'laptop'") && body.contains("'sini.bitstream'"),
+            "the pinned-dial refusal must name both entries: {body}"
         );
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -923,7 +948,87 @@ async fn test_oracle_8_no_hand_assigned_name() {
             line.contains(&format!("xmsg@{expected} · ci")),
             "a node with no certificate is {expected}: {line}"
         );
-        assert_eq!(expected.matches('.').count(), 1, "{expected}");
+        // D4: `<user>.<host>`, the host cut at its first `.`; the user name may contain `.`.
+        let host = gethostname::gethostname().to_string_lossy().to_string();
+        let host = host.split('.').next().unwrap();
+        let user = expected.strip_suffix(&format!(".{host}"));
+        assert!(user.is_some_and(|u| !u.is_empty()), "{expected}");
+    })
+    .await;
+}
+
+// =============================================================================
+// Oracle 7b: Filters at a hub (xa2-verify-v0 C1). A -> H -> D; on H, D's entry has
+// `targets = ["genie-guard", "sess-label"]`, and D has no service, only a Claude instance
+// labelled `genie-guard` (id `sess-label`). The hub checks the unresolved ref: a ref with
+// a harness kind (`claude:`) never passes, even naming a listed ID; `svc:`/`session:` map
+// to the name. The bare-label case (`genie-guard@D@hub`) is open by design, not asserted.
+// Mutant M7c: strip every retired kind prefix from the ref => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_7b_hub_targets_refuse_harness_kind_refs() {
+    run_with_port_retry(|| async {
+        let a_creds = pinned_creds("a");
+        let d_creds = pinned_creds("d");
+        let h_creds = pinned_creds("h");
+        let h_fed = get_free_port();
+        let to_hub = |allow: &[&str]| {
+            Some(json!({ "hub": pin_entry(&addr(h_fed), &h_creds.pin, allow) }).to_string())
+        };
+        let a = start(
+            NodeSpec {
+                creds: Some(a_creds.clone()),
+                peers: to_hub(&["send", "reply"]),
+                fed: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let d = start(
+            NodeSpec {
+                creds: Some(d_creds.clone()),
+                peers: to_hub(&["send", "reply", "relayed"]),
+                fed: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let mut d_on_h = pin_entry(&addr(d.fed_port), &d_creds.pin, &["send", "reply"]);
+        d_on_h["targets"] = json!(["genie-guard", "sess-label"]);
+        let h_peers = json!({
+            "anode": pin_entry(&addr(a.fed_port), &a_creds.pin, &["send", "reply", "forward"]),
+            "dnode": d_on_h,
+        })
+        .to_string();
+        let mut h_spec = NodeSpec {
+            creds: Some(h_creds),
+            peers: Some(h_peers),
+            ..Default::default()
+        };
+        h_spec
+            .extra_args
+            .extend(["--fed-listen".to_string(), addr(h_fed)]);
+        let _h = start(h_spec, None).await;
+        let d_name = node_name_from_pin(&d_creds.pin).unwrap();
+        let inbox = claude_session(&d.sessions_dir, "sess-label", "genie-guard");
+
+        for (r, want) in [
+            (format!("sess-label@{d_name}@hub"), 202),
+            (format!("session:sess-label@{d_name}@hub"), 202),
+            (format!("claude:genie-guard@{d_name}@hub"), 403),
+            (format!("claude:sess-label@{d_name}@hub"), 403),
+        ] {
+            let (status, body) = http_send(&a, &r, &format!("to {r}")).await;
+            assert_eq!(status, want, "{r} through the hub: {body}");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let got = inbox.lock().unwrap().clone();
+        assert!(
+            got.len() == 2 && got.iter().all(|l| !l.contains("to claude:")),
+            "only the two admitted sends reach the labelled instance: {got:?}"
+        );
     })
     .await;
 }

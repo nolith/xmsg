@@ -111,11 +111,14 @@ pub(crate) fn target_matches_allowlist(
     targets.iter().any(|t| t == key)
 }
 
-/// Before resolution: could `target_ref` name an allowed target? An old-surface kind
-/// prefix on the ref is stripped first.
+/// Before resolution: could `target_ref` name an allowed target? `svc:<n>` names the
+/// service `<n>` and `session:<id>` the instance `<id>`. A harness kind (`claude:`, `agy:`,
+/// `pi:`, `http:`) prefixes a label or an instance the unresolved ref cannot prove, so it
+/// never passes a non-empty `targets`.
 pub(crate) fn target_ref_could_match(target_ref: &str, targets: &[String]) -> bool {
     let bare = match target_ref.split_once(':') {
-        Some((kind, rest)) if RETIRED_FILTER_KINDS.contains(&kind) => rest,
+        Some(("svc" | "session", rest)) => rest,
+        Some((kind, _)) if RETIRED_FILTER_KINDS.contains(&kind) => return false,
         _ => target_ref,
     };
     targets.iter().any(|t| t == bare)
@@ -813,6 +816,34 @@ impl PeersMap {
         Self::load_from_json_for(&content, own)
     }
 
+    /// The CA entries a certificate authenticates as: its single URI SAN matches the
+    /// entry's identities and it chains to the entry's anchors for `usage`. Inbound
+    /// admission and AM-6 on a pinned dial both use this one test.
+    pub fn ca_entries_for(
+        &self,
+        leaf: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+        usage: webpki::KeyUsage,
+    ) -> Vec<(&PeerConfig, String)> {
+        let uris = extract_uri_sans(leaf.as_ref()).unwrap_or_default();
+        let [uri] = uris.as_slice() else {
+            return Vec::new();
+        };
+        self.ca_peers()
+            .into_iter()
+            .filter(|peer| {
+                peer.identities
+                    .as_ref()
+                    .is_some_and(|ids| uri_matches_any_identity(uri, ids))
+                    && self.get_ca_anchors(&peer.name).is_some_and(|anchors| {
+                        verify_cert_chain(leaf, intermediates, anchors, now, usage).is_ok()
+                    })
+            })
+            .map(|peer| (peer, uri.clone()))
+            .collect()
+    }
+
     pub fn resolve_incoming_peer(
         &self,
         leaf: &CertificateDer<'_>,
@@ -823,32 +854,16 @@ impl PeersMap {
         let norm_pin = normalize_pin(&client_pin);
         let any_pin_match = self.get_by_pin(&norm_pin);
 
-        let uris = extract_uri_sans(leaf.as_ref()).unwrap_or_default();
-        let mut ca_matches: Vec<(&PeerConfig, String)> = Vec::new();
-
-        if uris.len() == 1 {
-            let uri = &uris[0];
-            let now = UnixTime::now();
-            for peer in self.ca_peers().into_iter().filter(|p| !p.allow.is_empty()) {
-                if let Some(ref identities) = peer.identities {
-                    if uri_matches_any_identity(uri, identities) {
-                        if let Some(anchors) = self.get_ca_anchors(&peer.name) {
-                            if verify_cert_chain(
-                                leaf,
-                                intermediates,
-                                anchors,
-                                now,
-                                webpki::KeyUsage::client_auth(),
-                            )
-                            .is_ok()
-                            {
-                                ca_matches.push((peer, uri.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let mut ca_matches: Vec<(&PeerConfig, String)> = self
+            .ca_entries_for(
+                leaf,
+                intermediates,
+                UnixTime::now(),
+                webpki::KeyUsage::client_auth(),
+            )
+            .into_iter()
+            .filter(|(p, _)| !p.allow.is_empty())
+            .collect();
 
         if let Some(pin_peer) = any_pin_match {
             if !ca_matches.is_empty() {
@@ -1150,13 +1165,25 @@ impl rustls::server::danger::ClientCertVerifier for PinnedClientCertVerifier {
 #[derive(Debug)]
 pub struct PinnedServerCertVerifier {
     expected_pin: String,
+    /// This pinned entry's key, and the peers file, for AM-6.
+    peer_name: String,
+    peers: Option<Arc<PeersMap>>,
 }
 
 impl PinnedServerCertVerifier {
     pub fn new(expected_pin: &str) -> Self {
         Self {
             expected_pin: normalize_pin(expected_pin),
+            peer_name: String::new(),
+            peers: None,
         }
+    }
+
+    /// Refuse a server that also authenticates as a CA entry of the peers file (AM-6).
+    pub fn refusing_ca(mut self, peer_name: &str, peers: Arc<PeersMap>) -> Self {
+        self.peer_name = peer_name.to_string();
+        self.peers = Some(peers);
+        self
     }
 }
 
@@ -1164,22 +1191,35 @@ impl rustls::client::danger::ServerCertVerifier for PinnedServerCertVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
+        intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: UnixTime,
+        now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let pin = spki_sha256_from_der(end_entity.as_ref()).map_err(|_| {
             rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
         })?;
         let norm_pin = normalize_pin(&pin);
-        if norm_pin == self.expected_pin {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::InvalidCertificate(
+        if norm_pin != self.expected_pin {
+            return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::UnknownIssuer,
-            ))
+            ));
         }
+        if let Some(peers) = &self.peers {
+            let ca = peers.ca_entries_for(
+                end_entity,
+                intermediates,
+                now,
+                webpki::KeyUsage::server_auth(),
+            );
+            if !ca.is_empty() {
+                let msg =
+                    one_node_two_names(&self.peer_name, ca.iter().map(|(p, _)| p.name.as_str()));
+                tracing::warn!("{msg}");
+                return Err(rustls::Error::General(msg));
+            }
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -1245,36 +1285,18 @@ impl rustls::server::danger::ClientCertVerifier for CombinedClientCertVerifier {
         let norm_pin = normalize_pin(&pin);
         let any_pin_match = self.peers.get_by_pin(&norm_pin);
 
-        let uris = extract_uri_sans(end_entity.as_ref()).unwrap_or_default();
-        let mut ca_matches: Vec<&PeerConfig> = Vec::new();
-
-        if uris.len() == 1 {
-            let uri = &uris[0];
-            for peer in self
-                .peers
-                .ca_peers()
-                .into_iter()
-                .filter(|p| !p.allow.is_empty())
-            {
-                if let Some(ref identities) = peer.identities {
-                    if uri_matches_any_identity(uri, identities) {
-                        if let Some(anchors) = self.peers.get_ca_anchors(&peer.name) {
-                            if verify_cert_chain(
-                                end_entity,
-                                intermediates,
-                                anchors,
-                                now,
-                                webpki::KeyUsage::client_auth(),
-                            )
-                            .is_ok()
-                            {
-                                ca_matches.push(peer);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let ca_matches: Vec<&PeerConfig> = self
+            .peers
+            .ca_entries_for(
+                end_entity,
+                intermediates,
+                now,
+                webpki::KeyUsage::client_auth(),
+            )
+            .into_iter()
+            .map(|(p, _)| p)
+            .filter(|p| !p.allow.is_empty())
+            .collect();
 
         // AM-6: a CA-authenticated connection presenting a pinned entry's key is one node
         // under two names; refuse it (including outbound-only pinned peers).
@@ -3277,21 +3299,24 @@ pub fn make_tls_connector_for_peer(
         fed_state.key_der(),
     ));
 
-    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-        if let Some(ref pin) = peer.pin {
-            Arc::new(PinnedServerCertVerifier::new(pin))
-        } else if let Some(anchors) = fed_state.get_ca_anchors(&peer.name) {
-            let identities = peer.identities.clone().unwrap_or_default();
-            Arc::new(
-                CaServerCertVerifier::new(anchors, identities)
-                    .refusing_pinned(&peer.name, fed_state.current_peers().pinned_entries()),
-            )
-        } else {
-            return Err(AppError::Internal(format!(
-                "peer '{}' has neither pin nor valid CA bundle",
-                peer.name
-            )));
-        };
+    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = if let Some(ref pin) =
+        peer.pin
+    {
+        Arc::new(
+            PinnedServerCertVerifier::new(pin).refusing_ca(&peer.name, fed_state.current_peers()),
+        )
+    } else if let Some(anchors) = fed_state.get_ca_anchors(&peer.name) {
+        let identities = peer.identities.clone().unwrap_or_default();
+        Arc::new(
+            CaServerCertVerifier::new(anchors, identities)
+                .refusing_pinned(&peer.name, fed_state.current_peers().pinned_entries()),
+        )
+    } else {
+        return Err(AppError::Internal(format!(
+            "peer '{}' has neither pin nor valid CA bundle",
+            peer.name
+        )));
+    };
 
     let client_config = rustls::ClientConfig::builder_with_provider(
         rustls::crypto::ring::default_provider().into(),

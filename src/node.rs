@@ -127,7 +127,11 @@ mod tests {
         assert!(node_name_from_pin("sha256:abcd").is_err());
         assert!(is_key_name_shaped("mzxw6ytboiaaaaaa"));
         assert!(!is_key_name_shaped("laptop"));
+        // D4: `<user>.<host>`, the host cut at its first `.`; the user name may contain `.`.
         let local = local_node_name();
-        assert_eq!(local.matches('.').count(), 1, "{local}");
+        let host = gethostname::gethostname().to_string_lossy().to_string();
+        let host = host.split('.').next().unwrap();
+        let user = local.strip_suffix(&format!(".{host}"));
+        assert!(user.is_some_and(|u| !u.is_empty()), "{local}");
     }
 }
