@@ -581,12 +581,42 @@ pub fn http_request_unix(
     path_and_query: &str,
     body: Option<&str>,
 ) -> io::Result<(StatusCode, String)> {
+    http_request_unix_within(
+        sock_path,
+        method,
+        path_and_query,
+        body,
+        Duration::from_secs(5),
+    )
+}
+
+/// As [`http_request_unix`], with `timeout` bounding each socket read and write.
+/// An expired bound is `ErrorKind::TimedOut` naming the socket and the bound; the
+/// request is never retried (a POST is not idempotent).
+pub fn http_request_unix_within(
+    sock_path: &Path,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&str>,
+    timeout: Duration,
+) -> io::Result<(StatusCode, String)> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
+    let timed_out = |e: io::Error| match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "{method} {path_and_query} on {} timed out: no progress within {timeout:?}",
+                sock_path.display()
+            ),
+        ),
+        _ => e,
+    };
+
     let mut stream = UnixStream::connect(sock_path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
 
     let req = if let Some(b) = body {
         format!(
@@ -598,7 +628,7 @@ pub fn http_request_unix(
             "{method} {path_and_query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
         )
     };
-    stream.write_all(req.as_bytes())?;
+    stream.write_all(req.as_bytes()).map_err(timed_out)?;
 
     let mut resp_bytes = Vec::new();
     let mut buf = [0u8; 4096];
@@ -606,7 +636,7 @@ pub fn http_request_unix(
     let mut header_len = 0;
 
     loop {
-        let n = stream.read(&mut buf)?;
+        let n = stream.read(&mut buf).map_err(timed_out)?;
         if n == 0 {
             break;
         }

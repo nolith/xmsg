@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
-use xmsg::http::{bind_ucred_unix_listener, build_router, http_get_unix, AppState};
+use xmsg::http::{bind_ucred_unix_listener, build_router, http_request_unix_within, AppState};
 use xmsg::mcp::{run_mcp_loop, McpConfig};
 
 fn test_app_state() -> Arc<AppState> {
@@ -85,7 +85,8 @@ async fn test_oracle_1_foreign_uid_refused() {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (status, body) =
-            http_get_unix(&sock_path, "/healthz").expect("matching UID must succeed");
+            http_request_unix_within(&sock_path, "GET", "/healthz", None, Duration::from_secs(30))
+                .expect("matching UID must succeed");
         assert_eq!(status, axum::http::StatusCode::OK);
         assert!(body.contains("\"status\":\"ok\""));
 
@@ -107,7 +108,8 @@ async fn test_oracle_1_foreign_uid_refused() {
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let res = http_get_unix(&sock_path, "/healthz");
+        let res =
+            http_request_unix_within(&sock_path, "GET", "/healthz", None, Duration::from_secs(30));
         assert!(
             res.is_err(),
             "Connection from different UID must be refused by peer-cred comparison check, got: {:?}",

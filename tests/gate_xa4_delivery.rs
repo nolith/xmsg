@@ -201,7 +201,13 @@ impl Node {
         let (method, path) = (method.to_string(), path.to_string());
         let body = body.map(|b| b.to_string());
         let (status, text) = tokio::task::spawn_blocking(move || {
-            xmsg::http::http_request_unix(&sock, &method, &path, body.as_deref())
+            xmsg::http::http_request_unix_within(
+                &sock,
+                &method,
+                &path,
+                body.as_deref(),
+                std::time::Duration::from_secs(30),
+            )
         })
         .await
         .unwrap()

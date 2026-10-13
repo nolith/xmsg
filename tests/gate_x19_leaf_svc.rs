@@ -18,7 +18,7 @@ use xmsg::error::AppError;
 use xmsg::fed::{
     generate_self_signed_ed25519, run_fed_listener, FedState, PeerConfig, PeersMap, RateLimiter,
 };
-use xmsg::http::{bind_ucred_unix_listener, build_router, http_request_unix, AppState};
+use xmsg::http::{bind_ucred_unix_listener, build_router, http_request_unix_within, AppState};
 use xmsg::pi::new_pi_store;
 use xmsg::svc::{new_svc_store, run_leaf_inbox_task, run_leaf_register_server};
 
@@ -624,7 +624,16 @@ async fn test_oracle_2_redelivery_unacked_message() {
 
     let (status, resp_body) = tokio::task::spawn_blocking({
         let http_sock = hub.http_sock.clone();
-        move || http_request_unix(&http_sock, "POST", "/v1/messages", Some(&send_body)).unwrap()
+        move || {
+            http_request_unix_within(
+                &http_sock,
+                "POST",
+                "/v1/messages",
+                Some(&send_body),
+                Duration::from_secs(30),
+            )
+            .unwrap()
+        }
     })
     .await
     .unwrap();
@@ -848,7 +857,14 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
             let body =
                 serde_json::json!({ "to": "guard@leaf1", "from": "alice", "text": "M1 for leaf1" })
                     .to_string();
-            http_request_unix(&http_sock, "POST", "/v1/messages", Some(&body)).unwrap()
+            http_request_unix_within(
+                &http_sock,
+                "POST",
+                "/v1/messages",
+                Some(&body),
+                Duration::from_secs(30),
+            )
+            .unwrap()
         }
     })
     .await
@@ -866,7 +882,14 @@ async fn test_oracle_4_peer_mailbox_isolation_and_non_leaf_denied() {
             let body =
                 serde_json::json!({ "to": "guard@leaf2", "from": "alice", "text": "M2 for leaf2" })
                     .to_string();
-            http_request_unix(&http_sock, "POST", "/v1/messages", Some(&body)).unwrap()
+            http_request_unix_within(
+                &http_sock,
+                "POST",
+                "/v1/messages",
+                Some(&body),
+                Duration::from_secs(30),
+            )
+            .unwrap()
         }
     })
     .await
@@ -1040,7 +1063,14 @@ async fn test_oracle_5_targets_filter_on_queue_path() {
             let body =
                 serde_json::json!({ "to": "other@leaf", "from": "alice", "text": "Disallowed" })
                     .to_string();
-            http_request_unix(&http_sock, "POST", "/v1/messages", Some(&body)).unwrap()
+            http_request_unix_within(
+                &http_sock,
+                "POST",
+                "/v1/messages",
+                Some(&body),
+                Duration::from_secs(30),
+            )
+            .unwrap()
         }
     })
     .await
@@ -1069,7 +1099,14 @@ async fn test_oracle_5_targets_filter_on_queue_path() {
             let body =
                 serde_json::json!({ "to": "guard@leaf", "from": "alice", "text": "Allowed" })
                     .to_string();
-            http_request_unix(&http_sock, "POST", "/v1/messages", Some(&body)).unwrap()
+            http_request_unix_within(
+                &http_sock,
+                "POST",
+                "/v1/messages",
+                Some(&body),
+                Duration::from_secs(30),
+            )
+            .unwrap()
         }
     })
     .await

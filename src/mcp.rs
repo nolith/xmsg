@@ -561,6 +561,11 @@ pub fn execute_tool(
                     match crate::http::http_get_unix(sock, &path) {
                         Ok((status, text)) if status.is_success() => return tool_ok(text),
                         Ok((status, text)) => return tool_err(format!("HTTP {status}: {text}")),
+                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                            tracing::warn!(
+                                "http.sock list request failed, falling back to TCP: {e}"
+                            )
+                        }
                         Err(e) => tracing::debug!("failed to query http.sock for list: {e}"),
                     }
                 }

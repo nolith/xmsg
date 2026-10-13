@@ -19,7 +19,7 @@ use xmsg::fed::{
     generate_self_signed_ed25519, list_peer, run_fed_listener, FedState, PeerConfig, PeersMap,
     RateLimiter,
 };
-use xmsg::http::{bind_ucred_unix_listener, build_router, http_get_unix, AppState};
+use xmsg::http::{bind_ucred_unix_listener, build_router, http_request_unix_within, AppState};
 use xmsg::mcp::{execute_tool, McpConfig};
 use xmsg::pi::new_pi_store;
 use xmsg::svc::new_svc_store;
@@ -388,7 +388,14 @@ async fn test_oracle_1_peer_with_list_allowed() {
     assert_eq!(reg_resp["status"], "ok");
 
     // Node B queries local /v1/recipients?node=host-a over http.sock
-    let (status, body) = http_get_unix(&node_b.http_sock, "/v1/recipients?node=host-a").unwrap();
+    let (status, body) = http_request_unix_within(
+        &node_b.http_sock,
+        "GET",
+        "/v1/recipients?node=host-a",
+        None,
+        Duration::from_secs(30),
+    )
+    .unwrap();
     assert_eq!(status, StatusCode::OK, "Body: {body}");
 
     let sessions: Vec<Value> =
@@ -478,7 +485,14 @@ async fn test_oracle_2_peer_without_list_allowed_403() {
 
     // Node B queries /v1/recipients?node=host-a. XA5: a node that withholds `list` is
     // reported in the per-node status, not as an error of the whole list.
-    let (status, body) = http_get_unix(&node_b.http_sock, "/v1/recipients?node=host-a").unwrap();
+    let (status, body) = http_request_unix_within(
+        &node_b.http_sock,
+        "GET",
+        "/v1/recipients?node=host-a",
+        None,
+        Duration::from_secs(30),
+    )
+    .unwrap();
     assert_eq!(status, StatusCode::OK, "Body: {body}");
 
     let res: Value = serde_json::from_str(&body).unwrap();
@@ -568,7 +582,14 @@ async fn test_oracle_3_peer_with_targets() {
     assert_eq!(reg_resp["status"], "ok");
 
     // Node B queries /v1/recipients?node=host-a
-    let (status, body) = http_get_unix(&node_b.http_sock, "/v1/recipients?node=host-a").unwrap();
+    let (status, body) = http_request_unix_within(
+        &node_b.http_sock,
+        "GET",
+        "/v1/recipients?node=host-a",
+        None,
+        Duration::from_secs(30),
+    )
+    .unwrap();
     assert_eq!(status, StatusCode::OK, "Body: {body}");
 
     let sessions: Vec<Value> =
@@ -655,7 +676,14 @@ async fn test_oracle_4_no_cwd_or_pid() {
     assert!(!wire_entries.is_empty());
 
     // Check via client route /v1/recipients?node=host-a
-    let (status, body) = http_get_unix(&node_b.http_sock, "/v1/recipients?node=host-a").unwrap();
+    let (status, body) = http_request_unix_within(
+        &node_b.http_sock,
+        "GET",
+        "/v1/recipients?node=host-a",
+        None,
+        Duration::from_secs(30),
+    )
+    .unwrap();
     assert_eq!(status, StatusCode::OK);
 
     let val: Value = serde_json::from_str(&body).unwrap();
@@ -813,7 +841,14 @@ async fn test_oracle_5_mcp_list_host() {
     assert_eq!(local_call["isError"], false);
     let local_mcp_text = local_call["content"][0]["text"].as_str().unwrap();
 
-    let (_status, local_direct_text) = http_get_unix(&node_b.http_sock, "/v1/recipients").unwrap();
+    let (_status, local_direct_text) = http_request_unix_within(
+        &node_b.http_sock,
+        "GET",
+        "/v1/recipients",
+        None,
+        Duration::from_secs(30),
+    )
+    .unwrap();
     assert_eq!(
         local_mcp_text, local_direct_text,
         "MCP list without node must match local /v1/recipients byte-for-byte"
