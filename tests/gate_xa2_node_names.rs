@@ -3,6 +3,7 @@
 //! Every oracle runs the real `xmsg serve` (or `xmsg check-peers`) binary. Node names are
 //! never assigned here: CA nodes hold CA-issued leaves with SPIFFE URI SANs, pinned nodes
 //! hold self-signed keys, and each node's name is whatever xmsg derives from those.
+mod short_sock;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -309,7 +310,7 @@ fn addr(port: u16) -> String {
 
 /// A Claude session fixture owned by this test process; returns its received lines.
 fn claude_session(sessions_dir: &Path, session_id: &str, name: &str) -> Arc<Mutex<Vec<String>>> {
-    let sock_path = sessions_dir.join(format!("inbox-{session_id}.sock"));
+    let sock_path = short_sock::sock_path(sessions_dir, "inbox");
     let listener = UnixListener::bind(&sock_path).unwrap();
     let received = Arc::new(Mutex::new(Vec::new()));
     let rx = received.clone();

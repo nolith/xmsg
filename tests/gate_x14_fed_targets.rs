@@ -1,3 +1,4 @@
+mod short_sock;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -274,7 +275,7 @@ fn create_claude_session_fixture(
     session_id: &str,
     name: &str,
 ) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
-    let sock_path = sessions_dir.join(format!("inbox-{session_id}.sock"));
+    let sock_path = short_sock::sock_path(sessions_dir, "inbox");
     let listener = UnixListener::bind(&sock_path).unwrap();
     let received = Arc::new(Mutex::new(Vec::new()));
     let rx_clone = received.clone();

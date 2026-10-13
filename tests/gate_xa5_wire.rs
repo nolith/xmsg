@@ -7,6 +7,7 @@
 //! test peer certificate (`sini.o`), since nothing in xmsg originates a hop until H6 (A3,
 //! B4). Two oracles add an in-process stub peer: one lists another user's entry (P-3), and
 //! one stands for a node still on `/fed/v1` (`ee1b6ca`, the deployed release).
+mod short_sock;
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -315,7 +316,7 @@ fn leaf_entry(ca_file: &Path, uri: &str, allow: &[&str]) -> Value {
 
 /// A Claude session fixture owned by this test process; returns its received lines.
 fn claude_session(sessions_dir: &Path, session_id: &str, name: &str) -> Arc<Mutex<Vec<String>>> {
-    let sock_path = sessions_dir.join(format!("inbox-{session_id}.sock"));
+    let sock_path = short_sock::sock_path(sessions_dir, "inbox");
     let listener = UnixListener::bind(&sock_path).unwrap();
     let received = Arc::new(Mutex::new(Vec::new()));
     let rx = received.clone();

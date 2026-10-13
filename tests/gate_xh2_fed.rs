@@ -2,6 +2,7 @@
 //! that session. Node B is a real `xmsg serve`; node A runs in this process. Adapted from
 //! the gate's probe `xh2-verify-v0.probes/review_fed.rs`.
 
+mod short_sock;
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -107,8 +108,8 @@ async fn create_full_test_node(
     let sock_dir = temp.path().join("xmsg");
     fs::create_dir_all(&sock_dir).unwrap();
     fs::set_permissions(&sock_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    let agent_sock = sock_dir.join(format!("agent-{name}.sock"));
-    let register_sock = sock_dir.join(format!("register-{name}.sock"));
+    let agent_sock = short_sock::sock_path(&sock_dir, "agent");
+    let register_sock = short_sock::sock_path(&sock_dir, "register");
 
     let sessions_dir = temp.path().join("sessions");
     fs::create_dir_all(&sessions_dir).unwrap();
@@ -140,7 +141,7 @@ async fn create_full_test_node(
     setup_mock_proc(&proc_root, my_pid, &trusted_bin, &my_proc_start);
 
     // Setup Claude inbox listener and session fixture
-    let target_inbox_sock = sock_dir.join(format!("inbox-{target_session_name}.sock"));
+    let target_inbox_sock = short_sock::sock_path(&sock_dir, "inbox");
     let inbox_listener = UnixListener::bind(&target_inbox_sock).unwrap();
     let inbox_rx = Arc::new(Mutex::new(Vec::new()));
     let rx_clone = inbox_rx.clone();

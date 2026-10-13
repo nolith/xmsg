@@ -1,3 +1,4 @@
+mod short_sock;
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
@@ -85,9 +86,9 @@ async fn create_test_node_full_inner(
     let sock_dir = tmp.path().join("run");
     fs::create_dir_all(&sock_dir).unwrap();
     fs::set_permissions(&sock_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    let agent_sock_path = sock_dir.join(format!("agent-{name}.sock"));
+    let agent_sock_path = short_sock::sock_path(&sock_dir, "agent");
 
-    let target_inbox_sock = sock_dir.join(format!("inbox-{target_session_name}.sock"));
+    let target_inbox_sock = short_sock::sock_path(&sock_dir, "inbox");
     let inbox_listener = UnixListener::bind(&target_inbox_sock).unwrap();
     let inbox_rx = Arc::new(Mutex::new(Vec::new()));
     let rx_clone = inbox_rx.clone();
