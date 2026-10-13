@@ -321,6 +321,9 @@ impl Service {
             .call(serde_json::json!({ "harness": "svc", "name": name }))
             .await;
         assert_eq!(resp["status"], "ok", "register {name}: {resp}");
+        // AM-4: the `ok` frame carries the address and the node MA's origin check reads.
+        assert_eq!(resp["address"], format!("{name}@{}", node_name()), "{resp}");
+        assert_eq!(resp["node"], node_name(), "{resp}");
         svc
     }
 
@@ -1015,4 +1018,64 @@ async fn test_oracle_11_no_hop_in_the_grammar() {
         .agent(serde_json::json!({ "action": "send", "to": "x@dest@hub", "text": "hop" }))
         .await;
     assert_eq!(resp["error"], "bad_request", "{resp}");
+}
+
+// =============================================================================
+// Oracle 12 (A2, A7: one name equality, exact). Two live services `dup` and `DUP` are
+// two names: each send reaches the one it names, and `list?name=` agrees with `send`
+// for a Claude label (`LBL-X` lists nothing and sends nowhere while `lbl-x` is live).
+// Mutant: case-insensitive service match in `resolve_target`, or in the `list` name
+// filter => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_12_names_compare_exactly() {
+    let tmp = tempdir().unwrap();
+    let node = Node::start(tmp.path(), &["dup", "DUP"]);
+    let mut lower = Service::register(&node, "dup").await;
+    let mut upper = Service::register(&node, "DUP").await;
+    let me = node_name();
+
+    for (to, svc) in [("DUP", &mut upper), ("dup", &mut lower)] {
+        let (status, body) = node.send(to, &format!("for {to}")).await;
+        assert_eq!(status, 202, "send {to}: {body}");
+        assert_eq!(body["address"], format!("{to}@{me}"), "send {to}: {body}");
+        let got = svc.poll(3).await.expect("the named service receives it");
+        assert_eq!(got["text"], format!("for {to}"), "{got}");
+        let ack = svc
+            .call(serde_json::json!({ "action": "ack", "messageId": got["messageId"] }))
+            .await;
+        assert_eq!(ack["status"], "ok", "{ack}");
+    }
+    assert!(lower.poll(1).await.is_none(), "nothing more for dup");
+    assert!(upper.poll(1).await.is_none(), "nothing more for DUP");
+
+    let (status, body) = node.http("GET", "/v1/recipients?name=dup", None).await;
+    assert_eq!(status, 200, "{body}");
+    let listed: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    let addrs: Vec<&str> = listed
+        .iter()
+        .filter_map(|r| r["address"].as_str())
+        .collect();
+    assert_eq!(addrs, [format!("dup@{me}")], "{body}");
+
+    let sl = Sleeper::new();
+    let ib = inbox();
+    claude_file(&node, "c", sl.pid(), ID_A, "lbl-x", &ib.sock);
+    node.list().await;
+    for (name, found) in [("lbl-x", true), ("LBL-X", false)] {
+        let (_, body) = node
+            .http("GET", &format!("/v1/recipients?name={name}"), None)
+            .await;
+        let listed: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let (status, sent) = node.send(name, "label").await;
+        if found {
+            assert_eq!(listed.len(), 1, "list {name}: {body}");
+            assert_eq!(listed[0]["address"], format!("{ID_A}@{me}"), "{body}");
+            assert_eq!(status, 202, "send {name}: {sent}");
+        } else {
+            assert!(listed.is_empty(), "list {name}: {body}");
+            assert_eq!(status, 404, "send {name}: {sent}");
+            assert_eq!(sent["error"], "not_found", "send {name}: {sent}");
+        }
+    }
 }

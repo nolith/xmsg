@@ -121,13 +121,12 @@ pub fn resolve_pi_session(
 ) -> Result<Option<Session>, AppError> {
     let query = SessionsQuery::default();
     let all = list_pi_sessions(proc_root, store, &query);
-    let ref_lower = ref_str.to_ascii_lowercase();
     let ref_pid = ref_str.parse::<u32>().ok();
 
     let matched: Vec<Session> = all
         .into_iter()
         .filter(|s| {
-            if s.session_id.to_ascii_lowercase() == ref_lower {
+            if s.session_id == ref_str {
                 return true;
             }
             if let Some(pid) = ref_pid {
@@ -136,7 +135,7 @@ pub fn resolve_pi_session(
                 }
             }
             if let Some(ref name) = s.name {
-                if name.to_ascii_lowercase() == ref_lower {
+                if name == ref_str {
                     return true;
                 }
             }

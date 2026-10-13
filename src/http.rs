@@ -174,7 +174,7 @@ pub(crate) async fn resolve_target(
 ) -> Result<ResolvedTarget, AppError> {
     let proc_root = &agy_config.proc_root;
     let query = registry::SessionsQuery::default();
-    let is = |id: &str| id.eq_ignore_ascii_case(ref_str);
+    let is = |id: &str| id == ref_str;
 
     // One claim scan answers the Claude half of every step.
     let (claude_by_id, claude_labelled, claude_absence) =

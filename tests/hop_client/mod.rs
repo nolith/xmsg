@@ -40,6 +40,26 @@ pub async fn hop_send(
         "created_at": 1000
     });
 
+    request(
+        origin,
+        hub_pin,
+        hub_port,
+        "POST",
+        "/fed/v1/messages",
+        Some(envelope),
+    )
+    .await
+}
+
+/// One request to the hub's federation listener as the origin node: (HTTP status, JSON).
+pub async fn request(
+    origin: &Origin<'_>,
+    hub_pin: &str,
+    hub_port: u16,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
     let fut = async {
         let connector = make_tls_connector(origin.cert_der, origin.key_der, hub_pin)
             .expect("origin TLS connector");
@@ -58,11 +78,11 @@ pub async fn hop_send(
             let _ = conn.await;
         });
         let req = hyper::Request::builder()
-            .method("POST")
-            .uri("/fed/v1/messages")
+            .method(method)
+            .uri(uri)
             .header("content-type", "application/json")
             .body(http_body_util::Full::new(bytes::Bytes::from(
-                envelope.to_string(),
+                body.map(|b| b.to_string()).unwrap_or_default(),
             )))
             .unwrap();
         let resp = sender.send_request(req).await.expect("hub answers");
@@ -79,5 +99,5 @@ pub async fn hop_send(
     };
     tokio::time::timeout(Duration::from_secs(15), fut)
         .await
-        .expect("hop send timed out after 15s")
+        .expect("hub request timed out after 15s")
 }

@@ -1105,3 +1105,215 @@ async fn test_oracle_6b_direct_send_reply_pushed_back() {
     )
     .await;
 }
+
+// =============================================================================
+// Oracles 1a and 3a: the hub half of oracles 1 and 3, the reply to a forwarded message.
+// The origin's half (originating the hop, writing its `outbound` row) waits for XA5; the
+// hop is posted by tests/hop_client, as for oracles 4-6.
+// =============================================================================
+
+/// A hop from node-a through the hub to `bob@node-b`; Bob replies. Returns the forwarded
+/// message's ID once Bob's reply has been accepted by the hub.
+async fn hop_and_reply(
+    origin: &Origin<'_>,
+    pin_h: &str,
+    port_h: u16,
+    node_b: &TestNode,
+    rx_b: &Arc<Mutex<Vec<String>>>,
+    text: &str,
+) -> String {
+    let (status, sent) = hop_send(origin, pin_h, port_h, "bob@node-b", "Question for Bob").await;
+    assert_eq!(status, 202, "hop: {sent}");
+    let b_msg = wait_for_inbox_message(rx_b, Duration::from_secs(5))
+        .await
+        .expect("Bob receives the forwarded message");
+    let msg_id = extract_message_id(&b_msg).expect("message_id");
+    let reply = reply_via_agent_sock(&node_b.agent_sock, &msg_id, text).await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    assert_eq!(
+        reply["reply"]["pushOutcome"], "pushed",
+        "the hub takes the reply: {reply}"
+    );
+    msg_id
+}
+
+fn hub_entry(port_h: u16, pin_h: &str, allow: &[&str]) -> Value {
+    serde_json::json!({
+        "address": format!("127.0.0.1:{port_h}"),
+        "pin": normalize_pin(pin_h),
+        "allow": allow
+    })
+}
+
+// Oracle 1a: H relays the reply to a dialable origin, which stores it.
+// Mutant: H never relays a forwarded reply (fed_reply_handler's forwarded branch off) => RED
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_1a_hub_relays_reply_to_dialable_origin() {
+    run_test_with_port_retry(
+        "test_oracle_1a_hub_relays_reply_to_dialable_origin",
+        || async move {
+            use rustls::pki_types::pem::PemObject;
+            let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
+            let (cert_h, key_h, pin_h) = generate_self_signed_ed25519_pem("hub").unwrap();
+            let (cert_b, key_b, pin_b) = generate_self_signed_ed25519_pem("node-b").unwrap();
+            let cert_a_der = rustls::pki_types::CertificateDer::from_pem_slice(cert_a.as_bytes())
+                .unwrap()
+                .to_vec();
+            let key_a_der = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_a.as_bytes())
+                .unwrap()
+                .secret_der()
+                .to_vec();
+
+            let (port_a, http_a) = (get_free_port(), get_free_port());
+            let (port_h, http_h) = (get_free_port(), get_free_port());
+            let (port_b, http_b) = (get_free_port(), get_free_port());
+
+            let peers_a =
+                serde_json::json!({ "hub": hub_entry(port_h, &pin_h, &["send", "reply"]) });
+            let peers_h = serde_json::json!({
+                "node-a": {
+                    "address": format!("127.0.0.1:{port_a}"),
+                    "pin": normalize_pin(&pin_a),
+                    "allow": ["send", "reply", "forward"]
+                },
+                "node-b": {
+                    "address": format!("127.0.0.1:{port_b}"),
+                    "pin": normalize_pin(&pin_b),
+                    "allow": ["send", "reply"]
+                }
+            });
+            let peers_b = serde_json::json!({
+                "hub": hub_entry(port_h, &pin_h, &["send", "reply", "relayed"])
+            });
+
+            let node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
+            let _hub = spawn_test_node("hub", port_h, http_h, &cert_h, &key_h, peers_h).await;
+            let node_a = spawn_test_node("node-a", port_a, http_a, &cert_a, &key_a, peers_a).await;
+            let (_sock_b, rx_b) = create_claude_session_fixture(&node_b.sessions_dir, "bob", "Bob");
+
+            let origin = Origin {
+                cert_der: &cert_a_der,
+                key_der: &key_a_der,
+            };
+            let (status, sent) =
+                hop_send(&origin, &pin_h, port_h, "bob@node-b", "Question for Bob").await;
+            assert_eq!(status, 202, "hop: {sent}");
+            let b_msg = wait_for_inbox_message(&rx_b, Duration::from_secs(5))
+                .await
+                .expect("Bob receives the forwarded message");
+            let msg_id = extract_message_id(&b_msg).expect("message_id");
+
+            // The rows node-a writes when it originates the hop (XA5), written here: the
+            // sent message (a sender with no inbox, so node-a stores the reply) and its
+            // `outbound` record naming the hub.
+            let a_db = rusqlite::Connection::open(&node_a.db_path).unwrap();
+            a_db.busy_timeout(Duration::from_secs(5)).unwrap();
+            let sent = xmsg::storage::MessageRecord {
+                id: msg_id.clone(),
+                created_at: 1000,
+                session_id: "bob@node-b".to_string(),
+                from_name: "alice".to_string(),
+                bytes: 16,
+                outcome: "delivered".to_string(),
+                recipient_harness: "fed".to_string(),
+                return_harness: None,
+                return_session_id: None,
+                return_host: None,
+                thread_id: msg_id.clone(),
+            };
+            xmsg::storage::insert_message(&a_db, &sent).unwrap();
+            xmsg::storage::insert_outbound(&a_db, &msg_id, "hub", "bob@node-b", "delivered", 1000)
+                .unwrap();
+
+            let reply = reply_via_agent_sock(&node_b.agent_sock, &msg_id, "Bob answers A").await;
+            assert_eq!(reply["status"], "ok", "{reply}");
+            assert_eq!(reply["reply"]["pushOutcome"], "pushed", "{reply}");
+
+            let mut at_a = Vec::new();
+            for _ in 0..100 {
+                at_a = xmsg::storage::get_replies_after(&a_db, &msg_id, 0).unwrap();
+                if !at_a.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(
+                at_a.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+                ["Bob answers A"],
+                "H relays the reply to the dialable origin node-a"
+            );
+        },
+    )
+    .await;
+}
+
+// Oracle 3a: H stores the reply for an undialable (leaf) origin, which reads it from H.
+// Mutant: the forwarded branch's leaf arm answers `stored` without storing => RED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_3a_hub_stores_reply_for_undialable_origin() {
+    run_test_with_port_retry(
+        "test_oracle_3a_hub_stores_reply_for_undialable_origin",
+        || async move {
+            let (cert_a, key_a, pin_a) = generate_self_signed_ed25519("node-a").unwrap();
+            let (cert_h, key_h, pin_h) = generate_self_signed_ed25519_pem("hub").unwrap();
+            let (cert_b, key_b, pin_b) = generate_self_signed_ed25519_pem("node-b").unwrap();
+            let (port_h, http_h) = (get_free_port(), get_free_port());
+            let (port_b, http_b) = (get_free_port(), get_free_port());
+
+            let mut entry_a = origin_entry(&pin_a, &["send", "reply", "inbox", "forward"]);
+            entry_a["leaf"] = true.into();
+            let peers_h = serde_json::json!({
+                "node-a": entry_a,
+                "node-b": {
+                    "address": format!("127.0.0.1:{port_b}"),
+                    "pin": normalize_pin(&pin_b),
+                    "allow": ["send", "reply"]
+                }
+            });
+            let peers_b = serde_json::json!({
+                "hub": hub_entry(port_h, &pin_h, &["send", "reply", "relayed"])
+            });
+
+            let node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
+            let _hub = spawn_test_node("hub", port_h, http_h, &cert_h, &key_h, peers_h).await;
+            let (_sock_b, rx_b) = create_claude_session_fixture(&node_b.sessions_dir, "bob", "Bob");
+
+            let origin = Origin {
+                cert_der: &cert_a,
+                key_der: &key_a,
+            };
+            let msg_id = hop_and_reply(
+                &origin,
+                &pin_h,
+                port_h,
+                &node_b,
+                &rx_b,
+                "Bob answers leaf A",
+            )
+            .await;
+
+            let (status, replies) = hop_client::request(
+                &origin,
+                &pin_h,
+                port_h,
+                "GET",
+                &format!("/fed/v1/messages/{msg_id}/replies"),
+                None,
+            )
+            .await;
+            assert_eq!(status, 200, "{replies}");
+            let texts: Vec<&str> = replies
+                .as_array()
+                .expect("a reply list")
+                .iter()
+                .filter_map(|r| r["text"].as_str())
+                .collect();
+            assert_eq!(
+                texts,
+                ["Bob answers leaf A"],
+                "H holds the reply for node-a: {replies}"
+            );
+        },
+    )
+    .await;
+}

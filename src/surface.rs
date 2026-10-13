@@ -301,10 +301,7 @@ pub async fn list(state: &AppState, query: &ListQuery) -> Result<Vec<Recipient>,
         query.kind.as_deref().is_none_or(|k| r.kind == k)
             && query.name.as_deref().is_none_or(|n| {
                 let local = r.address.rsplit_once('@').map_or("", |(l, _)| l);
-                r.label
-                    .as_deref()
-                    .is_some_and(|l| l.eq_ignore_ascii_case(n))
-                    || (r.kind == "service" && local.eq_ignore_ascii_case(n))
+                r.label.as_deref() == Some(n) || (r.kind == "service" && local == n)
             })
     });
     Ok(out)

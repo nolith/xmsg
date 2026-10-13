@@ -309,12 +309,13 @@ The daemon connects to `$XDG_RUNTIME_DIR/xmsg/register.sock` and sends a JSON re
 }
 ```
 
-The server responds with the registered canonical session ID:
+The server responds with the registration's address and this node's name (AM-4):
 
 ```json
 {
   "status": "ok",
-  "sessionId": "genie-expert"
+  "address": "genie-expert@sini.cortex",
+  "node": "sini.cortex"
 }
 ```
 
@@ -338,20 +339,23 @@ Communication over the registration socket uses a JSON-lines streaming protocol:
      "messageId": "01M4FG...",
      "fromName": "sender · 6f1c2a7e-...@sini.cortex",
      "origin": {
-       "kind": "local",
-       "harness": "claude",
-       "sessionId": "b0682ca7-..."
+       "id": "6f1c2a7e-...",
+       "node": "sini.cortex",
+       "label": "sender"
      },
      "text": "Task payload...",
-     "envelope": "[xmsg] from=... message_id=...\n\nTask payload..."
+     "envelope": "[xmsg] from=... message_id=...\n\nTask payload...",
+     "inReplyTo": null
    }
    ```
 
-   The `origin` object provides structured, tamper-proof sender attestation resolved at enqueue time:
+   The `origin` object provides structured sender attestation resolved at enqueue time, one shape for every sender (A12): the sender's instance `id` or `service` name, the `node` that attests it, and the sender's own `label`:
 
-   - `{"kind": "local", "harness": <harness>, "sessionId": <session_id>}`: For local senders attested on this instance via `agent.sock` or kernel-attested callers in leaf mode.
-   - `{"kind": "fed", "host": <node_name>, "principal": <sender_badge>}`: For inbound messages arriving over mTLS federation from an authenticated peer. `host` is the sending node's canonical name (Section 7.0): `<user>.<host>` or `<sa>.<ns>` for a CA peer, the 16-character key-derived name for a pinned peer, never a local nickname. `principal` carries the sender badge asserted by the sending node (e.g. `claude:alice` or `svc:guard`), as verified by the peer host and gated by `principals` filters. It is asserted by the authenticated peer, not proven end to end.
-   - `{"kind": "anonymous"}`: For unattested senders (e.g. plain HTTP sends without leaf attestation) or pre-migration rows.
+   - `{"id": <instance_id>, "node": <node>, "label": <label>}`: an instance (`label` is omitted when it has none).
+   - `{"service": <name>, "node": <node>}`: a registered service.
+   - `{"node": <node>, "label": <from>}`: an anonymous sender (e.g. a plain HTTP send); `label` is its unattested `from`.
+
+   `node` is this node's name for a local sender. For a message that arrived over mTLS federation it is the sending node's canonical name (Section 7.0): `<user>.<host>` or `<sa>.<ns>` for a CA peer, the 16-character key-derived name for a pinned peer, never a local nickname. A federated origin is asserted by the authenticated peer, gated by `principals` filters, and not proven end to end. `inReplyTo` names the message a delivered reply answers.
 
    Daemons and services must use `origin` rather than parsing display strings (`fromName` or `envelope`) for security and authorization decisions.
 
@@ -624,7 +628,7 @@ No CRL (Certificate Revocation List) or OCSP (Online Certificate Status Protocol
 
   - **Filters (`principals`, `targets`):** an entry is a service name or an instance ID, matched exactly; `principals` also takes `anon:<from>` for an anonymous HTTP sender. The node that resolves the target never matches an instance label, so there `targets = ["genie-guard"]` admits the service `genie-guard` and refuses an instance merely labelled `genie-guard`. A forwarding hub checks the destination's `targets` against the unresolved ref instead (see Hub Forwarding). An entry in the retired kind-qualified form (`svc:`, `session:`, `claude:`, `agy:`, `pi:`, `http:` followed by a name) is refused at load with a message naming the new form; it is never silently ignored.
   - **Target Filtering (`targets`):** When `targets` is configured, a federated `send` from that peer is refused with HTTP `403 Forbidden` (`denied`, "target not allowed for peer") before rate-limiting or queueing unless the resolved local target's service name or instance ID is listed. An empty present list (`"targets": []`) refuses all targets. When `targets` is omitted, every local target is reachable. Replies on the federated reply route are not gated by `targets`.
-    - *Target Resolution & Prefix Stripping (P1):* Federated refs may still carry a harness prefix (`claude:sess-target`, `svc:guard`, `session:sess-id`); `resolve_target_session_fed` strips it before querying the local session stores. This does not bypass policy: the `targets` check runs on the fully resolved target.
+    - *Target Resolution (P1):* A federated ref is read in the local grammar, an instance ID or a name, compared exactly; `resolve_target_session_fed` runs the local resolver on it unchanged, so a kind- or harness-prefixed ref (`claude:x`, `svc:guard`, `session:x`) names nothing and is `not_found`. The `targets` check runs on the resolved target.
 
 - **Federated Session Listing (`GET /fed/v1/sessions` & `GET /v1/recipients?node=<name>`):**
 
@@ -729,13 +733,13 @@ In a star or multi-node mesh topology, nodes that cannot directly dial one anoth
 - **Origin & Attestation (Trust Model):**
   When a recipient receives a forwarded message, the sender origin displayed to local sessions and services (`label · id@<origin_peer>`, or `name@<origin_peer>` for a service) is the forwarding node's assertion, **not proven end-to-end**. The recipient trusts the hub to attest accurately to who sent the message. (For end-to-end origin signatures, see Section B of `xmsg-hub-design.md`).
 - **Destination Target Filters:**
-  The forwarding node checks the destination peer's configured `targets` list against the unpacked `ref`, before resolution, since the target lives on the destination. `svc:<name>` is checked as `<name>` and `session:<id>` as `<id>`; a ref carrying a harness kind (`claude:`, `agy:`, `pi:`, `http:`) never passes a non-empty `targets`. If the destination peer restricts targets and `ref` is not allowed, the hub rejects the send before relaying. **Open:** a bare ref is compared as a string, so a bare instance label equal to a listed entry passes the hub and the destination resolves it to the labelled instance; the hub cannot tell a label from a service name without resolving.
+  The forwarding node checks the destination peer's configured `targets` list against the unpacked `ref`, before resolution, since the target lives on the destination. The ref is compared exactly, in the destination's grammar (an instance ID or a name), so a kind- or harness-prefixed ref (`svc:`, `session:`, `claude:`, `agy:`, `pi:`, `http:`) matches no entry and never passes a non-empty `targets`. If the destination peer restricts targets and `ref` is not allowed, the hub rejects the send before relaying. **Open:** a bare ref is compared as a string, so a bare instance label equal to a listed entry passes the hub and the destination resolves it to the labelled instance; the hub cannot tell a label from a service name without resolving.
 - **Reply Routing:**
   - The forwarding hub records each forwarded message in SQLite (`forwarded_messages`).
   - When the recipient replies, its reply is addressed to the forwarding node (`return_host = hub`).
   - The hub authorizes the reply against the outbound record created during forwarding, looks up the origin peer, and relays the reply back to the origin peer using `send_federated_reply` (if dialable) or stores it in SQLite for long-polling if the origin is a leaf or outbound-linked node.
 - **Default State (Off by Default):**
-  Without `"forward"` configured on the sender's peer entry, a node behaves identically to older releases: cross-host target references containing `@` are rejected with `denied`.
+  A hop envelope (a `to.ref` carrying `@<dest>`) from a peer whose entry lacks `"forward"` is refused with `denied`. No client surface writes a hop: an address has at most one `@`, and `send` to a `to` with more than one `@` is `bad_request` over HTTP, `agent.sock`, MCP and pi alike (A9).
 
 ---
 

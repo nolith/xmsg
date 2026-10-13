@@ -401,9 +401,7 @@ pub fn resolve_agy_session(
     let query = SessionsQuery::default();
     let all = list_agy_sessions(config, store, &query);
 
-    let ref_lower = ref_str.to_ascii_lowercase();
     let raw = ref_str.strip_prefix("agy:").unwrap_or(ref_str);
-    let raw_lower = raw.to_ascii_lowercase();
     let ref_pid = raw.parse::<u32>().ok();
 
     let pid_starttime = raw
@@ -415,11 +413,11 @@ pub fn resolve_agy_session(
         .filter(|s| {
             if s.status == "unregistered" {
                 // 1. By conversation id (as listed)
-                if s.session_id.to_ascii_lowercase() == raw_lower {
+                if s.session_id == raw {
                     return true;
                 }
                 if let Some(ref name) = s.name {
-                    if name.to_ascii_lowercase() == raw_lower {
+                    if name == raw {
                         return true;
                     }
                 }
@@ -434,15 +432,10 @@ pub fn resolve_agy_session(
                 false
             } else {
                 // Registered session in store
-                if s.session_id.to_ascii_lowercase() == ref_lower {
+                if s.session_id == ref_str {
                     return true;
                 }
-                if s.session_id
-                    .strip_prefix("agy:")
-                    .unwrap_or(&s.session_id)
-                    .to_ascii_lowercase()
-                    == raw_lower
-                {
+                if s.session_id.strip_prefix("agy:").unwrap_or(&s.session_id) == raw {
                     return true;
                 }
                 if let Some(pid) = ref_pid {
@@ -451,9 +444,7 @@ pub fn resolve_agy_session(
                     }
                 }
                 if let Some(ref name) = s.name {
-                    if name.to_ascii_lowercase() == ref_lower
-                        || name.to_ascii_lowercase() == raw_lower
-                    {
+                    if name == ref_str || name == raw {
                         return true;
                     }
                 }

@@ -164,7 +164,7 @@ pub fn list_svc_sessions(
     sessions
 }
 
-/// The live service named `name` (case-insensitive). A name is unique per node (A2).
+/// The live service named exactly `name`. A name is unique per node (A2).
 pub fn resolve_svc_session(
     proc_root: &Path,
     store: &SvcStore,
@@ -173,7 +173,7 @@ pub fn resolve_svc_session(
     Ok(
         list_svc_sessions(proc_root, store, &SessionsQuery::default())
             .into_iter()
-            .find(|s| s.session_id.eq_ignore_ascii_case(name)),
+            .find(|s| s.session_id == name),
     )
 }
 
