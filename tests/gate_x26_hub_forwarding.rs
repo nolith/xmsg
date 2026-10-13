@@ -8,7 +8,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use serde_json::Value;
-use xmsg::fed::{generate_self_signed_ed25519_pem, normalize_pin};
+use xmsg::fed::{generate_self_signed_ed25519, generate_self_signed_ed25519_pem, normalize_pin};
+
+mod hop_client;
+use hop_client::{hop_send, Origin};
 
 struct ChildGuard(Option<tokio::process::Child>);
 
@@ -324,7 +327,7 @@ where
 // Line: test_oracle_1_relay_and_reply
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
+#[ignore = "XA5: re-armed when H6 routing originates hop envelopes (owner design A3/B4)"]
 async fn test_oracle_1_relay_and_reply() {
     run_test_with_port_retry("test_oracle_1_relay_and_reply", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -449,7 +452,7 @@ async fn test_oracle_1_relay_and_reply() {
 // Line: test_oracle_2_polling_sender
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
+#[ignore = "XA5: re-armed when H6 routing originates hop envelopes (owner design A3/B4)"]
 async fn test_oracle_2_polling_sender() {
     run_test_with_port_retry("test_oracle_2_polling_sender", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -566,7 +569,7 @@ async fn test_oracle_2_polling_sender() {
 // Line: test_oracle_3_undialable_client
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
+#[ignore = "XA5: re-armed when H6 routing originates hop envelopes (owner design A3/B4)"]
 async fn test_oracle_3_undialable_client() {
     run_test_with_port_retry("test_oracle_3_undialable_client", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -656,6 +659,22 @@ async fn test_oracle_3_undialable_client() {
 }
 
 // =============================================================================
+// Oracles 4-6 are hub-side: the hub's enforcement of a hop envelope. Nothing in xmsg
+// originates a hop until XA5's routing, so each is driven by an in-process client that
+// presents node-a's credentials and posts `to.ref = <ref>@<dest>` to the hub directly
+// (tests/hop_client). Node A itself is not run: the hub never dials it on the send path.
+// =============================================================================
+
+/// A hub entry for the origin node; its address is never dialled on the send path.
+fn origin_entry(pin_a: &str, allow: &[&str]) -> Value {
+    serde_json::json!({
+        "address": format!("127.0.0.1:{}", get_free_port()),
+        "pin": normalize_pin(pin_a),
+        "allow": allow
+    })
+}
+
+// =============================================================================
 // Oracle 4: Gates
 // 4a: H refuses when A's entry lacks forward. Mutant: skip that check => RED
 // 4b: B refuses when H doesn't allow relaying. Mutant: skip that check => RED
@@ -663,35 +682,20 @@ async fn test_oracle_3_undialable_client() {
 // Line: test_oracle_4_gates
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_4_gates() {
     run_test_with_port_retry("test_oracle_4_gates", || async move {
-        let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
+        let (cert_a, key_a, pin_a) = generate_self_signed_ed25519("node-a").unwrap();
         let (cert_h, key_h, pin_h) = generate_self_signed_ed25519_pem("hub").unwrap();
         let (cert_b, key_b, pin_b) = generate_self_signed_ed25519_pem("node-b").unwrap();
 
-        let port_a = get_free_port();
-        let http_a = get_free_port();
         let port_h = get_free_port();
         let http_h = get_free_port();
         let port_b = get_free_port();
         let http_b = get_free_port();
 
-        let peers_a = serde_json::json!({
-            "hub": {
-                "address": format!("127.0.0.1:{port_h}"),
-                "pin": normalize_pin(&pin_h),
-                "allow": ["send", "reply"]
-            }
-        });
-
         // 4a test setup: H does NOT give A "forward" capability
         let peers_h_no_fwd = serde_json::json!({
-            "node-a": {
-                "address": format!("127.0.0.1:{port_a}"),
-                "pin": normalize_pin(&pin_a),
-                "allow": ["send", "reply"] // NO "forward"
-            },
+            "node-a": origin_entry(&pin_a, &["send", "reply"]), // NO "forward"
             "node-b": {
                 "address": format!("127.0.0.1:{port_b}"),
                 "pin": normalize_pin(&pin_b),
@@ -717,54 +721,46 @@ async fn test_oracle_4_gates() {
         )
         .await;
         let _hub = spawn_test_node("hub", port_h, http_h, &cert_h, &key_h, peers_h_no_fwd).await;
-        let node_a = spawn_test_node("node-a", port_a, http_a, &cert_a, &key_a, peers_a).await;
-        let (_sock_a, _rx_a) =
-            create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
 
-        // Gate 4a: Send through Hub without "forward" capability must fail with no_forward
-        let res_4a =
-            send_via_agent_sock(&node_a.agent_sock, "bob@node-b@hub", "Test lacking forward").await;
+        // Gate 4a: a hop from A without "forward" is refused by H itself.
+        let origin = Origin {
+            cert_der: &cert_a,
+            key_der: &key_a,
+        };
+        let (status, res_4a) = hop_send(
+            &origin,
+            &pin_h,
+            port_h,
+            "bob@node-b",
+            "Test lacking forward",
+        )
+        .await;
 
-        assert_eq!(res_4a["status"], "error");
+        assert_eq!(status, 403, "4a: {res_4a}");
+        assert_eq!(res_4a["error"], "denied", "4a: {res_4a}");
         assert_eq!(
-            res_4a["error"], "denied",
-            "4a: H must refuse send lacking 'forward' with no_forward: {:?}",
-            res_4a
+            res_4a["detail"], "Forwarding cross-host is not permitted",
+            "4a: H must refuse a hop lacking 'forward' (no_forward), not pass it on: {res_4a}"
         );
     })
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_4b_recipient_relayed_gate() {
     run_test_with_port_retry("test_oracle_4b_recipient_relayed_gate", || async move {
-        let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
+        let (cert_a, key_a, pin_a) = generate_self_signed_ed25519("node-a").unwrap();
         let (cert_h, key_h, pin_h) = generate_self_signed_ed25519_pem("hub").unwrap();
         let (cert_b, key_b, pin_b) = generate_self_signed_ed25519_pem("node-b").unwrap();
 
-        let port_a = get_free_port();
-        let http_a = get_free_port();
         let port_h = get_free_port();
         let http_h = get_free_port();
         let port_b = get_free_port();
         let http_b = get_free_port();
 
-        let peers_a = serde_json::json!({
-            "hub": {
-                "address": format!("127.0.0.1:{port_h}"),
-                "pin": normalize_pin(&pin_h),
-                "allow": ["send", "reply"]
-            }
-        });
-
         // Hub allows forward for A
         let peers_h = serde_json::json!({
-            "node-a": {
-                "address": format!("127.0.0.1:{port_a}"),
-                "pin": normalize_pin(&pin_a),
-                "allow": ["send", "reply", "forward"]
-            },
+            "node-a": origin_entry(&pin_a, &["send", "reply", "forward"]),
             "node-b": {
                 "address": format!("127.0.0.1:{port_b}"),
                 "pin": normalize_pin(&pin_b),
@@ -781,59 +777,53 @@ async fn test_oracle_4b_recipient_relayed_gate() {
             }
         });
 
-        let _node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
+        let node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
         let _hub = spawn_test_node("hub", port_h, http_h, &cert_h, &key_h, peers_h).await;
-        let node_a = spawn_test_node("node-a", port_a, http_a, &cert_a, &key_a, peers_a).await;
-        let (_sock_a, _rx_a) =
-            create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
+        let (_sock_b, rx_b) = create_claude_session_fixture(&node_b.sessions_dir, "bob", "Bob");
 
-        let res_4b = send_via_agent_sock(
-            &node_a.agent_sock,
-            "bob@node-b@hub",
+        let origin = Origin {
+            cert_der: &cert_a,
+            key_der: &key_a,
+        };
+        let (status, res_4b) = hop_send(
+            &origin,
+            &pin_h,
+            port_h,
+            "bob@node-b",
             "Test lacking relayed on B",
         )
         .await;
 
-        assert_eq!(res_4b["status"], "error");
+        assert_eq!(status, 403, "4b: {res_4b}");
+        assert_eq!(res_4b["error"], "denied", "4b: {res_4b}");
         assert_eq!(
-            res_4b["error"], "denied",
-            "4b: B must refuse forwarded message lacking 'relayed' with op_denied: {:?}",
-            res_4b
+            res_4b["detail"], "relayed messages not allowed for peer",
+            "4b: B must refuse a forwarded message lacking 'relayed': {res_4b}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            rx_b.lock().unwrap().is_empty(),
+            "4b: nothing reaches bob on B"
         );
     })
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_4c_dest_targets_gate() {
     run_test_with_port_retry("test_oracle_4c_dest_targets_gate", || async move {
-        let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
+        let (cert_a, key_a, pin_a) = generate_self_signed_ed25519("node-a").unwrap();
         let (cert_h, key_h, pin_h) = generate_self_signed_ed25519_pem("hub").unwrap();
         let (cert_b, key_b, pin_b) = generate_self_signed_ed25519_pem("node-b").unwrap();
 
-        let port_a = get_free_port();
-        let http_a = get_free_port();
         let port_h = get_free_port();
         let http_h = get_free_port();
         let port_b = get_free_port();
         let http_b = get_free_port();
 
-        let peers_a = serde_json::json!({
-            "hub": {
-                "address": format!("127.0.0.1:{port_h}"),
-                "pin": normalize_pin(&pin_h),
-                "allow": ["send", "reply"]
-            }
-        });
-
         // Hub restricts B's targets to only ["allowed_bob"]
         let peers_h = serde_json::json!({
-            "node-a": {
-                "address": format!("127.0.0.1:{port_a}"),
-                "pin": normalize_pin(&pin_a),
-                "allow": ["send", "reply", "forward"]
-            },
+            "node-a": origin_entry(&pin_a, &["send", "reply", "forward"]),
             "node-b": {
                 "address": format!("127.0.0.1:{port_b}"),
                 "pin": normalize_pin(&pin_b),
@@ -850,25 +840,35 @@ async fn test_oracle_4c_dest_targets_gate() {
             }
         });
 
-        let _node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
+        let node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
         let _hub = spawn_test_node("hub", port_h, http_h, &cert_h, &key_h, peers_h).await;
-        let node_a = spawn_test_node("node-a", port_a, http_a, &cert_a, &key_a, peers_a).await;
-        let (_sock_a, _rx_a) =
-            create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
+        let (_sock_b, rx_b) =
+            create_claude_session_fixture(&node_b.sessions_dir, "forbidden_bob", "Bob");
 
-        // Send to forbidden target on B
-        let res_4c = send_via_agent_sock(
-            &node_a.agent_sock,
-            "forbidden_bob@node-b@hub",
+        // A hop to a target B's entry on H does not list; it exists on B.
+        let origin = Origin {
+            cert_der: &cert_a,
+            key_der: &key_a,
+        };
+        let (status, res_4c) = hop_send(
+            &origin,
+            &pin_h,
+            port_h,
+            "forbidden_bob@node-b",
             "Test targets check",
         )
         .await;
 
-        assert_eq!(res_4c["status"], "error");
+        assert_eq!(status, 403, "4c: {res_4c}");
+        assert_eq!(res_4c["error"], "denied", "4c: {res_4c}");
         assert_eq!(
-            res_4c["error"], "denied",
-            "4c: H must check dest targets and reject forbidden ref with op_denied: {:?}",
-            res_4c
+            res_4c["detail"], "target not allowed for peer",
+            "4c: H must check dest targets and reject the forbidden ref: {res_4c}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            rx_b.lock().unwrap().is_empty(),
+            "4c: nothing reaches forbidden_bob on B"
         );
     })
     .await;
@@ -881,16 +881,13 @@ async fn test_oracle_4c_dest_targets_gate() {
 // Line: test_oracle_5_one_hop
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_5_one_hop() {
     run_test_with_port_retry("test_oracle_5_one_hop", || async move {
-        let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
+        let (cert_a, key_a, pin_a) = generate_self_signed_ed25519("node-a").unwrap();
         let (cert_h1, key_h1, pin_h1) = generate_self_signed_ed25519_pem("hub1").unwrap();
         let (cert_h2, key_h2, pin_h2) = generate_self_signed_ed25519_pem("hub2").unwrap();
         let (cert_b, key_b, pin_b) = generate_self_signed_ed25519_pem("node-b").unwrap();
 
-        let port_a = get_free_port();
-        let http_a = get_free_port();
         let port_h1 = get_free_port();
         let http_h1 = get_free_port();
         let port_h2 = get_free_port();
@@ -898,20 +895,8 @@ async fn test_oracle_5_one_hop() {
         let port_b = get_free_port();
         let http_b = get_free_port();
 
-        let peers_a = serde_json::json!({
-            "hub1": {
-                "address": format!("127.0.0.1:{port_h1}"),
-                "pin": normalize_pin(&pin_h1),
-                "allow": ["send", "reply"]
-            }
-        });
-
         let peers_h1 = serde_json::json!({
-            "node-a": {
-                "address": format!("127.0.0.1:{port_a}"),
-                "pin": normalize_pin(&pin_a),
-                "allow": ["send", "reply", "forward"]
-            },
+            "node-a": origin_entry(&pin_a, &["send", "reply", "forward"]),
             "hub2": {
                 "address": format!("127.0.0.1:{port_h2}"),
                 "pin": normalize_pin(&pin_h2),
@@ -940,67 +925,59 @@ async fn test_oracle_5_one_hop() {
             }
         });
 
-        let _node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
+        let node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
         let _hub2 = spawn_test_node("hub2", port_h2, http_h2, &cert_h2, &key_h2, peers_h2).await;
         let _hub1 = spawn_test_node("hub1", port_h1, http_h1, &cert_h1, &key_h1, peers_h1).await;
-        let node_a = spawn_test_node("node-a", port_a, http_a, &cert_a, &key_a, peers_a).await;
-        let (_sock_a, _rx_a) =
-            create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
+        let (_sock_b, rx_b) = create_claude_session_fixture(&node_b.sessions_dir, "bob", "Bob");
 
-        // A sends to bob@node-b@hub2@hub1: H1 forwards to H2, H2 must refuse with no_forward
-        let res = send_via_agent_sock(
-            &node_a.agent_sock,
-            "bob@node-b@hub2@hub1",
+        // A's hop to bob@node-b@hub2 through H1: H1 forwards `bob@node-b` to H2, marked
+        // forwarded; H2 must refuse to forward it again.
+        let origin = Origin {
+            cert_der: &cert_a,
+            key_der: &key_a,
+        };
+        let (status, res) = hop_send(
+            &origin,
+            &pin_h1,
+            port_h1,
+            "bob@node-b@hub2",
             "Two-hop attempt",
         )
         .await;
 
-        assert_eq!(res["status"], "error");
+        assert_eq!(status, 403, "{res}");
+        assert_eq!(res["error"], "denied", "{res}");
         assert_eq!(
-            res["error"], "denied",
-            "H2 must refuse already-forwarded envelope with no_forward: {:?}",
-            res
+            res["detail"], "message has already been forwarded (one hop maximum)",
+            "H2 must refuse an already-forwarded envelope with no_forward: {res}"
         );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(rx_b.lock().unwrap().is_empty(), "nothing reaches bob on B");
     })
     .await;
 }
 
 // =============================================================================
 // Oracle 6: Off by default
-// With no forward anywhere, ref@dest@H is refused with no_forward, exactly as today.
+// With no forward anywhere, a hop through H is refused with no_forward.
 // Mutant: allow forwarding unconditionally without checking peer config => RED
 // Line: test_oracle_6_off_by_default
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "XA3: the client hop x@dest@hub left the grammar (A3, B4); this oracle needs a hop originator, which XA5's routing provides. Disposition owed by the orchestrator (xa3 part 2 report)"]
 async fn test_oracle_6_off_by_default() {
     run_test_with_port_retry("test_oracle_6_off_by_default", || async move {
-        let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
+        let (cert_a, key_a, pin_a) = generate_self_signed_ed25519("node-a").unwrap();
         let (cert_h, key_h, pin_h) = generate_self_signed_ed25519_pem("hub").unwrap();
         let (cert_b, key_b, pin_b) = generate_self_signed_ed25519_pem("node-b").unwrap();
 
-        let port_a = get_free_port();
-        let http_a = get_free_port();
         let port_h = get_free_port();
         let http_h = get_free_port();
         let port_b = get_free_port();
         let http_b = get_free_port();
 
-        let peers_a = serde_json::json!({
-            "hub": {
-                "address": format!("127.0.0.1:{port_h}"),
-                "pin": normalize_pin(&pin_h),
-                "allow": ["send", "reply"]
-            }
-        });
-
         // Default configuration: no "forward" or "relayed" anywhere
         let peers_h = serde_json::json!({
-            "node-a": {
-                "address": format!("127.0.0.1:{port_a}"),
-                "pin": normalize_pin(&pin_a),
-                "allow": ["send", "reply"]
-            },
+            "node-a": origin_entry(&pin_a, &["send", "reply"]),
             "node-b": {
                 "address": format!("127.0.0.1:{port_b}"),
                 "pin": normalize_pin(&pin_b),
@@ -1018,22 +995,25 @@ async fn test_oracle_6_off_by_default() {
 
         let _node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
         let _hub = spawn_test_node("hub", port_h, http_h, &cert_h, &key_h, peers_h).await;
-        let node_a = spawn_test_node("node-a", port_a, http_a, &cert_a, &key_a, peers_a).await;
-        let (_sock_a, _rx_a) =
-            create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
 
-        let res = send_via_agent_sock(
-            &node_a.agent_sock,
-            "bob@node-b@hub",
+        let origin = Origin {
+            cert_der: &cert_a,
+            key_der: &key_a,
+        };
+        let (status, res) = hop_send(
+            &origin,
+            &pin_h,
+            port_h,
+            "bob@node-b",
             "Send to unconfigured hub",
         )
         .await;
 
-        assert_eq!(res["status"], "error");
+        assert_eq!(status, 403, "{res}");
+        assert_eq!(res["error"], "denied", "{res}");
         assert_eq!(
-            res["error"], "denied",
-            "Hub without forward capability must refuse with no_forward: {:?}",
-            res
+            res["detail"], "Forwarding cross-host is not permitted",
+            "Hub without forward capability must refuse with no_forward: {res}"
         );
     })
     .await;
