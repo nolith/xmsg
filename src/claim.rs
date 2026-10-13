@@ -163,6 +163,8 @@ pub struct ForkNoticeToSend {
     pub proc_start1: String,
     pub pid2: u32,
     pub proc_start2: String,
+    pub recipient_pid: u32,
+    pub recipient_proc_start: String,
     pub target_session_id: String,
     pub socket_path: PathBuf,
     pub from_name: String,
@@ -186,6 +188,11 @@ pub fn sync_claims_db(
     ),
     AppError,
 > {
+    // One transaction per scan: an error part-way rolls back every claim and
+    // every notice claim it made, so none is recorded without being returned.
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     let raw_entries = registry::read_session_entries(sessions_dirs);
 
     // Filter to live entries where process is still alive and proc_start matches
@@ -316,89 +323,74 @@ pub fn sync_claims_db(
         }
     }
 
-    // 5. Check for fork notices: when >= 2 live processes exist for an ID
+    // 5. Fork notices: one per (pair, recipient process). Each notice is
+    //    claimed here, inside this scan's transaction and under the caller's
+    //    DB lock, so two overlapping scans cannot both send it.
+    //    `deliver_fork_notices` releases the claim if delivery fails, so a
+    //    later scan sends it once.
     let mut notices_to_send = Vec::new();
     for (id, claims) in &claims_by_id {
-        if claims.len() >= 2 {
-            let plain_claim = claims.iter().find(|c| c.suffix == 1);
-            let plain_addr = match plain_claim {
-                Some(pc) => pc.address(),
-                None => id.clone(),
-            };
+        if claims.len() < 2 {
+            continue;
+        }
+        let plain_addr = claims
+            .iter()
+            .find(|c| c.suffix == 1)
+            .map_or_else(|| id.clone(), |c| c.address());
 
-            for i in 0..claims.len() {
-                for j in (i + 1)..claims.len() {
-                    let (c1, c2) = if (claims[i].pid, &claims[i].proc_start)
-                        <= (claims[j].pid, &claims[j].proc_start)
-                    {
-                        (&claims[i], &claims[j])
-                    } else {
-                        (&claims[j], &claims[i])
+        for i in 0..claims.len() {
+            for j in (i + 1)..claims.len() {
+                let (c1, c2) = if (claims[i].pid, &claims[i].proc_start)
+                    <= (claims[j].pid, &claims[j].proc_start)
+                {
+                    (&claims[i], &claims[j])
+                } else {
+                    (&claims[j], &claims[i])
+                };
+
+                for (me, other) in [(c1, c2), (c2, c1)] {
+                    let Some(entry) = live_entries.iter().find(|e| {
+                        e.pid == me.pid && e.proc_start == me.proc_start && e.session_id == me.id
+                    }) else {
+                        continue;
                     };
-
-                    let mut check_notice_stmt = conn
-                        .prepare("SELECT COUNT(*) FROM fork_notices WHERE id = ?1 AND pid1 = ?2 AND proc_start1 = ?3 AND pid2 = ?4 AND proc_start2 = ?5")
-                        .map_err(|e| AppError::Internal(e.to_string()))?;
-                    let noticed_count: i64 = check_notice_stmt
-                        .query_row(
-                            params![id, c1.pid, c1.proc_start, c2.pid, c2.proc_start],
-                            |r| r.get(0),
+                    let claimed = conn
+                        .execute(
+                            "INSERT OR IGNORE INTO fork_notices (id, pid1, proc_start1, pid2, proc_start2, recipient_pid, recipient_proc_start, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            params![id, c1.pid, c1.proc_start, c2.pid, c2.proc_start, me.pid, me.proc_start, now],
                         )
                         .map_err(|e| AppError::Internal(e.to_string()))?;
-
-                    if noticed_count == 0 {
-                        if let Some(e1) = live_entries.iter().find(|e| {
-                            e.pid == c1.pid
-                                && e.proc_start == c1.proc_start
-                                && e.session_id == c1.id
-                        }) {
-                            let text1 = format!(
-                                "xmsg: conversation {} is open in two processes on {}. This process is {}; the other is {}. A send to {} reaches {}.",
-                                id, host_label, c1.address(), c2.address(), id, plain_addr
-                            );
-                            notices_to_send.push(ForkNoticeToSend {
-                                id: id.clone(),
-                                pid1: c1.pid,
-                                proc_start1: c1.proc_start.clone(),
-                                pid2: c2.pid,
-                                proc_start2: c2.proc_start.clone(),
-                                target_session_id: c1.address(),
-                                socket_path: PathBuf::from(&e1.messaging_socket_path),
-                                from_name: format!("xmsg@{host_label}"),
-                                text: text1,
-                            });
-                        }
-
-                        if let Some(e2) = live_entries.iter().find(|e| {
-                            e.pid == c2.pid
-                                && e.proc_start == c2.proc_start
-                                && e.session_id == c2.id
-                        }) {
-                            let text2 = format!(
-                                "xmsg: conversation {} is open in two processes on {}. This process is {}; the other is {}. A send to {} reaches {}.",
-                                id, host_label, c2.address(), c1.address(), id, plain_addr
-                            );
-                            notices_to_send.push(ForkNoticeToSend {
-                                id: id.clone(),
-                                pid1: c1.pid,
-                                proc_start1: c1.proc_start.clone(),
-                                pid2: c2.pid,
-                                proc_start2: c2.proc_start.clone(),
-                                target_session_id: c2.address(),
-                                socket_path: PathBuf::from(&e2.messaging_socket_path),
-                                from_name: format!("xmsg@{host_label}"),
-                                text: text2,
-                            });
-                        }
+                    if claimed == 0 {
+                        continue;
                     }
+                    notices_to_send.push(ForkNoticeToSend {
+                        id: id.clone(),
+                        pid1: c1.pid,
+                        proc_start1: c1.proc_start.clone(),
+                        pid2: c2.pid,
+                        proc_start2: c2.proc_start.clone(),
+                        recipient_pid: me.pid,
+                        recipient_proc_start: me.proc_start.clone(),
+                        target_session_id: me.address(),
+                        socket_path: PathBuf::from(&entry.messaging_socket_path),
+                        from_name: format!("xmsg@{host_label}"),
+                        text: format!(
+                            "xmsg: conversation {} is open in two processes on {}. This process is {}; the other is {}. A send to {} reaches {}.",
+                            id, host_label, me.address(), other.address(), id, plain_addr
+                        ),
+                    });
                 }
             }
         }
     }
 
+    tx.commit().map_err(|e| AppError::Internal(e.to_string()))?;
     Ok((active_pairs, notices_to_send))
 }
 
+/// Delivers notices claimed by `sync_claims_db`. A delivered notice is
+/// stored as a message; a failed one has its claim released so a later scan
+/// delivers it.
 pub async fn deliver_fork_notices(
     db: &std::sync::Mutex<Connection>,
     notices: Vec<ForkNoticeToSend>,
@@ -407,55 +399,83 @@ pub async fn deliver_fork_notices(
         return;
     }
 
-    let mut delivered_records = Vec::new();
+    let mut outcomes = Vec::new();
     for notice in notices {
-        let msg_id = ulid::Ulid::new().to_string();
-        let body_len = notice.text.len();
-        match inbox::encode_transport_line(&notice.from_name, &notice.text) {
-            Ok(line) => match inbox::deliver_to_socket(&notice.socket_path, &line).await {
-                Ok(()) => {
-                    let record = MessageRecord {
-                        id: msg_id.clone(),
-                        created_at: now_epoch_secs(),
-                        session_id: notice.target_session_id.clone(),
-                        from_name: notice.from_name.clone(),
-                        bytes: body_len,
-                        outcome: "delivered".to_string(),
-                        recipient_harness: "claude".to_string(),
-                        return_harness: None,
-                        return_session_id: None,
-                        push_replies: false,
-                        thread_id: msg_id,
-                        return_host: None,
-                    };
-                    delivered_records.push((notice, record));
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed delivering fork notice to {}: {}",
-                        notice.socket_path.display(),
-                        e
-                    );
-                }
-            },
-            Err(e) => {
-                warn!("Failed encoding transport line for fork notice: {}", e);
-            }
+        let res = match inbox::encode_transport_line(&notice.from_name, &notice.text) {
+            Ok(line) => inbox::deliver_to_socket(&notice.socket_path, &line).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = &res {
+            warn!(
+                "Failed delivering fork notice to {}: {}",
+                notice.socket_path.display(),
+                e
+            );
         }
+        outcomes.push((notice, res.is_ok()));
     }
 
-    if !delivered_records.is_empty() {
-        if let Ok(conn) = db.lock() {
-            let now = now_epoch_secs();
-            for (notice, record) in delivered_records {
-                let _ = storage::insert_message(&conn, &record);
-                let _ = conn.execute(
-                    "INSERT INTO fork_notices (id, pid1, proc_start1, pid2, proc_start2, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![notice.id, notice.pid1, notice.proc_start1, notice.pid2, notice.proc_start2, now],
-                );
-            }
+    let conn = match db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Fork notice bookkeeping skipped, DB lock poisoned: {}", e);
+            return;
+        }
+    };
+    for (notice, delivered) in outcomes {
+        let res = if delivered {
+            let msg_id = ulid::Ulid::new().to_string();
+            storage::insert_message(
+                &conn,
+                &MessageRecord {
+                    id: msg_id.clone(),
+                    created_at: now_epoch_secs(),
+                    session_id: notice.target_session_id.clone(),
+                    from_name: notice.from_name.clone(),
+                    bytes: notice.text.len(),
+                    outcome: "delivered".to_string(),
+                    recipient_harness: "claude".to_string(),
+                    return_harness: None,
+                    return_session_id: None,
+                    push_replies: false,
+                    thread_id: msg_id,
+                    return_host: None,
+                },
+            )
+        } else {
+            conn.execute(
+                "DELETE FROM fork_notices WHERE id = ?1 AND pid1 = ?2 AND proc_start1 = ?3 AND pid2 = ?4 AND proc_start2 = ?5 AND recipient_pid = ?6 AND recipient_proc_start = ?7",
+                params![notice.id, notice.pid1, notice.proc_start1, notice.pid2, notice.proc_start2, notice.recipient_pid, notice.recipient_proc_start],
+            )
+            .map(|_| ())
+        };
+        if let Err(e) = res {
+            warn!(
+                "Fork notice bookkeeping failed for {}: {}",
+                notice.target_session_id, e
+            );
         }
     }
+}
+
+/// Runs one claim scan, then `f` over its live (claim, session file) pairs,
+/// under the DB lock; then delivers the fork notices that scan claimed.
+/// Every surface that observes the claim table goes through here, so none can
+/// observe a fork and drop its notice.
+pub async fn with_claims<T>(
+    db: &std::sync::Mutex<Connection>,
+    proc_root: &Path,
+    sessions_dirs: &(impl SessionDirs + ?Sized),
+    host_label: &str,
+    f: impl FnOnce(&Connection, &[(InstanceClaim, SessionFileEntry)]) -> T,
+) -> Result<T, AppError> {
+    let (out, notices) = {
+        let conn = db.lock().map_err(|e| AppError::Internal(e.to_string()))?;
+        let (pairs, notices) = sync_claims_db(&conn, proc_root, sessions_dirs, host_label)?;
+        (f(&conn, &pairs), notices)
+    };
+    deliver_fork_notices(db, notices).await;
+    Ok(out)
 }
 
 pub async fn sync_claims(
@@ -464,35 +484,27 @@ pub async fn sync_claims(
     sessions_dirs: &(impl SessionDirs + ?Sized),
     host_label: &str,
 ) -> Result<Vec<(InstanceClaim, SessionFileEntry)>, AppError> {
-    let (active_pairs, notices_to_send) = {
-        let conn = db.lock().map_err(|e| AppError::Internal(e.to_string()))?;
-        sync_claims_db(&conn, proc_root, sessions_dirs, host_label)?
-    };
-
-    deliver_fork_notices(db, notices_to_send).await;
-    Ok(active_pairs)
+    with_claims(db, proc_root, sessions_dirs, host_label, |_, pairs| {
+        pairs.to_vec()
+    })
+    .await
 }
 
-pub fn resolve_claude_session_with_notices(
+/// Resolves a Claude session reference against one scan's live pairs.
+pub fn resolve_claude_in(
     conn: &Connection,
-    proc_root: &Path,
     sessions_dirs: &(impl SessionDirs + ?Sized),
-    host_label: &str,
+    active_pairs: &[(InstanceClaim, SessionFileEntry)],
     ref_str: &str,
-) -> Result<((Session, PathBuf), Vec<ForkNoticeToSend>), AppError> {
+) -> Result<(Session, PathBuf), AppError> {
     // 1. Check if ref_str specifies a fork suffix e.g. "X~2"
     if let Some((base_id, suffix_str)) = ref_str.split_once('~') {
         if let Ok(suffix) = suffix_str.parse::<u32>() {
-            let (active_pairs, notices) =
-                sync_claims_db(conn, proc_root, sessions_dirs, host_label)?;
             for (claim, entry) in active_pairs {
                 if claim.id == base_id && claim.suffix == suffix {
                     let mut session: Session = entry.clone().into();
                     session.session_id = claim.address();
-                    return Ok((
-                        (session, PathBuf::from(entry.messaging_socket_path)),
-                        notices,
-                    ));
+                    return Ok((session, PathBuf::from(&entry.messaging_socket_path)));
                 }
             }
 
@@ -515,24 +527,17 @@ pub fn resolve_claude_session_with_notices(
         }
     }
 
-    let (active_pairs, notices) = sync_claims_db(conn, proc_root, sessions_dirs, host_label)?;
-
     // 2. Check for bare ID match
-    let mut id_matches: Vec<(InstanceClaim, SessionFileEntry)> = Vec::new();
-    for (claim, entry) in &active_pairs {
-        if claim.id == ref_str || entry.session_id == ref_str {
-            id_matches.push((claim.clone(), entry.clone()));
-        }
-    }
+    let id_matches: Vec<&(InstanceClaim, SessionFileEntry)> = active_pairs
+        .iter()
+        .filter(|(claim, entry)| claim.id == ref_str || entry.session_id == ref_str)
+        .collect();
 
     if !id_matches.is_empty() {
         if let Some((plain_claim, plain_entry)) = id_matches.iter().find(|(c, _)| c.suffix == 1) {
             let mut session: Session = plain_entry.clone().into();
             session.session_id = plain_claim.address();
-            return Ok((
-                (session, PathBuf::from(&plain_entry.messaging_socket_path)),
-                notices,
-            ));
+            return Ok((session, PathBuf::from(&plain_entry.messaging_socket_path)));
         } else {
             // Suffix 1 is free/dead, but active forks exist: ambiguous!
             let candidates: Vec<String> = id_matches.iter().map(|(c, _)| c.address()).collect();
@@ -542,36 +547,26 @@ pub fn resolve_claude_session_with_notices(
 
     // 3. Check for PID match
     if let Ok(pid) = ref_str.parse::<u32>() {
-        for (claim, entry) in &active_pairs {
+        for (claim, entry) in active_pairs {
             if entry.pid == pid {
                 let mut session: Session = entry.clone().into();
                 session.session_id = claim.address();
-                return Ok((
-                    (session, PathBuf::from(&entry.messaging_socket_path)),
-                    notices,
-                ));
+                return Ok((session, PathBuf::from(&entry.messaging_socket_path)));
             }
         }
     }
 
     // 4. Check for session name match
-    let mut name_matches = Vec::new();
-    for (claim, entry) in &active_pairs {
-        if let Some(ref name) = entry.name {
-            if name == ref_str {
-                name_matches.push((claim.clone(), entry.clone()));
-            }
-        }
-    }
+    let name_matches: Vec<&(InstanceClaim, SessionFileEntry)> = active_pairs
+        .iter()
+        .filter(|(_, entry)| entry.name.as_deref() == Some(ref_str))
+        .collect();
 
     if name_matches.len() == 1 {
-        let (claim, entry) = name_matches.into_iter().next().unwrap();
+        let (claim, entry) = name_matches[0];
         let mut session: Session = entry.clone().into();
         session.session_id = claim.address();
-        return Ok((
-            (session, PathBuf::from(entry.messaging_socket_path)),
-            notices,
-        ));
+        return Ok((session, PathBuf::from(&entry.messaging_socket_path)));
     } else if name_matches.len() > 1 {
         let candidates: Vec<String> = name_matches.iter().map(|(c, _)| c.address()).collect();
         return Err(AppError::Ambiguous(candidates.join(", ")));
@@ -610,18 +605,6 @@ pub fn resolve_claude_session_with_notices(
     Err(AppError::NotFound(ref_str.to_string()))
 }
 
-pub fn resolve_claude_session(
-    conn: &Connection,
-    proc_root: &Path,
-    sessions_dirs: &(impl SessionDirs + ?Sized),
-    host_label: &str,
-    ref_str: &str,
-) -> Result<(Session, PathBuf), AppError> {
-    let (res, _) =
-        resolve_claude_session_with_notices(conn, proc_root, sessions_dirs, host_label, ref_str)?;
-    Ok(res)
-}
-
 pub async fn resolve_claude_session_and_deliver(
     db: &std::sync::Mutex<Connection>,
     proc_root: &Path,
@@ -629,10 +612,8 @@ pub async fn resolve_claude_session_and_deliver(
     host_label: &str,
     ref_str: &str,
 ) -> Result<(Session, PathBuf), AppError> {
-    let (res, notices) = {
-        let conn = db.lock().map_err(|e| AppError::Internal(e.to_string()))?;
-        resolve_claude_session_with_notices(&conn, proc_root, sessions_dirs, host_label, ref_str)?
-    };
-    deliver_fork_notices(db, notices).await;
-    Ok(res)
+    with_claims(db, proc_root, sessions_dirs, host_label, |conn, pairs| {
+        resolve_claude_in(conn, sessions_dirs, pairs, ref_str)
+    })
+    .await?
 }

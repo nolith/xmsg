@@ -429,41 +429,33 @@ pub async fn run_agent_server(
                         }
                         Err(e) => {
                             // Check Claude Code sessions via claim table
-                            let claude_res = {
-                                if let Ok(db) = state_clone.db.lock() {
-                                    crate::claim::sync_claims_db(
-                                        &db,
+                            let claude_res = crate::claim::sync_claims(
+                                &state_clone.db,
+                                &state_clone.agy_config.proc_root,
+                                &state_clone.sessions_dirs,
+                                &state_clone.host_label,
+                            )
+                            .await
+                            .ok()
+                            .and_then(|active_pairs| {
+                                let mut curr = peer_pid;
+                                for _ in 0..32 {
+                                    if let Some((claim, _)) =
+                                        active_pairs.iter().find(|(c, _)| c.pid == curr)
+                                    {
+                                        return Some(claim.address());
+                                    }
+                                    let ppid = process::parent_pid(
                                         &state_clone.agy_config.proc_root,
-                                        &state_clone.sessions_dirs,
-                                        &state_clone.host_label,
-                                    )
-                                    .ok()
-                                    .and_then(|(active_pairs, _)| {
-                                        let mut curr = peer_pid;
-                                        for _ in 0..32 {
-                                            if let Some((claim, _)) =
-                                                active_pairs.iter().find(|(c, _)| c.pid == curr)
-                                            {
-                                                return Some(claim.address());
-                                            }
-                                            if let Some(ppid) = process::parent_pid(
-                                                &state_clone.agy_config.proc_root,
-                                                curr,
-                                            ) {
-                                                if ppid <= 1 {
-                                                    break;
-                                                }
-                                                curr = ppid;
-                                            } else {
-                                                break;
-                                            }
-                                        }
-                                        None
-                                    })
-                                } else {
-                                    None
+                                        curr,
+                                    )?;
+                                    if ppid <= 1 {
+                                        break;
+                                    }
+                                    curr = ppid;
                                 }
-                            };
+                                None
+                            });
 
                             if let Some(address) = claude_res {
                                 let resp = serde_json::json!({
@@ -1307,7 +1299,7 @@ pub async fn run_agent_server(
                             continue;
                         }
 
-                        let target_res = resolve_target_session(&state_clone, target_ref);
+                        let target_res = resolve_target_session(&state_clone, target_ref).await;
                         match target_res {
                             Ok(target) => {
                                 let message_id = ulid::Ulid::new().to_string();

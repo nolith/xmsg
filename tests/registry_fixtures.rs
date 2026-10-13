@@ -1,8 +1,6 @@
 use std::fs;
-use std::path::Path;
 use tempfile::tempdir;
-use xmsg::error::AppError;
-use xmsg::registry::{list_sessions, resolve_session, SessionsQuery};
+use xmsg::registry::{list_sessions, SessionsQuery};
 
 fn get_self_proc_start() -> String {
     xmsg::process::starttime(
@@ -104,47 +102,4 @@ fn test_registry_fixtures() {
         .iter()
         .any(|s| s.name.as_deref() == Some("KEY-LEAK")));
     assert!(!live_list.iter().any(|s| s.session_id == "key-leak-session"));
-
-    // Test resolve_session on live session (by id, pid, and name)
-    let (s_by_id, sock) = resolve_session(dir_path, "live-session-1111").unwrap();
-    assert_eq!(s_by_id.pid, my_pid);
-    assert_eq!(sock, Path::new("/tmp/live.sock"));
-
-    let (s_by_pid, _) = resolve_session(dir_path, &my_pid.to_string()).unwrap();
-    assert_eq!(s_by_pid.session_id, "live-session-1111");
-
-    let (s_by_name, _) = resolve_session(dir_path, "live-agent").unwrap();
-    assert_eq!(s_by_name.session_id, "live-session-1111");
-
-    // Test resolve_session on dead session -> 410 Gone
-    let dead_res = resolve_session(dir_path, "dead-session-2222");
-    assert!(
-        matches!(dead_res, Err(AppError::Gone { ref session_id, pid }) if session_id == "dead-session-2222" && pid == dead_pid),
-        "Expected Gone error for dead PID, got: {:?}",
-        dead_res
-    );
-
-    // Test resolve_session on reused session -> 410 Gone
-    let reused_res = resolve_session(dir_path, "reused-session-3333");
-    assert!(
-        matches!(reused_res, Err(AppError::Gone { ref session_id, pid }) if session_id == "reused-session-3333" && pid == my_pid),
-        "Expected Gone error for reused PID, got: {:?}",
-        reused_res
-    );
-
-    // Test resolve_session on unknown ref -> 404 NotFound
-    let not_found_res = resolve_session(dir_path, "non-existent-agent");
-    assert!(
-        matches!(not_found_res, Err(AppError::NotFound(_))),
-        "Expected NotFound error, got: {:?}",
-        not_found_res
-    );
-
-    // Test resolve_session on KEY-LEAK (.key file) -> 404 NotFound
-    let key_leak_res = resolve_session(dir_path, "KEY-LEAK");
-    assert!(
-        matches!(key_leak_res, Err(AppError::NotFound(_))),
-        "Expected NotFound error for .key file entry, got: {:?}",
-        key_leak_res
-    );
 }

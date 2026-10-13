@@ -4,21 +4,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Mutex;
 
-use xmsg::agy::{new_agy_store, AgyConfig, AgySessionInfo};
+use xmsg::agy::{new_agy_store, AgyConfig};
 use xmsg::claim::{get_all_claims_for_id, is_uuid_shaped, sync_claims_db, validate_service_name};
 use xmsg::http::{build_router, AppState};
 use xmsg::pi::new_pi_store;
 use xmsg::storage::init_db;
 
 fn setup_mock_proc(proc_root: &Path, pid: u32, starttime: &str) {
+    setup_mock_proc_with_parent(proc_root, pid, 1, starttime);
+}
+
+fn setup_mock_proc_with_parent(proc_root: &Path, pid: u32, ppid: u32, starttime: &str) {
     let pid_dir = proc_root.join(pid.to_string());
     fs::create_dir_all(&pid_dir).unwrap();
     let stat = format!(
-        "{pid} (test) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {starttime} 0 0 0 0 0 0 0 0 0 0\n"
+        "{pid} (test) S {ppid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {starttime} 0 0 0 0 0 0 0 0 0 0\n"
     );
     fs::write(pid_dir.join("stat"), stat).unwrap();
 }
@@ -115,6 +119,7 @@ async fn start_socket_listener(name: &str) -> SocketListener {
 struct RunningServer {
     base_url: String,
     agent_sock: PathBuf,
+    state: Arc<AppState>,
     agent_task: tokio::task::JoinHandle<()>,
     http_task: tokio::task::JoinHandle<()>,
 }
@@ -135,7 +140,6 @@ async fn start_test_server(
     proc_root: PathBuf,
     db_path: PathBuf,
 ) -> RunningServer {
-    let my_uid = xmsg::agent::current_uid();
     let agy_config = AgyConfig {
         presence_dir: proc_root.join("presence"),
         proc_locks_path: proc_root.join("locks"),
@@ -143,6 +147,16 @@ async fn start_test_server(
         agy_bin: "agy".to_string(),
         trusted_agy_exes: Vec::new(),
     };
+    start_server_with(agent_sock, sessions_dir, agy_config, db_path).await
+}
+
+async fn start_server_with(
+    agent_sock: PathBuf,
+    sessions_dir: PathBuf,
+    agy_config: AgyConfig,
+    db_path: PathBuf,
+) -> RunningServer {
+    let my_uid = xmsg::agent::current_uid();
     let agy_store = new_agy_store();
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     init_db(&conn).unwrap();
@@ -179,6 +193,12 @@ async fn start_test_server(
         axum::serve(http_listener, router).await.unwrap();
     });
 
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(
+        agent_sock.parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let st = state.clone();
     let asock = agent_sock.clone();
     let agent_task = tokio::spawn(async move {
@@ -191,12 +211,137 @@ async fn start_test_server(
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(agent_sock.exists(), "agent.sock never came up");
 
     RunningServer {
         base_url,
         agent_sock,
+        state,
         agent_task,
         http_task,
+    }
+}
+
+fn live_self_proc_start() -> String {
+    xmsg::process::starttime(Path::new(xmsg::process::LIVE_PROC_ROOT), std::process::id())
+        .expect("live starttime of the test process")
+}
+
+/// A real `xmsg mcp` child, killed on drop.
+struct KillChild(std::process::Child);
+
+impl Drop for KillChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_mcp(agent_sock: &Path) -> KillChild {
+    KillChild(
+        std::process::Command::new(env!("CARGO_BIN_EXE_xmsg"))
+            .arg("mcp")
+            .arg("--agent-sock")
+            .arg(agent_sock)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn xmsg mcp"),
+    )
+}
+
+/// One frame over agent.sock from this test process, which the server
+/// attests by its peer pid.
+async fn agent_request(agent_sock: &Path, req: serde_json::Value) -> serde_json::Value {
+    let stream = tokio::net::UnixStream::connect(agent_sock).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    writer
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut line = String::new();
+    tokio::io::BufReader::new(reader)
+        .read_line(&mut line)
+        .await
+        .unwrap();
+    serde_json::from_str(&line).unwrap_or_else(|e| panic!("bad response {line:?}: {e}"))
+}
+
+fn claude_message(id: &str, session_id: &str) -> xmsg::storage::MessageRecord {
+    xmsg::storage::MessageRecord {
+        id: id.to_string(),
+        created_at: xmsg::storage::now_epoch_secs(),
+        session_id: session_id.to_string(),
+        from_name: "test@peer".to_string(),
+        bytes: 10,
+        outcome: "delivered".to_string(),
+        recipient_harness: "claude".to_string(),
+        return_harness: None,
+        return_session_id: None,
+        push_replies: false,
+        thread_id: id.to_string(),
+        return_host: None,
+    }
+}
+
+const NOTICE_MARK: &str = "is open in two processes";
+
+async fn notice_count(l: &SocketListener) -> usize {
+    l.received_lines
+        .lock()
+        .await
+        .iter()
+        .filter(|line| line.contains(NOTICE_MARK))
+        .count()
+}
+
+/// Waits up to `wait` for both processes to hold a notice, then long enough
+/// for a duplicate to land, and returns both counts.
+async fn settle_notices(a: &SocketListener, b: &SocketListener, wait: Duration) -> (usize, usize) {
+    let deadline = tokio::time::Instant::now() + wait;
+    while tokio::time::Instant::now() < deadline
+        && (notice_count(a).await == 0 || notice_count(b).await == 0)
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    (notice_count(a).await, notice_count(b).await)
+}
+
+/// Two live processes, 1001 (procStart 100) and 1002 (procStart 200), both
+/// presenting `conv`, and nothing observed yet.
+struct ForkFixture {
+    _tmp: TempDir,
+    proc_root: PathBuf,
+    sessions_dir: PathBuf,
+    db_path: PathBuf,
+    agent_sock: PathBuf,
+    p1: SocketListener,
+    p2: SocketListener,
+}
+
+async fn fork_fixture(conv: &str) -> ForkFixture {
+    let tmp = tempdir().unwrap();
+    let proc_root = tmp.path().join("proc");
+    let sessions_dir = tmp.path().join("sessions");
+    let sock_dir = tmp.path().join("sockets");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::create_dir_all(&sock_dir).unwrap();
+    let p1 = start_socket_listener("p1").await;
+    let p2 = start_socket_listener("p2").await;
+    setup_mock_proc(&proc_root, 1001, "100");
+    setup_mock_proc(&proc_root, 1002, "200");
+    write_claude_session_file(&sessions_dir, 1001, conv, "first", "100", &p1.sock_path);
+    write_claude_session_file(&sessions_dir, 1002, conv, "second", "200", &p2.sock_path);
+    ForkFixture {
+        db_path: tmp.path().join("xmsg.db"),
+        agent_sock: sock_dir.join("agent.sock"),
+        _tmp: tmp,
+        proc_root,
+        sessions_dir,
+        p1,
+        p2,
     }
 }
 
@@ -550,7 +695,10 @@ async fn test_oracle_4_ties_broken_by_proc_start_and_pid() {
 
 // =============================================================================
 // Oracle 5: Fork identity in send/reply attribution and authorization (D-5)
+// P2 is this test process, so its agent.sock frames are attested as P2 and
+// go through the production send and reply paths.
 // Mutant M5: caller identity from session file's sessionId => RED
+// Mutant X-R5: reply authorization drops the recipient-address check => RED
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_oracle_5_fork_identity_attribution_and_routing() {
@@ -558,14 +706,17 @@ async fn test_oracle_5_fork_identity_attribution_and_routing() {
     let db_path = tmp.path().join("xmsg.db");
     let proc_root = tmp.path().join("proc");
     let sessions_dir = tmp.path().join("sessions");
+    let sock_dir = tmp.path().join("sockets");
     fs::create_dir_all(&sessions_dir).unwrap();
+    fs::create_dir_all(&sock_dir).unwrap();
 
     let conv_id = "0199cecf-0005-7000-8000-000000000001";
+    let fork_addr = format!("{conv_id}~2");
     let listener_p1 = start_socket_listener("p1").await;
     let listener_p2 = start_socket_listener("p2").await;
 
+    // P1 (fake pid 1001) is observed first and holds plain X.
     setup_mock_proc(&proc_root, 1001, "100");
-    setup_mock_proc(&proc_root, 1002, "200");
     write_claude_session_file(
         &sessions_dir,
         1001,
@@ -574,110 +725,106 @@ async fn test_oracle_5_fork_identity_attribution_and_routing() {
         "100",
         &listener_p1.sock_path,
     );
+    let server = start_test_server(
+        sock_dir.join("agent.sock"),
+        sessions_dir.clone(),
+        proc_root.clone(),
+        db_path.clone(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let s1: Vec<serde_json::Value> = client
+        .get(format!("{}/v1/sessions", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s1.len(), 1);
+    assert_eq!(s1[0]["sessionId"], conv_id);
+
+    // P2 (this test process) presents X later and gets X~2.
+    let my_pid = std::process::id();
+    let my_start = live_self_proc_start();
+    setup_mock_proc(&proc_root, my_pid, &my_start);
     write_claude_session_file(
         &sessions_dir,
-        1002,
+        my_pid,
         conv_id,
         "second",
-        "200",
+        &my_start,
         &listener_p2.sock_path,
     );
+    let s2: Vec<serde_json::Value> = client
+        .get(format!("{}/v1/sessions", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let p2_entry = s2.iter().find(|s| s["pid"] == my_pid).expect("P2 listed");
+    assert_eq!(p2_entry["sessionId"], fork_addr);
 
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    init_db(&conn).unwrap();
-
-    // 1. Initial observation: P1 gets plain X, P2 gets X~2
-    let (pairs, _) = sync_claims_db(&conn, &proc_root, &sessions_dir, "test-node").unwrap();
-    assert_eq!(pairs.len(), 2);
-
-    let agy_config = AgyConfig {
-        presence_dir: proc_root.join("presence"),
-        proc_locks_path: proc_root.join("locks"),
-        proc_root: proc_root.clone(),
-        agy_bin: "agy".to_string(),
-        trusted_agy_exes: Vec::new(),
-    };
-    let agy_store = new_agy_store();
-    let pi_store = new_pi_store();
-    let svc_store = xmsg::svc::new_svc_store();
-
-    // 2. Caller resolution for P2 (pid 1002)
-    let caller_p2 = xmsg::agent::resolve_caller_session(
-        &proc_root,
-        &[sessions_dir.clone()][..],
-        &agy_config,
-        &agy_store,
-        &pi_store,
-        &svc_store,
-        Some(&conn),
-        1002,
+    // 1. P2 sends to X: the message is attributed to X~2, the address a
+    //    reply to it is routed back to.
+    let sent = agent_request(
+        &server.agent_sock,
+        serde_json::json!({"action": "send", "ref": conv_id, "text": "hello from the fork"}),
     )
-    .expect("resolve caller P2");
-
+    .await;
+    assert_eq!(sent["status"], "ok", "send from P2 failed: {sent}");
+    let sent_id = sent["delivery"]["messageId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no messageId in {sent}"));
+    let record = xmsg::storage::get_message(&server.state.db.lock().unwrap(), sent_id)
+        .unwrap()
+        .expect("P2's send is stored");
     assert_eq!(
-        caller_p2.session_id,
-        format!("{conv_id}~2"),
-        "Caller identity for fork process MUST resolve to X~2 via claim table"
+        record.return_session_id.as_deref(),
+        Some(fork_addr.as_str()),
+        "P2's send MUST be attributed to X~2"
+    );
+    assert_eq!(record.return_harness.as_deref(), Some("claude"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        listener_p1
+            .received_lines
+            .lock()
+            .await
+            .iter()
+            .any(|l| l.contains("hello from the fork")),
+        "P1 (plain X) received P2's send"
     );
 
-    // 3. From-attribution: message sent by P2 is attributed to X~2, NOT X
-    let badge =
-        xmsg::inbox::sanitize_attested_from("test-node", &caller_p2.harness, &caller_p2.session_id);
+    // 2. Replies through the production reply path: P2 may reply to a message
+    //    addressed to X~2 and is denied for one addressed to X.
+    {
+        let db = server.state.db.lock().unwrap();
+        xmsg::storage::insert_message(&db, &claude_message("msg-fork-002", &fork_addr)).unwrap();
+        xmsg::storage::insert_message(&db, &claude_message("msg-plain-001", conv_id)).unwrap();
+    }
+    let allowed = agent_request(
+        &server.agent_sock,
+        serde_json::json!({"action": "reply", "messageId": "msg-fork-002", "text": "reply as the fork"}),
+    )
+    .await;
     assert_eq!(
-        badge,
-        format!("xmsg@test-node · claude:{conv_id}~2"),
-        "Sender badge MUST attribute to X~2"
+        allowed["status"], "ok",
+        "P2 MUST be allowed to reply to a message addressed to X~2: {allowed}"
     );
-    assert_ne!(
-        badge,
-        format!("xmsg@test-node · claude:{conv_id}"),
-        "Sender badge MUST NOT attribute to plain X"
-    );
-
-    // 4. Reply authorization: P2 may reply to a message addressed to X~2, and is denied for one addressed to X
-    let msg_for_plain = xmsg::storage::MessageRecord {
-        id: "msg-plain-001".to_string(),
-        created_at: xmsg::storage::now_epoch_secs(),
-        session_id: conv_id.to_string(),
-        from_name: "test@peer".to_string(),
-        bytes: 10,
-        outcome: "delivered".to_string(),
-        recipient_harness: "claude".to_string(),
-        return_harness: None,
-        return_session_id: None,
-        push_replies: false,
-        thread_id: "t1".to_string(),
-        return_host: None,
-    };
-    xmsg::storage::insert_message(&conn, &msg_for_plain).unwrap();
-
-    let msg_for_fork = xmsg::storage::MessageRecord {
-        id: "msg-fork-002".to_string(),
-        created_at: xmsg::storage::now_epoch_secs(),
-        session_id: format!("{conv_id}~2"),
-        from_name: "test@peer".to_string(),
-        bytes: 10,
-        outcome: "delivered".to_string(),
-        recipient_harness: "claude".to_string(),
-        return_harness: None,
-        return_session_id: None,
-        push_replies: false,
-        thread_id: "t2".to_string(),
-        return_host: None,
-    };
-    xmsg::storage::insert_message(&conn, &msg_for_fork).unwrap();
-
-    // Check authorization against msg_for_plain: caller is X~2, recipient is X -> denied
-    assert_ne!(
-        caller_p2.session_id, msg_for_plain.session_id,
-        "P2 must NOT match recipient of message addressed to plain X"
-    );
-
-    // Check authorization against msg_for_fork: caller is X~2, recipient is X~2 -> allowed
+    let denied = agent_request(
+        &server.agent_sock,
+        serde_json::json!({"action": "reply", "messageId": "msg-plain-001", "text": "reply as the fork"}),
+    )
+    .await;
     assert_eq!(
-        caller_p2.session_id, msg_for_fork.session_id,
-        "P2 MUST match recipient of message addressed to X~2"
+        denied["error"], "not_recipient",
+        "P2 MUST be denied a reply to a message addressed to plain X: {denied}"
     );
+
+    server.stop().await;
 }
 
 // =============================================================================
@@ -798,10 +945,110 @@ async fn test_oracle_6_fork_notice_exact_text_and_single_delivery() {
 }
 
 // =============================================================================
-// Oracle 7: agy conversation UUID across restart (PM1 case and caller resolution)
+// Oracle 6b: two overlapping scans notice a fork pair once.
+// Mutant B-N1: record the notice only after delivery, outside the lock => RED
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_6b_fork_notice_once_under_concurrent_scans() {
+    let f = fork_fixture("0199cecf-0006-7000-8000-00000000000b").await;
+    let conn = rusqlite::Connection::open(&f.db_path).unwrap();
+    init_db(&conn).unwrap();
+    let db = std::sync::Mutex::new(conn);
+
+    let (a, b) = tokio::join!(
+        xmsg::claim::sync_claims(&db, &f.proc_root, &f.sessions_dir, "test-node"),
+        xmsg::claim::sync_claims(&db, &f.proc_root, &f.sessions_dir, "test-node"),
+    );
+    a.unwrap();
+    b.unwrap();
+    xmsg::claim::sync_claims(&db, &f.proc_root, &f.sessions_dir, "test-node")
+        .await
+        .unwrap();
+
+    let (n1, n2) = settle_notices(&f.p1, &f.p2, Duration::from_secs(2)).await;
+    assert_eq!(
+        n1, 1,
+        "P1 must receive exactly one notice under concurrent scans"
+    );
+    assert_eq!(
+        n2, 1,
+        "P2 must receive exactly one notice under concurrent scans"
+    );
+}
+
+// =============================================================================
+// Oracle 6c: a fork first observed by Claude's mcp_start is noticed there,
+// with no list.
+// Mutant B-N2-mcp: the mcp_start Claude arm drops the notices => RED
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_6c_fork_notice_on_mcp_start_without_list() {
+    let f = fork_fixture("0199cecf-0006-7000-8000-00000000000c").await;
+    let server = start_test_server(
+        f.agent_sock.clone(),
+        f.sessions_dir.clone(),
+        f.proc_root.clone(),
+        f.db_path.clone(),
+    )
+    .await;
+
+    // A real `xmsg mcp` under P2, as Claude runs its MCP.
+    let child = spawn_mcp(&server.agent_sock);
+    setup_mock_proc_with_parent(&f.proc_root, child.0.id(), 1002, "300");
+
+    let (n1, n2) = settle_notices(&f.p1, &f.p2, Duration::from_secs(5)).await;
+    drop(child);
+    server.stop().await;
+    assert_eq!(n1, 1, "P1 must receive exactly one notice from mcp_start");
+    assert_eq!(n2, 1, "P2 must receive exactly one notice from mcp_start");
+}
+
+// =============================================================================
+// Oracle 6d: a fork first observed by a send is noticed there, with no list.
+// Mutant B-N2-send: the send path's resolution drops the notices => RED
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oracle_6d_fork_notice_on_send_without_list() {
+    let conv = "0199cecf-0006-7000-8000-00000000000d";
+    let f = fork_fixture(conv).await;
+    let server = start_test_server(
+        f.agent_sock.clone(),
+        f.sessions_dir.clone(),
+        f.proc_root.clone(),
+        f.db_path.clone(),
+    )
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{}/v1/sessions/{conv}/messages", server.base_url))
+        .json(&serde_json::json!({"from": "tester", "text": "hello X"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::ACCEPTED);
+
+    let (n1, n2) = settle_notices(&f.p1, &f.p2, Duration::from_secs(2)).await;
+    server.stop().await;
+    assert_eq!(n1, 1, "P1 must receive exactly one notice from the send");
+    assert_eq!(n2, 1, "P2 must receive exactly one notice from the send");
+}
+
+// =============================================================================
+// Oracle 7: agy conversation UUID across restart (PM1 arm), through the
+// running server: real `xmsg mcp` children drive mcp_start, agy restarts with
+// a new pid, and the restarted agy replies to a message received before.
 // Mutant M7a: key on agy:{pid}:{starttime} in AgySessionInfo::new => RED
 // Mutant M7b: key on agy:{pid}:{starttime} at registration sites => RED
+// Mutant X-B2rev: mcp_start keeps the stale store entry => RED
 // =============================================================================
+fn setup_mock_agy(proc_root: &Path, pid: u32, starttime: &str, exe: &Path, lock: &Path) {
+    setup_mock_proc(proc_root, pid, starttime);
+    let dir = proc_root.join(pid.to_string());
+    fs::create_dir_all(dir.join("fd")).unwrap();
+    std::os::unix::fs::symlink(exe, dir.join("exe")).unwrap();
+    std::os::unix::fs::symlink(lock, dir.join("fd").join("3")).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_oracle_7_agy_conversation_uuid_across_restart() {
     let tmp = tempdir().unwrap();
@@ -809,182 +1056,121 @@ async fn test_oracle_7_agy_conversation_uuid_across_restart() {
     let presence_dir = tmp.path().join("presence");
     let proc_locks = tmp.path().join("proc_locks");
     let sessions_dir = tmp.path().join("sessions");
+    let sock_dir = tmp.path().join("sockets");
     fs::create_dir_all(&presence_dir).unwrap();
     fs::create_dir_all(&sessions_dir).unwrap();
+    fs::create_dir_all(&sock_dir).unwrap();
 
     let conv_uuid = "4a111111-2222-4333-8444-555555555555";
     let lock_file = presence_dir.join(format!("{conv_uuid}.lock"));
     fs::write(&lock_file, "lock").unwrap();
     let meta = fs::metadata(&lock_file).unwrap();
     use std::os::unix::fs::MetadataExt;
-    let dev = meta.dev();
-    let ino = meta.ino();
-    let maj = xmsg::agy::dev_major(dev);
-    let min = xmsg::agy::dev_minor(dev);
-
+    let (maj, min, ino) = (
+        xmsg::agy::dev_major(meta.dev()),
+        xmsg::agy::dev_minor(meta.dev()),
+        meta.ino(),
+    );
+    let lock_line =
+        |holder: u32| format!("1: FLOCK ADVISORY WRITE {holder} {maj:02x}:{min:02x}:{ino} 0 EOF\n");
     let trusted_agy = tmp.path().join("trusted_agy");
     fs::write(&trusted_agy, "binary").unwrap();
 
     let agy_config = AgyConfig {
-        presence_dir: presence_dir.clone(),
+        presence_dir,
         proc_locks_path: proc_locks.clone(),
         proc_root: proc_root.clone(),
         agy_bin: "agy".to_string(),
         trusted_agy_exes: vec![trusted_agy.clone()],
     };
-    let agy_store = new_agy_store();
-    let pi_store = new_pi_store();
-    let svc_store = xmsg::svc::new_svc_store();
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    init_db(&conn).unwrap();
-
-    // 1. Initial agy process (pid 7777, start "100")
-    let locks_content_1 = format!(
-        "1: FLOCK ADVISORY WRITE 7777 {:02x}:{:02x}:{} 0 EOF\n",
-        maj, min, ino
-    );
-    fs::write(&proc_locks, &locks_content_1).unwrap();
-    setup_mock_proc(&proc_root, 7777, "100");
-    let pid7777_dir = proc_root.join("7777");
-    let _ = fs::create_dir_all(pid7777_dir.join("fd"));
-    let _ = std::os::unix::fs::symlink(&trusted_agy, pid7777_dir.join("exe"));
-    let _ = std::os::unix::fs::symlink(&lock_file, pid7777_dir.join("fd").join("3"));
-
-    let my_uid = xmsg::agent::current_uid();
-    let reg1 = xmsg::agy::attest_mcp_caller(
-        &proc_root,
-        &proc_locks,
-        &presence_dir,
-        &[trusted_agy.clone()],
-        my_uid,
-        my_uid,
-        7777,
+    let server = start_server_with(
+        sock_dir.join("agent.sock"),
+        sessions_dir,
+        agy_config,
+        tmp.path().join("xmsg.db"),
     )
-    .expect("attest 7777");
-
-    assert_eq!(reg1.1, conv_uuid);
-    assert_eq!(
-        reg1.0.session_key, conv_uuid,
-        "Session key MUST be conversation UUID"
-    );
-    let session_key = reg1.0.session_key.clone();
-
-    let session_info = AgySessionInfo::new(session_key.clone(), 7777, "100".to_string(), None);
-    assert_eq!(session_info.session_key, conv_uuid);
-    assert_eq!(session_info.conversation_id, conv_uuid);
-    assert!(is_uuid_shaped(&session_info.session_key));
-
-    agy_store
-        .write()
-        .unwrap()
-        .insert(session_key.clone(), session_info.clone());
-
-    // Initial caller resolution for 7777
-    let caller1 = xmsg::agent::resolve_caller_session(
-        &proc_root,
-        &[sessions_dir.clone()][..],
-        &agy_config,
-        &agy_store,
-        &pi_store,
-        &svc_store,
-        Some(&conn),
-        7777,
-    )
-    .expect("resolve caller 7777");
-    assert_eq!(caller1.session_id, conv_uuid);
-
-    // A message is received addressed to conversation UUID
-    let msg = xmsg::storage::MessageRecord {
-        id: "msg-before-restart-1".to_string(),
-        created_at: xmsg::storage::now_epoch_secs(),
-        session_id: conv_uuid.to_string(),
-        from_name: "orchestrator".to_string(),
-        bytes: 12,
-        outcome: "queued".to_string(),
-        recipient_harness: "agy".to_string(),
-        return_harness: None,
-        return_session_id: None,
-        push_replies: false,
-        thread_id: "t1".to_string(),
-        return_host: None,
+    .await;
+    let store_entry = |pid: u32| {
+        server
+            .state
+            .agy_store
+            .read()
+            .unwrap()
+            .get(conv_uuid)
+            .filter(|i| i.pid == pid)
+            .cloned()
     };
-    xmsg::storage::insert_message(&conn, &msg).unwrap();
-
-    // 2. Restart agy with NEW PID 8888, start "300", resuming SAME conversation UUID
-    remove_mock_proc(&proc_root, 7777);
-
-    let locks_content_2 = format!(
-        "1: FLOCK ADVISORY WRITE 8888 {:02x}:{:02x}:{} 0 EOF\n",
-        maj, min, ino
-    );
-    fs::write(&proc_locks, &locks_content_2).unwrap();
-    setup_mock_proc(&proc_root, 8888, "300");
-    let pid8888_dir = proc_root.join("8888");
-    let _ = fs::create_dir_all(pid8888_dir.join("fd"));
-    let _ = std::os::unix::fs::symlink(&trusted_agy, pid8888_dir.join("exe"));
-    let _ = std::os::unix::fs::symlink(&lock_file, pid8888_dir.join("fd").join("3"));
-
-    let reg2 = xmsg::agy::attest_mcp_caller(
-        &proc_root,
-        &proc_locks,
-        &presence_dir,
-        &[trusted_agy.clone()],
-        my_uid,
-        my_uid,
-        8888,
-    )
-    .expect("attest 8888");
-
-    assert_eq!(reg2.1, conv_uuid);
-    assert_eq!(
-        reg2.0.session_key, conv_uuid,
-        "Restarted session key MUST be conversation UUID"
-    );
-
-    // Emulate mcp_start store update:
-    {
-        let mut store_lock = agy_store.write().unwrap();
-        store_lock
-            .entry(reg2.0.session_key.clone())
-            .and_modify(|current| {
-                if current.pid != 8888 || current.starttime != "300" {
-                    *current = AgySessionInfo::new(
-                        reg2.0.session_key.clone(),
-                        8888,
-                        "300".to_string(),
-                        None,
-                    );
-                }
-            })
-            .or_insert_with(|| {
-                AgySessionInfo::new(reg2.0.session_key.clone(), 8888, "300".to_string(), None)
-            });
+    async fn wait_for<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
+        for _ in 0..250 {
+            if let Some(v) = f() {
+                return Some(v);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
     }
 
-    // 3. Restarted agy resolves as caller under conversation UUID
-    let caller2 = xmsg::agent::resolve_caller_session(
+    // 1. agy 7777 holds conversation C; its `xmsg mcp` registers through mcp_start.
+    fs::write(&proc_locks, lock_line(7777)).unwrap();
+    setup_mock_agy(&proc_root, 7777, "100", &trusted_agy, &lock_file);
+    let mcp1 = spawn_mcp(&server.agent_sock);
+    setup_mock_proc_with_parent(&proc_root, mcp1.0.id(), 7777, "200");
+    let before = wait_for(|| store_entry(7777))
+        .await
+        .expect("agy 7777 MUST be registered under conversation UUID C");
+    assert_eq!(before.session_key, conv_uuid, "Session key MUST be C");
+    assert_eq!(before.conversation_id, conv_uuid);
+    let addressed: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/v1/sessions/{conv_uuid}", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        addressed["sessionId"], conv_uuid,
+        "agy MUST be addressed as C"
+    );
+
+    // 2. A message addressed to C is received before the restart.
+    {
+        let mut msg = claude_message("msg-before-restart-1", conv_uuid);
+        msg.recipient_harness = "agy".to_string();
+        msg.outcome = "queued".to_string();
+        xmsg::storage::insert_message(&server.state.db.lock().unwrap(), &msg).unwrap();
+    }
+
+    // 3. agy restarts: 7777 exits, 8888 resumes C and holds its lock, and a
+    //    new `xmsg mcp` runs under it. No list runs in between.
+    drop(mcp1);
+    remove_mock_proc(&proc_root, 7777);
+    fs::write(&proc_locks, lock_line(8888)).unwrap();
+    setup_mock_agy(&proc_root, 8888, "300", &trusted_agy, &lock_file);
+    let mcp2 = spawn_mcp(&server.agent_sock);
+    setup_mock_proc_with_parent(&proc_root, mcp2.0.id(), 8888, "400");
+    // Bounded wait for mcp_start; the reply below is the assertion.
+    let _ = wait_for(|| store_entry(8888)).await;
+
+    // 4. The restarted agy replies to the pre-restart message. This test
+    //    process stands in as a process under agy 8888.
+    setup_mock_proc_with_parent(
         &proc_root,
-        &[sessions_dir.clone()][..],
-        &agy_config,
-        &agy_store,
-        &pi_store,
-        &svc_store,
-        Some(&conn),
+        std::process::id(),
         8888,
+        &live_self_proc_start(),
+    );
+    let reply = agent_request(
+        &server.agent_sock,
+        serde_json::json!({"action": "reply", "messageId": "msg-before-restart-1", "text": "reply after restart"}),
     )
-    .expect("resolve restarted caller 8888");
-
+    .await;
+    drop(mcp2);
+    server.stop().await;
     assert_eq!(
-        caller2.session_id, conv_uuid,
-        "Restarted agy must resolve caller session_id to conversation UUID"
+        reply["status"], "ok",
+        "restarted agy (new pid, same C) MUST reply to a message received before the restart: {reply}"
     );
-
-    // 4. Restarted agy replies to the message received before restart:
-    assert_eq!(
-        caller2.session_id, msg.session_id,
-        "Restarted agy must match recipient of message received before restart"
-    );
-    assert_eq!(caller2.harness, msg.recipient_harness);
 }
 
 // =============================================================================

@@ -286,64 +286,6 @@ pub fn list_sessions(
     sessions
 }
 
-/// Resolves a session reference (session_id, pid, or name) across all configured session directories
-/// to a live Session and messaging socket path.
-pub fn resolve_session(
-    sessions_dirs: &(impl SessionDirs + ?Sized),
-    ref_str: &str,
-) -> Result<(Session, PathBuf), AppError> {
-    let entries = read_session_entries(sessions_dirs);
-
-    // Candidates matching ref_str by session_id, pid, or name
-    let ref_lower = ref_str.to_ascii_lowercase();
-    let ref_pid: Option<u32> = ref_str.parse().ok();
-
-    let matching_candidates: Vec<SessionFileEntry> = entries
-        .into_iter()
-        .filter(|e| {
-            if e.session_id.to_ascii_lowercase() == ref_lower {
-                return true;
-            }
-            if let Some(pid) = ref_pid {
-                if e.pid == pid {
-                    return true;
-                }
-            }
-            if let Some(ref name) = e.name {
-                if name == ref_str {
-                    return true;
-                }
-            }
-            false
-        })
-        .collect();
-
-    if matching_candidates.is_empty() {
-        return Err(AppError::NotFound(ref_str.to_string()));
-    }
-
-    // Check liveness of candidates
-    let mut live_candidates = Vec::new();
-    let mut last_dead: Option<(String, u32)> = None;
-
-    for candidate in matching_candidates {
-        if is_pid_live(candidate.pid, &candidate.proc_start) {
-            live_candidates.push(candidate);
-        } else {
-            last_dead = Some((candidate.session_id, candidate.pid));
-        }
-    }
-
-    if live_candidates.is_empty() {
-        let (session_id, pid) = last_dead.unwrap();
-        return Err(AppError::Gone { session_id, pid });
-    }
-
-    let resolved = live_candidates.into_iter().next().unwrap();
-    let socket_path = PathBuf::from(&resolved.messaging_socket_path);
-    Ok((resolved.into(), socket_path))
-}
-
 /// Walks ancestor process parent PIDs up to PID 1,
 /// searching for the first ancestor that has an active session file in any directory in `sessions_dirs`.
 pub fn find_ancestor_session_in_dirs(

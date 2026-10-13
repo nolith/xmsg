@@ -255,8 +255,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             proc_start1 TEXT NOT NULL,
             pid2 INTEGER NOT NULL,
             proc_start2 TEXT NOT NULL,
+            recipient_pid INTEGER NOT NULL,
+            recipient_proc_start TEXT NOT NULL,
             created_at INTEGER NOT NULL,
-            PRIMARY KEY (id, pid1, proc_start1, pid2, proc_start2)
+            PRIMARY KEY (id, pid1, proc_start1, pid2, proc_start2, recipient_pid, recipient_proc_start)
         );
         "#,
     )?;

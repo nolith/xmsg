@@ -132,13 +132,13 @@ impl ResolvedTarget {
     }
 }
 
-pub(crate) fn resolve_target(
+pub(crate) async fn resolve_target(
     sessions_dirs: &[PathBuf],
     agy_config: &crate::agy::AgyConfig,
     agy_store: &crate::agy::AgyStore,
     pi_store: &crate::pi::PiStore,
     svc_store: &crate::svc::SvcStore,
-    conn: Option<&rusqlite::Connection>,
+    db: &std::sync::Mutex<rusqlite::Connection>,
     host_label: &str,
     ref_str: &str,
 ) -> Result<ResolvedTarget, AppError> {
@@ -147,16 +147,14 @@ pub(crate) fn resolve_target(
         .or_else(|| ref_str.strip_prefix("session:"))
         .unwrap_or(ref_str);
 
-    let claude_res = match conn {
-        Some(c) => crate::claim::resolve_claude_session(
-            c,
-            &agy_config.proc_root,
-            sessions_dirs,
-            host_label,
-            claude_ref,
-        ),
-        None => registry::resolve_session(sessions_dirs, claude_ref),
-    };
+    let claude_res = crate::claim::resolve_claude_session_and_deliver(
+        db,
+        &agy_config.proc_root,
+        sessions_dirs,
+        host_label,
+        claude_ref,
+    )
+    .await;
 
     match claude_res {
         Ok((session, socket_path)) => Ok(ResolvedTarget::Claude(session, socket_path)),
@@ -210,24 +208,21 @@ pub(crate) fn resolve_target(
     }
 }
 
-pub(crate) fn resolve_target_session(
+pub(crate) async fn resolve_target_session(
     state: &AppState,
     ref_str: &str,
 ) -> Result<ResolvedTarget, AppError> {
-    let db = state
-        .db
-        .lock()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
     resolve_target(
         &state.sessions_dirs,
         &state.agy_config,
         &state.agy_store,
         &state.pi_store,
         &state.svc_store,
-        Some(&db),
+        &state.db,
         &state.host_label,
         ref_str,
     )
+    .await
 }
 
 async fn list_sessions_handler(
@@ -287,7 +282,7 @@ async fn get_session_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(ref_str): AxumPath<String>,
 ) -> Result<Response, AppError> {
-    let target = resolve_target_session(&state, &ref_str)?;
+    let target = resolve_target_session(&state, &ref_str).await?;
     let session = match target {
         ResolvedTarget::Claude(s, _) => s,
         ResolvedTarget::Agy(s) => {
@@ -529,13 +524,15 @@ async fn send_message_handler(
     }
 
     // Resolve target session
-    let target = resolve_target_session(&state, &ref_str).map_err(|err| {
-        eprintln!(
-            "req_id={} ref={} from=\"{}\" bytes={} outcome=resolve_error detail=\"{}\"",
-            req_id, ref_str, from_name, body_len, err
-        );
-        err
-    })?;
+    let target = resolve_target_session(&state, &ref_str)
+        .await
+        .map_err(|err| {
+            eprintln!(
+                "req_id={} ref={} from=\"{}\" bytes={} outcome=resolve_error detail=\"{}\"",
+                req_id, ref_str, from_name, body_len, err
+            );
+            err
+        })?;
 
     // Generate ULID message ID
     let message_id = ulid::Ulid::new().to_string();

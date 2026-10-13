@@ -495,8 +495,3 @@ async fn test_oracle_3_duplicate_session_across_dirs_assigned_suffixes_and_route
         );
     }
 }
-
-#[test]
-fn test_oracle_3_duplicate_session_across_dirs_excluded_fail_closed() {
-    test_oracle_3_duplicate_session_across_dirs_assigned_suffixes_and_routed();
-}

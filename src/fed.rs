@@ -1950,7 +1950,7 @@ async fn fed_send_message_handler(
         (&peer.name, &envelope.principal)
     };
 
-    let target = match resolve_target_session_fed(&fed_state, target_ref) {
+    let target = match resolve_target_session_fed(&fed_state, target_ref).await {
         Ok(t) => {
             if let Some(ref allowed_targets) = peer_cfg.targets {
                 if !target_matches_allowlist(&t, allowed_targets) {
@@ -2255,7 +2255,7 @@ pub async fn deliver_federated_reply_locally(
         "claude" => {
             match crate::claim::resolve_claude_session_and_deliver(
                 &fed_state.db,
-                std::path::Path::new(crate::process::LIVE_PROC_ROOT),
+                &fed_state.agy_config.proc_root,
                 &fed_state.sessions_dir,
                 &fed_state.host_label,
                 ret_session_id,
@@ -3012,24 +3012,21 @@ pub fn queue_leaf_mailbox_message(
     })
 }
 
-fn resolve_target_session_fed(
+async fn resolve_target_session_fed(
     fed_state: &FedState,
     ref_str: &str,
 ) -> Result<crate::http::ResolvedTarget, AppError> {
-    let db = fed_state
-        .db
-        .lock()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
     crate::http::resolve_target(
         std::slice::from_ref(&fed_state.sessions_dir),
         &fed_state.agy_config,
         &fed_state.agy_store,
         &fed_state.pi_store,
         &fed_state.svc_store,
-        Some(&db),
+        &fed_state.db,
         &fed_state.host_label,
         ref_str,
     )
+    .await
 }
 
 // -----------------------------------------------------------------------------
@@ -3806,7 +3803,7 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
                     _ => format!("xmsg@{peer_name}"),
                 };
 
-                let resolved = resolve_target_session_fed(&fed_state, target_ref);
+                let resolved = resolve_target_session_fed(&fed_state, target_ref).await;
 
                 match resolved {
                     Ok(target) => {
