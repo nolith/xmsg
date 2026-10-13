@@ -1,5 +1,5 @@
 # homeManagerModules.xmsg: the `xmsg serve` user service and the per-harness pieces
-# (MCP entry, skill, agy hook, pi extension).
+# (MCP entry, skill, agy hook, pi extension, opencode plugin).
 #
 # `packages` is this flake's `packages` output, the default for `programs.xmsg.package`.
 { packages }:
@@ -257,6 +257,7 @@ in
       claude.enable = mkEnableOption "the xmsg MCP server, skill and tool permissions in Claude Code (`programs.claude-code`)";
       agy.enable = mkEnableOption "the xmsg MCP server, skill and PreInvocation hook in Antigravity (`programs.antigravity-cli`); the module owns `~/.gemini/config/hooks.json`";
       pi.enable = mkEnableOption "the xmsg pi extension and skill (`~/.pi/agent`)";
+      opencode.enable = mkEnableOption "the xmsg opencode plugin and skill (`$XDG_CONFIG_HOME/opencode`); no MCP entry and no `opencode.json`";
     };
   };
 
@@ -377,6 +378,14 @@ in
     (mkIf cfg.harnesses.pi.enable {
       home.file.".pi/agent/extensions/xmsg-pi.ts".source = ../../extensions/pi/index.ts;
       home.file.".pi/agent/skills/xmsg/SKILL.md".source = skill + "/SKILL.md";
+    })
+
+    # opencode auto-loads {plugin,plugins}/*.ts from its config dir. Files, not
+    # `programs.opencode`: that module applies only when enabled and has no plugin option, so
+    # these compose with any opencode configuration and need no harness module (harness C9).
+    (mkIf cfg.harnesses.opencode.enable {
+      xdg.configFile."opencode/plugin/xmsg.ts".source = ../../extensions/opencode/xmsg.ts;
+      xdg.configFile."opencode/skills/xmsg/SKILL.md".source = skill + "/SKILL.md";
     })
   ]);
 }

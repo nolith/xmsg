@@ -47,6 +47,7 @@ let
                   claude.enable = true;
                   agy.enable = true;
                   pi.enable = true;
+                  opencode.enable = true;
                 };
                 server = {
                   httpSocket = "/run/user/1000/xmsg/http.sock";
@@ -217,6 +218,23 @@ in
         skill = builtins.readFile ../../nix/modules/skills/xmsg/SKILL.md;
       };
     };
+    # XH2 oracle 12: the opencode switch writes the plugin and the skill, and no opencode.json;
+    # `programs.opencode` stays off.
+    test-opencode = {
+      expr = {
+        plugin = builtins.readFile linux.xdg.configFile."opencode/plugin/xmsg.ts".source;
+        skill = builtins.readFile linux.xdg.configFile."opencode/skills/xmsg/SKILL.md".source;
+        opencodeJson = linux.xdg.configFile ? "opencode/opencode.json";
+        programsOpencode = linux.programs.opencode.enable;
+      };
+      expected = {
+        plugin = builtins.readFile ../../extensions/opencode/xmsg.ts;
+        skill = builtins.readFile ../../nix/modules/skills/xmsg/SKILL.md;
+        opencodeJson = false;
+        programsOpencode = false;
+      };
+    };
+
     # Oracle 7: the installed skill teaches A13's four tools, A12's labels and the error
     # vocabulary, and the http.sock limits (A15, HA2); nothing of the retired surface or of an
     # owner's hosts. `builtins.split` searches without a `.*` regex over the file.

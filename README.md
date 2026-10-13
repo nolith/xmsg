@@ -124,6 +124,38 @@ Used by non-Claude harnesses for registration and polling, and by services:
 - **Antigravity Registration:** `xmsg register agy` sends session credentials (`conversation_id`, `ls_address`, `csrf_token`) over this socket to enable outbound HTTP message injection into Antigravity.
 - **Pi Registration & Polling:** The Pi extension registers its process and enters an event-driven long-poll loop to receive inbound messages (`poll`, `ack`).
 - **Services:** a registration's `ok` frame is `{"status":"ok","address":"<name>@<node>","node":"<node>"}`. A service then uses `poll`, `ack` and `reply` here; it runs `list`, `send` and `replies` over `agent.sock`. `register.sock` carries registration, `poll`, `ack` and `reply` only, and its frames refuse unknown fields too.
+- **Plugin harnesses (opencode):** see 2.3.1.
+
+#### 2.3.1 Plugin registration: many sessions on one connection
+
+A plugin harness (opencode) runs many sessions in one process, so its plugin holds **one** `register.sock`
+connection and registers each session on it; each gets its own server-minted address (A18, HA4). The plugin's
+tools travel on the same connection, as frames naming the session they act as, so a call is attributed to that
+session's address and to no other.
+
+The connection opens with `{"harness":"opencode"}`, answered `{"status":"ok","node":"<node>"}`. Every later frame
+carries a `request_id` of the plugin's choosing, and its answer carries it back: answers to tool frames and the
+delivery that ends a pending `poll` arrive on one connection, in whatever order they are ready, and **a tool frame
+is answered while a `poll` is pending**. Every frame refuses unknown fields (`bad_request`, naming them).
+
+| frame                                                         | answer                                                                                                                                                                                                  |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `{"action":"register","session":S}`                           | `{"status":"ok","address":"<id>@<node>"}`, a fresh address; `conflict` if S is already registered on this connection                                                                                    |
+| `{"action":"release","session":S}`                            | `{"status":"ok"}`; S's address answers `gone` from then on                                                                                                                                              |
+| `{"action":"continues","from":S1,"to":S2}`                    | `{"status":"ok","address":…}`: S1's address now belongs to S2 (A19); `conflict` if S2 is registered on this connection                                                                                  |
+| `{"action":"list"\|"send"\|"reply"\|"replies","session":S,…}` | `agent.sock`'s frames and answers (2.2) field for field, acting as S                                                                                                                                    |
+| `{"action":"poll","wait":N}`                                  | `{"action":"deliver","session":S,"address":"<id>@<node>","message_id":…,"from_name":…,"text":…,"envelope":…}` for any session on the connection, or `{"action":"timeout"}` after N seconds (at most 60) |
+| `{"action":"ack","session":S,"message_id":M}`                 | `{"status":"ok"}` once the harness accepted M; an unacked message is offered again                                                                                                                      |
+
+One `poll` is pending per connection at a time, and a second is refused `conflict`, so a message is never handed
+to two polls.
+
+A frame naming a session this connection does not hold, `continues` included, is refused `denied`: only the
+connection that registered a session can speak for it or move its address. A released session's address, and
+every address of a connection that closes (whether or not the process lives on), answers `gone` and is never
+queued for (AM-9); a plugin that reconnects registers again and gets new addresses. A plugin process maps to no
+address, so any other caller in it or under it (a shell tool's `curl` to `http.sock`, an `xmsg mcp` child) is
+anonymous (A15, HA2).
 
 ### 2.4 Replies: stored always, pushed by sender kind (A10)
 
@@ -191,6 +223,27 @@ TypeScript extension for Pi (`@earendil-works/pi-coding-agent`):
   - **`list`:** Queries active sessions over `$XDG_RUNTIME_DIR/xmsg/http.sock` via Unix domain socket (or `XMSG_URL` when explicitly configured as an override).
   - **`send`:** Sends messages over `agent.sock` to ensure kernel attestation of peer PID and return address.
   - **`reply`:** Sends replies over `agent.sock`.
+
+### 3.2.1 opencode plugin: `extensions/opencode/xmsg.ts`
+
+opencode loads `<config>/opencode/plugin/xmsg.ts` on start. The plugin holds one `register.sock` connection per
+opencode process (2.3.1):
+
+- **Registration.** A session registers at its first `chat.message`, so a session started in this process, or
+  resumed with `-s`, gets an address once it is used, and the many stored sessions an opencode server can reach do
+  not. Registration finishes before the turn's first tool call is answered.
+- **Tools.** `xmsg_list`, `xmsg_send`, `xmsg_reply` and `xmsg_replies`, sent as frames under the calling session
+  (`ToolContext.sessionID`). The arguments are all required: `xmsg_replies` takes `wait` (0 for none), and
+  `xmsg_list` has no filters.
+- **Child sessions** (a `task` subagent) act as their root conversation: the plugin walks `parentID` to the root
+  and calls under the root's session. A child is never registered (HA7).
+- **Push.** A delivered message goes into its session with `promptAsync`, which starts the session if it is idle;
+  in a running turn, opencode takes it as it takes any mid-turn prompt. The plugin acks only after `promptAsync`
+  accepted it.
+- **Release.** Deleting a session releases its address. Switching sessions in the TUI does not: the opencode server
+  can still deliver to every session it registered.
+
+There is no MCP entry for opencode: the plugin's tools are the attested path.
 
 ### 3.3 Antigravity Integration: Automatic Registration & Hooks
 
@@ -420,7 +473,7 @@ A federated send arriving at this node takes steps 1 to 3 and answers `gone` or 
 ### Delivery and the queue (A14)
 
 - **Outcomes.** A send returns `delivered` (it reached a live recipient) or `queued` (it is held for an instance that is not running).
-- **What queues.** A send to an instance ID this node has observed, while it is not running: a closed Claude conversation, or an agy conversation between turns. "Observed" is the claim table (a Claude process presenting the ID) plus agy registrations. A pi ID and an exited `X~n` are `gone` and never queue.
+- **What queues.** A send to an instance ID this node has observed, while it is not running: a closed Claude conversation, or an agy conversation between turns. "Observed" is the claim table (a Claude process presenting the ID) plus agy registrations. A pi ID, a released or closed plugin session's address (opencode) and an exited `X~n` are `gone`, never queue and are never listed `parked`.
 - **How long.** A message is held for the reply TTL (`--reply-ttl`, 7 days by default) and dropped unread after it. The ID stays parked, so sends to it queue, for the reply TTL after the conversation was last live, or as long as its queue holds a message, whichever is longer; after that it is `not_found` (D-1's lifetime). Discovery is on demand, so for Claude "last live" is the scan that found the conversation gone, and for agy its last registration.
 - **Delivery.** The queue drains when the conversation is next observed: a new Claude process presenting the ID (the next scan of the session files, which every `list`, `send` and MCP start runs), or an agy registration. Each message is delivered once, in the order sent, and shows when it was sent: `[xmsg] message_id=<id> sent=<RFC 3339 UTC time>`. Its outcome then reads `delivered`.
 - **Across nodes.** The queue is this node's; a send through another node and a queue that follows a conversation to another node are XA7's.
@@ -823,6 +876,7 @@ option, so it composes with the rest of your configuration:
 - `programs.xmsg.harnesses.claude.enable`: the `xmsg mcp` server in `programs.claude-code.mcpServers`, the `xmsg`
   skill in `programs.claude-code.skills`, and `mcp__xmsg__list`, `mcp__xmsg__send`, `mcp__xmsg__reply` and
   `mcp__xmsg__replies` in `programs.claude-code.settings.permissions.allow`. Needs `programs.claude-code.enable`.
+
 - `programs.xmsg.harnesses.agy.enable`: the server in `programs.antigravity-cli.mcpServers`, the skill in
   `programs.antigravity-cli.skills`, and the PreInvocation hook `xmsg register agy --hook` (Section 3.3).
   Needs `programs.antigravity-cli.enable`. **Cost:** `programs.antigravity-cli` has no hook option, so the module
@@ -830,13 +884,23 @@ option, so it composes with the rest of your configuration:
   the hook command the module renders: a fake agy (a process holding a conversation's presence lock, as agy does)
   runs it for its turn against a real `xmsg serve` of the same revision, and the conversation registers and is
   listed under its own ID.
+
 - `programs.xmsg.harnesses.pi.enable`: the extension (`extensions/pi/index.ts`) as
   `~/.pi/agent/extensions/xmsg-pi.ts`, and the skill as `~/.pi/agent/skills/xmsg/SKILL.md`. pi loads everything
   under `~/.pi/agent/extensions` whether or not `settings.json` lists `extensions`: plain entries there add to the
   directory, and only a `!` or `-` pattern that matches `xmsg-pi.ts` disables it.
 
+- `programs.xmsg.harnesses.opencode.enable`: the plugin (`extensions/opencode/xmsg.ts`) as
+  `$XDG_CONFIG_HOME/opencode/plugin/xmsg.ts`, which opencode loads on start, and the skill as
+  `opencode/skills/xmsg/SKILL.md`. No MCP entry, and no `opencode.json`: `programs.opencode` applies its
+  configuration only when enabled and has no plugin option, so the switch writes the files and composes with any
+  opencode configuration. **Cost:** a `programs.opencode.skills` set to a directory owns the whole
+  `opencode/skills`, which conflicts with this file. CI starts the real opencode with the rendered plugin against a
+  real `xmsg serve` and a mock model, and checks registration, attribution for two sessions and a child session,
+  push, and release on delete.
+
 A Claude or agy switch whose harness module is off fails evaluation, naming the option it needs, rather than
-installing nothing.
+installing nothing. The pi and opencode switches write files and need no harness module.
 
 The skill (`nix/modules/skills/xmsg/SKILL.md`, the same file for every harness) teaches the four tools (`list`,
 `send`, `reply`, `replies`), addresses and sender labels (`label · id[~n]@node`, `name@node`,

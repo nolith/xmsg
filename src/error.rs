@@ -124,6 +124,8 @@ impl AppError {
             AppError::NotFound(r) => format!("no live recipient matches '{r}'"),
             AppError::UnknownPeer(n) => format!("unknown node '{n}'"),
             AppError::Unregistered(pid) => format!("process {pid} has no attested agent session"),
+            // pid 0: no process is known, as for a released plugin address or a peer's `gone`.
+            AppError::Gone { session_id, pid: 0 } => format!("session {session_id} is gone"),
             AppError::Gone { session_id, pid } => {
                 format!("session {session_id} process {pid} exited")
             }

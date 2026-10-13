@@ -9,6 +9,7 @@ pub mod inbox;
 pub mod mcp;
 pub mod node;
 pub mod pi;
+pub mod plugin;
 pub mod process;
 pub mod registry;
 pub mod storage;

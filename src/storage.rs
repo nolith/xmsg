@@ -361,6 +361,8 @@ const SCHEMA_N: &str = r#"
 /// at N in one transaction; one above N is refused.
 pub fn init_db(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    // Plugin registrations end with this connection, so their tables are not schema N's.
+    conn.execute_batch(crate::plugin::SCHEMA)?;
     if version == SCHEMA_VERSION {
         return conn.execute_batch(SCHEMA_N);
     }
@@ -1171,19 +1173,26 @@ pub fn seen_instance(
 }
 
 /// The instances that may be parked here at `now` (A14, D-1): observed before, not a pi
-/// (AM-9), and within their parked lifetime: `ttl_secs` after last live, or as long as
-/// their queue. The caller leaves out the ones live now.
+/// or a plugin session (AM-9: both are bound to their process or registration), and
+/// within their parked lifetime: `ttl_secs` after last live, or as long as their queue.
+/// The caller leaves out the ones live now.
 pub fn parked_instances(conn: &Connection, now: i64, ttl_secs: i64) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT id FROM instance_seen s WHERE harness != 'pi' AND (last_live + ?2 > ?1 \
+        "SELECT id, harness FROM instance_seen s WHERE harness != 'pi' AND (last_live + ?2 > ?1 \
          OR EXISTS (SELECT 1 FROM instance_queue q WHERE q.instance_id = s.id AND q.delivered_at IS NULL AND q.expires_at > ?1) \
          OR EXISTS (SELECT 1 FROM agy_pending_messages a WHERE a.session_id = s.id AND a.delivered_at IS NULL AND a.created_at >= ?1 - ?2)) \
          ORDER BY id",
     )?;
-    let ids = stmt
-        .query_map(params![now, ttl_secs], |r| r.get::<_, String>(0))?
+    let rows = stmt
+        .query_map(params![now, ttl_secs], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
         .collect::<Result<Vec<_>>>()?;
-    Ok(ids)
+    Ok(rows
+        .into_iter()
+        .filter(|(_, harness)| crate::plugin::harness(harness).is_none())
+        .map(|(id, _)| id)
+        .collect())
 }
 
 /// `secs` since the epoch as an RFC 3339 UTC time, `2026-10-12T08:30:00Z`.

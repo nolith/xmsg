@@ -127,6 +127,8 @@ async fn healthz_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
 pub(crate) enum ResolvedTarget {
     Claude(registry::Session, PathBuf),
     Agy(registry::Session),
+    /// A session served from a `register.sock` poll queue: a pi, or a plugin session
+    /// (opencode), whose `harness` names which.
     Pi(registry::Session),
     Svc(registry::Session),
     /// A Claude instance observed before and not running now: a send is queued until
@@ -211,7 +213,11 @@ pub(crate) async fn resolve_target(
     {
         return Ok(ResolvedTarget::Agy(session));
     }
-    let pi_sessions = crate::pi::list_pi_sessions(proc_root, pi_store, &query);
+    let mut pi_sessions = crate::pi::list_pi_sessions(proc_root, pi_store, &query);
+    pi_sessions.extend(
+        crate::plugin::sessions(&*db.lock().map_err(|e| AppError::Internal(e.to_string()))?)
+            .map_err(|e| AppError::Internal(e.to_string()))?,
+    );
     if let Some(session) = pi_sessions.iter().find(|s| is(&s.session_id)) {
         return Ok(ResolvedTarget::Pi(session.clone()));
     }
@@ -266,8 +272,9 @@ pub(crate) async fn resolve_target(
         };
         return match seen.harness.as_str() {
             _ if !parked => Err(AppError::NotFound(ref_str.to_string())),
-            // A pi ID is bound to its process: never queued (AM-9, AM-10).
-            "pi" => Err(AppError::Gone {
+            // A pi ID is bound to its process, and a plugin session's address to its
+            // registration: never queued (AM-9, AM-10, harness gate v0 C3).
+            h if h == "pi" || crate::plugin::harness(h).is_some() => Err(AppError::Gone {
                 session_id: ref_str.to_string(),
                 pid: 0,
             }),

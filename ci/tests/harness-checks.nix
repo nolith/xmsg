@@ -6,6 +6,9 @@
 #   addressed as C. Only Arm A is tested: here /proc/locks and the children file are readable,
 #   so the hook registers C itself. B′ (non-Linux, or no children file: the hook answers with an
 #   inject step) has no sandbox oracle.
+# - `opencode-plugin` (XH2 oracles 8-11, release, restart): the real opencode, with the plugin file the module
+#   renders, against a real `xmsg serve` and a mock model on loopback
+#   (extensions/opencode/check.py).
 # - `pi-extension`, `pi-paths`: the pi extension's own node tests (extensions/pi). The
 #   extension's darwin `getconf DARWIN_USER_TEMP_DIR` fallback is not covered by CI.
 { inputs, ... }:
@@ -59,6 +62,26 @@
         exec env -u ANTIGRAVITY_LS_ADDRESS -u ANTIGRAVITY_CSRF_TOKEN sleep 120
       '';
 
+      opencodePlugin =
+        (home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            xmsg.homeManagerModules.xmsg
+            {
+              home = {
+                username = "alice";
+                homeDirectory = "/home/alice";
+                stateVersion = "25.11";
+                enableNixpkgsReleaseCheck = false;
+              };
+              programs.xmsg = {
+                enable = true;
+                harnesses.opencode.enable = true;
+              };
+            }
+          ];
+        }).config.xdg.configFile."opencode/plugin/xmsg.ts".source;
+
       nodeCheck =
         name: script:
         pkgs.runCommand "xmsg-${name}"
@@ -79,6 +102,13 @@
       checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
         pi-extension = nodeCheck "pi-extension" "test.mjs";
         pi-paths = nodeCheck "pi-paths" "test-paths.mjs";
+
+        opencode-plugin =
+          pkgs.runCommand "xmsg-opencode-plugin" { nativeBuildInputs = [ pkgs.python3 ]; }
+            ''
+              python3 ${../../extensions/opencode/check.py} ${lib.getExe xmsgPkg} ${lib.getExe pkgs.opencode} ${opencodePlugin}
+              touch $out
+            '';
 
         agy-hook =
           pkgs.runCommand "xmsg-agy-hook"

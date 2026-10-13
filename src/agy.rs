@@ -1632,6 +1632,36 @@ pub async fn run_register_server(
                             }
                         }
                     }
+                    Ok(ref v)
+                        if v.get("harness")
+                            .and_then(|h| h.as_str())
+                            .and_then(crate::plugin::harness)
+                            .is_some() =>
+                    {
+                        match serde_json::from_value::<crate::plugin::PluginHello>(v.clone()) {
+                            Ok(hello) => {
+                                let harness = crate::plugin::harness(&hello.harness)
+                                    .expect("matched a plugin harness");
+                                if let Err(e) = crate::plugin::handle_plugin_connection(
+                                    buf_reader,
+                                    writer,
+                                    state_clone,
+                                    harness,
+                                    my_uid,
+                                    peer_uid,
+                                    peer_pid,
+                                )
+                                .await
+                                {
+                                    tracing::warn!("plugin connection ended with error: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                let err = crate::error::AppError::BadRequest(e.to_string()).frame();
+                                let _ = writer.write_all(format!("{err}\n").as_bytes()).await;
+                            }
+                        }
+                    }
                     Ok(ref v) if v.get("harness").and_then(|h| h.as_str()) == Some("svc") => {
                         match serde_json::from_value::<crate::svc::SvcRegisterRequest>(v.clone()) {
                             Ok(req) => {

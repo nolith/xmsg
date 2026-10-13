@@ -158,6 +158,18 @@ pub fn resolve_caller_session(
     let mut curr_pid = peer_pid;
 
     for _ in 0..32 {
+        // 0. A plugin process holds its addresses per session, so it maps to none: a caller
+        // reaching it is anonymous (HA2, harness gate v0 C2).
+        if let (Some(c), Ok(st)) = (conn, crate::process::starttime(proc_root, curr_pid)) {
+            if crate::plugin::is_plugin_process(c, curr_pid, &st)
+                .map_err(|e| AppError::Internal(e.to_string()))?
+            {
+                return Err(AppError::NotRecipient(format!(
+                    "peer PID {peer_pid} reaches plugin process {curr_pid}, whose addresses are per session"
+                )));
+            }
+        }
+
         // 1. Check Claude sessions
         let claude_sessions = registry::read_session_entries(sessions_dirs);
         for entry in claude_sessions {

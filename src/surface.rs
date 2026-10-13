@@ -370,8 +370,9 @@ pub async fn list(state: &AppState, query: &ListQuery) -> Result<ListResult, App
 }
 
 /// This node's recipients for `user`'s listing (A4, A-12, A16): live Claude, agy and pi
-/// instances, registered services, and the instances parked here (A14): observed, not
-/// running now, and within their parked lifetime. A pi is never parked (AM-9).
+/// instances, plugin sessions (opencode), registered services, and the instances parked
+/// here (A14): observed, not running now, and within their parked lifetime. A pi or a
+/// plugin session is never parked (AM-9).
 pub(crate) async fn listing(
     local: &Local<'_>,
     reply_ttl: Duration,
@@ -394,6 +395,11 @@ pub(crate) async fn listing(
     }
     let proc_root = &local.agy_config.proc_root;
     for s in crate::pi::list_pi_sessions(proc_root, local.pi_store, &query) {
+        out.push(entry(&s.session_id, false, s.name, "live", user));
+    }
+    let plugin_sessions =
+        crate::plugin::sessions(&*local.db.lock().map_err(db_err)?).map_err(db_err)?;
+    for s in plugin_sessions {
         out.push(entry(&s.session_id, false, s.name, "live", user));
     }
     for s in crate::svc::list_svc_sessions(proc_root, local.svc_store, &query) {
@@ -523,7 +529,8 @@ pub(crate) async fn deliver(
                 }
             }
             let _ = local.pi_notify_tx.send(session.session_id.clone());
-            Ok((session.session_id.clone(), "pi", "delivered"))
+            let harness = crate::plugin::harness(&session.harness).unwrap_or("pi");
+            Ok((session.session_id.clone(), harness, "delivered"))
         }
         ResolvedTarget::Svc(session) => {
             let svc_msg = storage::SvcPendingMessage {
@@ -642,12 +649,21 @@ pub async fn push_reply(
                 Err(_) => "push_failed",
             }
         }
-        "pi" => {
-            match crate::pi::resolve_pi_session(
-                &local.agy_config.proc_root,
-                local.pi_store,
-                ret_session_id,
-            ) {
+        h if h == "pi" || crate::plugin::harness(h).is_some() => {
+            let found = if ret_harness == "pi" {
+                crate::pi::resolve_pi_session(
+                    &local.agy_config.proc_root,
+                    local.pi_store,
+                    ret_session_id,
+                )
+            } else {
+                local
+                    .db
+                    .lock()
+                    .map_err(db_err)
+                    .and_then(|c| crate::plugin::session(&c, ret_session_id).map_err(db_err))
+            };
+            match found {
                 Ok(Some(session)) => {
                     let pi_msg = storage::PiPendingMessage {
                         id: reply_id.to_string(),

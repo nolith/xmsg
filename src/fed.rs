@@ -2248,7 +2248,7 @@ async fn fed_send_message_handler(
             (s.session_id.clone(), "claude".to_string())
         }
         crate::http::ResolvedTarget::Agy(s) => (s.session_id.clone(), "agy".to_string()),
-        crate::http::ResolvedTarget::Pi(s) => (s.session_id.clone(), "pi".to_string()),
+        crate::http::ResolvedTarget::Pi(s) => (s.session_id.clone(), s.harness.clone()),
         crate::http::ResolvedTarget::Svc(s) => (s.session_id.clone(), "svc".to_string()),
     };
 
