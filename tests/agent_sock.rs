@@ -67,6 +67,44 @@ fn test_ensure_secure_socket_dir_permissions_and_ownership() {
     }
 }
 
+/// Concurrent socket servers create the socket dir at startup: every caller must see 0700,
+/// never the umask-mode window between creation and chmod (OCI Image run 38359268103).
+#[test]
+fn test_ensure_secure_socket_dir_concurrent_create() {
+    const THREADS: usize = 16;
+    const ITERATIONS: usize = 5000;
+    // SAFETY: umask is process-wide and has no failure mode; 022 is the CI default.
+    unsafe { libc::umask(0o022) };
+    let tmp = tempdir().unwrap();
+    let my_uid = current_uid();
+    let mut failures = Vec::new();
+    for i in 0..ITERATIONS {
+        let dir = tmp.path().join(format!("run{i}")).join("xmsg");
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (dir, barrier) = (dir.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_secure_socket_dir(&dir, my_uid)
+                })
+            })
+            .collect();
+        for h in handles {
+            if let Err(e) = h.join().unwrap() {
+                failures.push(format!("iteration {i}: {e:?}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} calls failed; first: {}",
+        failures.len(),
+        THREADS * ITERATIONS,
+        failures[0]
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn test_missing_xdg_runtime_dir_returns_error() {

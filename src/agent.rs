@@ -57,17 +57,21 @@ pub fn current_uid() -> u32 {
     }
 }
 
+/// Creates `dir` and any missing parents at mode 0700 in the `mkdir` call itself, so no
+/// concurrent caller can observe it at the umask mode; an existing directory is left as is.
+pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
 pub fn ensure_secure_socket_dir(dir: &Path, expected_uid: u32) -> Result<(), AppError> {
     if !dir.exists() {
-        fs::create_dir_all(dir).map_err(|e| {
+        create_private_dir(dir).map_err(|e| {
             AppError::InsecureSocketDir(format!(
                 "failed to create directory {}: {e}",
-                dir.display()
-            ))
-        })?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
-            AppError::InsecureSocketDir(format!(
-                "failed to set permissions on {}: {e}",
                 dir.display()
             ))
         })?;

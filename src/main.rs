@@ -558,7 +558,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let db_path = resolve_db_path(args.db_path);
 
     if let Some(parent) = db_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = xmsg::agent::create_private_dir(parent);
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
