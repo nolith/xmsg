@@ -864,3 +864,87 @@ async fn test_oracle_5_unknown_ref_acked_and_error_reply() {
         "Hub mailbox for client should be acked and empty"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Oracle 6: an ack that lands while the dial-out client is still delivering
+// The client's database acks a service's message the moment it is queued (a trigger on
+// `svc_pending_messages` doing what `storage::ack_svc_message` does), so the ack lands
+// before `deliver` returns. The client's record still ends `delivered`.
+// Mutant in src/fed.rs run_outbound_peer_pull_loop: write the record only after
+// delivery => RED (the ack finds no row, and the record reads `queued` forever).
+// -----------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_6_an_ack_during_delivery_is_kept() {
+    let (cert_hub, key_hub, pin_hub) = generate_self_signed_ed25519_pem("hub").unwrap();
+    let (cert_client, key_client, pin_client) = generate_self_signed_ed25519_pem("client").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let (hub, hub_port) = spawn_hub_node("hub", &cert_hub, &key_hub, "client", &pin_client).await;
+    let client = spawn_client_node(
+        "client",
+        &cert_client,
+        &key_client,
+        "hub",
+        hub_port,
+        &pin_hub,
+        Some(format!("guard={}", current_exe.display())),
+    )
+    .await;
+
+    let (_sock_alice, _rx_alice) =
+        create_claude_session_fixture(&hub.sessions_dir, "sess-alice", "alice");
+
+    let (mut reader, mut writer) = connect_svc(&client.register_sock).await;
+    writer
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::json!({"harness": "svc", "name": "guard"})
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_json_line(&mut reader).await["status"], "ok");
+
+    rusqlite::Connection::open(&client.db_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER ack_on_queue AFTER INSERT ON svc_pending_messages BEGIN
+               UPDATE svc_pending_messages SET delivered_at = 1 WHERE id = NEW.id;
+               UPDATE messages SET outcome = 'delivered' WHERE id = NEW.id;
+             END;",
+        )
+        .unwrap();
+
+    let send_resp = send_via_agent_sock(&hub.agent_sock, "guard@client", "acked at once").await;
+    assert_eq!(send_resp["outcome"], "queued", "{send_resp}");
+    let msg_id = send_resp["message_id"].as_str().unwrap().to_string();
+
+    // The client acks the hub only after recording, so an empty hub mailbox means the
+    // client's record is final.
+    let mut outcome = None;
+    for _ in 0..200 {
+        let hub_conn = rusqlite::Connection::open(&hub.db_path).unwrap();
+        let left: i64 = hub_conn
+            .query_row(
+                "SELECT COUNT(*) FROM peer_mailbox WHERE id = ?1",
+                [&msg_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(1);
+        if left == 0 {
+            outcome = rusqlite::Connection::open(&client.db_path)
+                .unwrap()
+                .query_row(
+                    "SELECT outcome FROM messages WHERE id = ?1",
+                    [&msg_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(outcome.as_deref(), Some("delivered"));
+}

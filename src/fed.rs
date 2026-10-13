@@ -2413,9 +2413,11 @@ pub async fn deliver_federated_reply_locally(
 /// - A send queued for a dial-out client is resolved there, later, so the record holds the
 ///   reference as typed. The replier must be what that reference resolves to by the
 ///   resolver's own steps: its ID, its service name, or its label.
-/// - A queued send may instead get the client's own `not_found` error reply, which a
-///   service sends (the leaf principal, or `system`), never the recipient. Only a reply
-///   that is exactly that error object is admitted on that ground.
+/// - A send queued in a dial-out client's mailbox may instead get the client's own
+///   `not_found` error reply, which a service sends (the leaf principal, or `system`),
+///   never the recipient. Only a reply that is exactly that error object is admitted on
+///   that ground. A send the peer resolved and holds for its recipient's ack also reads
+///   `queued`, but its recipient is known, so it takes no such reply.
 fn replier_is_recipient(
     o: &storage::OutboundRecord,
     replier: &storage::Origin,
@@ -2427,7 +2429,7 @@ fn replier_is_recipient(
     }
     o.outcome == "queued"
         && ((!o.resolved && replier.id.is_some() && replier.label.as_deref() == Some(typed))
-            || (replier.service.is_some() && is_not_found_reply(text)))
+            || (o.via_mailbox && replier.service.is_some() && is_not_found_reply(text)))
 }
 
 /// `{"error": "not_found", "detail": …}` and nothing else: a dial-out client's answer
@@ -3005,6 +3007,11 @@ pub fn queue_leaf_mailbox_message(
         "queued",
         envelope.created_at,
     );
+    // Marked whether this insert or a forwarder's earlier one wrote the record: only a
+    // mailbox send takes the client's own `not_found` reply (`replier_is_recipient`).
+    if let Err(e) = storage::mark_outbound_via_mailbox(&db, &envelope.id) {
+        tracing::warn!(message_id = %envelope.id, "mailbox send not marked; its client's not_found reply will be refused: {e}");
+    }
 
     // Notify any waiting long-pollers
     let _ = fed_state.notify_tx.send(peer_name.to_string());
@@ -3809,6 +3816,45 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
 
                 match resolved {
                     Ok(target) => {
+                        // A sender with an inbox gets its reply pushed back through the
+                        // hub; an anonymous one reads it with `replies` (A10).
+                        let (return_harness, return_session_id) = match msg.origin.key() {
+                            Some(key) => (
+                                Some(
+                                    if msg.origin.service.is_some() {
+                                        "svc"
+                                    } else {
+                                        "fed"
+                                    }
+                                    .to_string(),
+                                ),
+                                Some(key.to_string()),
+                            ),
+                            None => (None, None),
+                        };
+
+                        // The record is written before the message is delivered, as the
+                        // federation receive path writes it: an ack that lands before
+                        // delivery returns finds it, and `queued` never replaces the
+                        // `delivered` it records. `pending` is not a reached outcome, so a
+                        // message whose delivery was interrupted is delivered again.
+                        let pre_record = storage::MessageRecord {
+                            id: msg.id.clone(),
+                            created_at: storage::now_epoch_secs(),
+                            session_id: target.session().session_id.clone(),
+                            from_name: from_name.clone(),
+                            bytes: msg.body.len(),
+                            outcome: storage::KEY_PENDING.to_string(),
+                            recipient_harness: String::new(),
+                            return_harness,
+                            return_session_id,
+                            thread_id: msg.id.clone(),
+                            return_host: Some(ret_host.clone()),
+                        };
+                        if let Ok(db) = fed_state.db.lock() {
+                            let _ = storage::upsert_message(&db, &pre_record);
+                        }
+
                         let deliver_res = crate::surface::deliver(
                             &fed_state.local(),
                             &target,
@@ -3837,39 +3883,15 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
                             }
                         };
 
-                        // A sender with an inbox gets its reply pushed back through the
-                        // hub; an anonymous one reads it with `replies` (A10).
-                        let (return_harness, return_session_id) = match msg.origin.key() {
-                            Some(key) => (
-                                Some(
-                                    if msg.origin.service.is_some() {
-                                        "svc"
-                                    } else {
-                                        "fed"
-                                    }
-                                    .to_string(),
-                                ),
-                                Some(key.to_string()),
-                            ),
-                            None => (None, None),
-                        };
-
-                        let msg_record = storage::MessageRecord {
-                            id: msg.id.clone(),
-                            created_at: storage::now_epoch_secs(),
-                            session_id: target_session_id,
-                            from_name: from_name.clone(),
-                            bytes: msg.body.len(),
-                            outcome: outcome_str.to_string(),
-                            recipient_harness,
-                            return_harness,
-                            return_session_id,
-                            thread_id: msg.id.clone(),
-                            return_host: Some(ret_host.clone()),
-                        };
-
                         if let Ok(db) = fed_state.db.lock() {
-                            let _ = storage::upsert_message(&db, &msg_record);
+                            let _ = storage::complete_message(
+                                &db,
+                                &msg.id,
+                                &target_session_id,
+                                outcome_str,
+                                &recipient_harness,
+                                Some(&ret_host),
+                            );
                         }
 
                         let mut ack_backoff = 100u64;

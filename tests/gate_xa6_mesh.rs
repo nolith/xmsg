@@ -1282,3 +1282,40 @@ async fn test_oracle_19_a_live_session_awaiting_its_ack_is_cached() {
     })
     .await;
 }
+
+// =============================================================================
+// Oracle 20 (XA5's reply rule, after delivered-on-ack). A bare H sent from `sini.a`
+// resolves over `sini.w`, which resolved it and holds it for its harness's ack: `queued`,
+// though no dial-out mailbox holds it. Its recipient is known, so another service on
+// `sini.w` answering `not_found` is refused, and H's own reply is taken.
+// Mutant: admit the `not_found` reply on any `queued` record => RED.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_20_a_peer_resolved_queued_send_takes_no_service_error() {
+    run_with_port_retry(|| async {
+        let ca = Ca::new();
+        let (ca_a, ca_w) = (ca.issue("sini.a"), ca.issue("sini.w"));
+        let pa = prepare(&ca);
+        let (port_w, _, _) =
+            stub(&ca_w, &[&ca_a.pin], listing(vec![inst(H, "live", "sini")])).await;
+        let w_entry = ca_entry(port_w, &pa.ca_file(), "sini.w", ALL);
+        let a = start(pa, &ca_a, json!({ "sini.w": w_entry }), None).await;
+        let w = Origin {
+            cert_der: &ca_w.cert_der,
+            key_der: &ca_w.key_der,
+        };
+        let (pin, port) = (ca_a.pin.as_str(), a.fed_port);
+
+        let (status, sent) = http_send(&a, H, "for h").await;
+        assert_eq!(status, 202, "{sent}");
+        assert_eq!(sent["outcome"], "queued", "{sent}");
+        assert_eq!(sent["address"], format!("{H}@sini.w"), "{sent}");
+        let id = sent["message_id"].as_str().unwrap().to_string();
+        let err = json!({ "error": "not_found", "detail": "no live session matches" }).to_string();
+        let other = json!({ "service": "other", "node": "x" });
+        assert_eq!(fed_reply(&w, pin, port, &id, other, &err).await, 403);
+        let h = json!({ "id": H, "node": "x" });
+        assert_eq!(fed_reply(&w, pin, port, &id, h, "from h").await, 200);
+    })
+    .await;
+}

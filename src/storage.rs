@@ -227,7 +227,8 @@ const SCHEMA_N: &str = r#"
             target_ref TEXT NOT NULL,
             outcome TEXT NOT NULL,
             created_at INTEGER NOT NULL,
-            resolved INTEGER NOT NULL DEFAULT 0
+            resolved INTEGER NOT NULL DEFAULT 0,
+            via_mailbox INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_outbound_created_at ON outbound(created_at);
 
@@ -410,6 +411,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
                 "ALTER TABLE idempotency_keys ADD COLUMN to_ref TEXT NOT NULL DEFAULT ''",
             )?;
         }
+        // A send recorded before it is not known to be in a dial-out mailbox, so it takes
+        // replies strictly (fail closed).
+        let has_via_mailbox: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('outbound') WHERE name = 'via_mailbox'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_via_mailbox {
+            conn.execute_batch(
+                "ALTER TABLE outbound ADD COLUMN via_mailbox INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         return Ok(());
     }
     if version > SCHEMA_VERSION {
@@ -551,6 +564,9 @@ pub struct OutboundRecord {
     /// The sending node resolved `target_ref` over its view (XA6), so it is the
     /// recipient's own ID or service name, not a reference as typed.
     pub resolved: bool,
+    /// The send waits in a dial-out client's mailbox here, to be resolved by that client
+    /// when it pulls it; not a send the peer resolved and holds for its recipient's ack.
+    pub via_mailbox: bool,
 }
 
 pub fn insert_outbound(
@@ -570,7 +586,7 @@ pub fn insert_outbound(
 
 pub fn get_outbound(conn: &Connection, id: &str) -> Result<Option<OutboundRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT id, peer, target_ref, outcome, created_at, resolved FROM outbound WHERE id = ?1",
+        "SELECT id, peer, target_ref, outcome, created_at, resolved, via_mailbox FROM outbound WHERE id = ?1",
     )?;
     let mut rows = stmt.query(params![id])?;
     if let Some(row) = rows.next()? {
@@ -581,6 +597,7 @@ pub fn get_outbound(conn: &Connection, id: &str) -> Result<Option<OutboundRecord
             outcome: row.get(3)?,
             created_at: row.get(4)?,
             resolved: row.get(5)?,
+            via_mailbox: row.get(6)?,
         }))
     } else {
         Ok(None)
@@ -590,6 +607,14 @@ pub fn get_outbound(conn: &Connection, id: &str) -> Result<Option<OutboundRecord
 pub fn mark_outbound_resolved(conn: &Connection, id: &str) -> Result<()> {
     conn.execute(
         "UPDATE outbound SET resolved = 1 WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+pub fn mark_outbound_via_mailbox(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE outbound SET via_mailbox = 1 WHERE id = ?1",
         params![id],
     )?;
     Ok(())
@@ -1765,6 +1790,25 @@ mod queue_tests {
             thread_id: id.into(),
             return_host: None,
         }
+    }
+
+    /// A schema-N database whose `outbound` predates `via_mailbox` gains it, and a send
+    /// recorded before it reads as not in a mailbox (fail closed).
+    #[test]
+    fn outbound_gains_via_mailbox_unset() {
+        let c = Connection::open_in_memory().unwrap();
+        init_db(&c).unwrap();
+        c.execute_batch("ALTER TABLE outbound DROP COLUMN via_mailbox")
+            .unwrap();
+        c.execute(
+            "INSERT INTO outbound (id, peer, target_ref, outcome, created_at) VALUES ('O', 'p', 't', 'queued', 0)",
+            [],
+        )
+        .unwrap();
+        init_db(&c).unwrap();
+        assert!(!get_outbound(&c, "O").unwrap().unwrap().via_mailbox);
+        mark_outbound_via_mailbox(&c, "O").unwrap();
+        assert!(get_outbound(&c, "O").unwrap().unwrap().via_mailbox);
     }
 
     /// HA3: an ack that lands before the send (or the federated receiver) records its own
