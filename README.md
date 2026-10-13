@@ -257,10 +257,14 @@ hermes process (2.3.1):
 - **Tools.** `xmsg_list`, `xmsg_send`, `xmsg_reply` and `xmsg_replies`, in the toolset `xmsg`, sent as frames under
   the calling session (the tool's `session_id`). hermes defers plugin tools behind its Tool Search bridge by default
   (`tools.tool_search`), so the model reaches them through `tool_search` and `tool_call`.
-- **Switching sessions (the classic CLI).** One session is live per CLI process. `/new` releases the old session's
-  address and registers the new session (hermes's `on_session_reset`). `/resume` and `/branch` fire no plugin hook,
-  so the plugin sees the switch at the next hook, tool call or push, by the CLI's `session_id`, releases the old
-  address then, and never injects one session's message into another.
+- **Ending a session.** A session that ends has its address released (hermes's `on_session_finalize`): a desktop
+  session closed, or the CLI's `/new` or exit. A send to it then answers `gone`, and it holds up no other session on
+  the connection. A tool call acting as an ended session answers `gone` and registers nothing: a background delegate
+  keeps running after `/new`, and registering its root again would release the live session.
+- **Switching sessions (the classic CLI).** One session is live per CLI process. `/new` ends the old session and
+  registers the new one (`on_session_reset`). `/resume` and `/branch` fire no plugin hook, so the plugin sees the
+  switch at the next hook, tool call or push, by the CLI's `session_id`, releases the old address then, and never
+  injects one session's message into another.
 - **Compression.** With `compression.in_place: false`, a compression continues the conversation under a new
   session id; the plugin then moves the address with `continues` (A19). It reads hermes's session store for this
   (`SessionDB(read_only=True).get_compression_chain`), which is internal hermes API: a change there breaks
@@ -270,7 +274,7 @@ hermes process (2.3.1):
   line typed while busy, so `display.busy_input_mode` (or `/busy`) decides exactly as for typed input: `queue` runs
   it as the next turn, `interrupt` redirects the running turn, and `steer` adds it to the running turn after its
   current tool call. When no turn runs it starts one. This uses hermes's private CLI names (`_manager._cli_ref`,
-  `_agent_running`, `_tui_enter_while_busy`), which the CI check pins.
+  `_agent_running`, `_tui_enter_while_busy`, and `session_id` for the switch above), which the CI check pins.
 - **Push, on the TUI and desktop host.** hermes's `inject_message` queues the message on its session in every busy
   mode ("a notice must not cancel in-flight work"), so there `interrupt` and `steer` behave as `queue`. It needs
   `plugins.entries.xmsg.allow_gateway_injection: true`, which the switch sets; without it hermes refuses every
@@ -971,11 +975,14 @@ option, so it composes with the rest of your configuration:
 - `programs.xmsg.harnesses.hermes.enable`: through hermes-agent's own home-manager module, the plugin
   (`extensions/hermes/`) in `services.hermes-agent.extraPlugins` (linked as `plugins/nix-managed-xmsg`),
   `settings.plugins.enabled = [ "xmsg" ]`, `settings.plugins.entries.xmsg.allow_gateway_injection = true`, and the
-  skill as `hermesHomeFiles."skills/xmsg/SKILL.md"`. **Cost:** hermes's `settings` merges with
-  `lib.recursiveUpdate`, which replaces lists, so a `settings.plugins.enabled` defined elsewhere replaces this one;
-  list `xmsg` there too. CI runs the real hermes CLI (on a pty) and its desktop backend with the rendered plugin
+  skill as `hermesHomeFiles."skills/xmsg/SKILL.md"`. hermes's `settings` merges with `lib.recursiveUpdate`, which
+  replaces a list whole, so the switch defines its `plugins.enabled` last (`lib.mkAfter`) as your own entries plus
+  `xmsg`: `[ "foo" ]` and the switch give `[ "foo" "xmsg" ]`. **Cost:** a `plugins.enabled` defined at
+  `lib.mkAfter` or later can replace it and drop `xmsg`; evaluation refuses that, naming what was
+  lost. CI runs the real hermes CLI (on a pty) and its desktop backend with the rendered plugin
   and settings against a real `xmsg serve` and a mock model, and checks registration and attribution, `/new`,
-  a compression, a delegate, the three busy modes, and a refused injection.
+  `/resume`, a delegate outliving `/new`, a desktop session closed, a compression, a delegate, the three busy modes,
+  and a refused injection.
 
 A Claude, agy or hermes switch whose harness module is off fails evaluation, naming the option it needs, rather
 than installing nothing. The pi and opencode switches write files and need no harness module.

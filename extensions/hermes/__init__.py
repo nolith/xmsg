@@ -5,12 +5,15 @@ registers at the first `pre_llm_call` or tool call carrying its unseen `session_
 its own server-minted address. A delegate (a subagent, whose `pre_llm_call` names its
 `parent_session_id`) acts as its root and is never registered (HA7).
 
-In the classic CLI one session is live per process. `/new` fires `on_session_reset` with the
-new id; `/resume` and `/branch` fire no plugin hook, so a changed `session_id` is seen at the
-next hook, tool call or push (the CLI's `session_id`). On every switch the old session's
-address is released (harness C3), unless hermes's session store records the new session as a
-compression continuation of the old, when it moves with `continues` (C4, A19). That store read
-is internal hermes API.
+A session that ends (`on_session_finalize`: a desktop session closed, the CLI's `/new` or exit)
+has its address released (harness C3). In the classic CLI one session is live per process.
+`/new` finalizes the old session, then fires `on_session_reset` with the new id; `/resume` and
+`/branch` fire no plugin hook, so a changed `session_id` is seen at the next hook, tool call or
+push (the CLI's `session_id`), and the old session's address is released then, unless hermes's
+session store records the new session as a compression continuation of the old, when it moves
+with `continues` (C4, A19). That store read is internal hermes API. A tool call acting as an
+ended session (its background delegate, still running after `/new`) answers `gone` and
+registers nothing.
 
 A pushed message goes in through the CLI's own Enter dispatch while a turn runs
 (`_tui_enter_while_busy`, so `busy_input_mode` routes it exactly as typed input: queue, steer
@@ -171,6 +174,7 @@ class Xmsg:
         self.current = None  # the CLI's live session
         self.parents = {}  # delegate session -> its parent (HA7)
         self.moved = {}  # session -> the continuation its address moved to
+        self.ended = set()  # finalized roots; only the root's own turn or the CLI brings one back
         self.conn = Connection(path, self.deliver)
 
     def _cli(self):
@@ -201,6 +205,7 @@ class Xmsg:
     def observe(self, session):
         """`session`, a root, is live: hold its address, moving or releasing what it replaces."""
         with self.lock:
+            self.ended.discard(session)
             if session in self.conn.wanted:
                 return
             cli = self._cli() is not None
@@ -227,15 +232,24 @@ class Xmsg:
             logger.warning("xmsg: registering %s", session_id, exc_info=True)
         return None
 
-    def on_session_reset(self, session_id="", **_):
-        """The CLI's `/new`: the old session's address is released, the new one registered."""
+    def on_session_finalize(self, session_id="", **_):
+        """A session ended: a desktop session closed, or the CLI's `/new` or exit. Its address is
+        released (harness C3); this is the one release on those paths."""
         try:
             with self.lock:
-                if self._cli() is not None and self.current and self.current != session_id:
-                    self.conn.release(self.current)
+                if self.current == session_id:
                     self.current = None
-                if session_id:
-                    self.observe(session_id)
+                self.ended.add(session_id)
+                self.conn.release(session_id)
+        except OSError:
+            logger.warning("xmsg: releasing %s", session_id, exc_info=True)
+
+    def on_session_reset(self, session_id="", **_):
+        """The CLI's `/new`: the new session is registered (the old one was finalized)."""
+        if not session_id:
+            return
+        try:
+            self.observe(session_id)
         except OSError:
             logger.warning("xmsg: switching to %s", session_id, exc_info=True)
 
@@ -262,6 +276,11 @@ class Xmsg:
                 return json.dumps({"status": "error", "error": "no_session",
                                    "detail": "hermes passed this tool call no session_id"})
             root = self._root(session_id)
+            if root in self.ended:
+                # An ended session's call, e.g. from its background delegate, which keeps
+                # running after `/new`: registering the root again would release the live session.
+                return json.dumps({"status": "error", "error": "gone",
+                                   "detail": f"the hermes session {root} has ended"})
             frame = {"action": action, "session": root}
             frame.update({k: args[k] for k in fields if args.get(k) is not None})
             try:
@@ -309,3 +328,4 @@ def register(ctx):
         ctx.register_tool(name=name, toolset="xmsg", schema=schema, handler=x.tool(action, fields), emoji="✉")
     ctx.register_hook("pre_llm_call", x.pre_llm_call)
     ctx.register_hook("on_session_reset", x.on_session_reset)
+    ctx.register_hook("on_session_finalize", x.on_session_finalize)

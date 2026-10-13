@@ -260,6 +260,37 @@ in
       };
     };
 
+    # hermes's `settings` merge replaces a list (lib.recursiveUpdate), so the switch's
+    # `plugins.enabled` joins the user's own entries rather than dropping them; a user list
+    # ordered after the switch's would drop `xmsg`, and is refused naming it.
+    test-hermes-enabled-joins = {
+      expr =
+        let
+          c = hmEval "x86_64-linux" { services.hermes-agent.settings.plugins.enabled = [ "foo" ]; };
+        in
+        {
+          enabled = c.services.hermes-agent.settings.plugins.enabled;
+          failed = failedAssertions c;
+        };
+      expected = {
+        enabled = [
+          "foo"
+          "xmsg"
+        ];
+        failed = [ ];
+      };
+    };
+    test-hermes-enabled-lost = {
+      expr = failedAssertions (
+        hmEval "x86_64-linux" {
+          services.hermes-agent.settings = lib.mkOrder 2000 { plugins.enabled = [ "foo" ]; };
+        }
+      );
+      expected = [
+        "programs.xmsg.harnesses.hermes.enable: services.hermes-agent.settings.plugins.enabled lost [\"xmsg\"]. hermes merges `settings` by lib.recursiveUpdate, which replaces a list, and a definition ordered after the switch's (lib.mkAfter) replaced its list; define that one without the later order."
+      ];
+    };
+
     # Oracle 7: the installed skill teaches A13's four tools, A12's labels and the error
     # vocabulary, and the http.sock limits (A15, HA2); nothing of the retired surface or of an
     # owner's hosts. `builtins.split` searches without a `.*` regex over the file.

@@ -2,8 +2,9 @@
 """XH3 oracles 1-6: the real hermes CLI (the classic REPL, on a pty), with the plugin and the
 config.yaml settings the home-manager switch renders, against a real `xmsg serve`. The model is
 a mock OpenAI-compatible server on loopback. A user message containing `CALL <tool> <json>`
-makes it call that tool once; one containing `SLOW` gets its answer streamed slowly, so a turn
-is running while a message is pushed; anything else gets the answer `ok`. A fake plugin
+makes it call that tool once, and `CALL <tool> <json> THEN <tool> <json>` makes it call the
+second after the first one's result; one containing `SLOW` gets its answer streamed slowly, so
+a turn is running while a message is pushed; anything else gets the answer `ok`. A fake plugin
 connection on register.sock is the receiver whose deliveries show each send's attribution.
 Oracle 6 and its control run on the desktop host instead: hermes's tui_gateway, the backend of
 the Ink TUI and the desktop app, driven over its stdio JSON-RPC.
@@ -77,6 +78,24 @@ def text_of(m):
     return c or ""
 
 
+def calls_of(txt):
+    """The calls a user message asks for: it starts `CALL <tool> <json>`, then any `THEN <tool>
+    <json>`. hermes's notice of a finished delegate quotes the delegate's goal, but never starts so."""
+    out = []
+    if not txt.startswith("CALL "):
+        return out
+    rest = txt[5:]
+    while True:
+        tool, _, args = rest.partition(" ")
+        args = args.lstrip()
+        obj, end = json.JSONDecoder().raw_decode(args)
+        out.append((tool, obj))
+        rest = args[end:].lstrip()
+        if not rest.startswith("THEN "):
+            return out
+        rest = rest[5:]
+
+
 def chunk(delta, finish=None):
     return ("data: " + json.dumps({"id": "m", "object": "chat.completion.chunk", "created": 0, "model": "m",
                                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n").encode()
@@ -114,10 +133,12 @@ class Mock(http.server.BaseHTTPRequestHandler):
             mlog.write(f"  tools: {tools}\n")
         mlog.flush()
         call = None
-        if "CALL " in txt and body.get("tools"):
-            rest = txt[txt.index("CALL ") + 5:]
-            tool, _, args = rest.partition(" ")
-            obj, _ = json.JSONDecoder().raw_decode(args.lstrip())
+        # The latest user message's calls, one per request: the next one after each tool result.
+        ui = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=None)
+        want = calls_of(text_of(msgs[ui])) if ui is not None else []
+        k = sum(m.get("role") == "tool" for m in msgs[ui + 1:]) if ui is not None else 0
+        if k < len(want) and body.get("tools"):
+            tool, obj = want[k]
             if tool not in tools and "tool_call" in tools:
                 # hermes defers plugin tools behind its Tool Search bridge (tools.tool_search).
                 tool, obj = "tool_call", {"calls": [{"name": tool, "arguments": obj}]}
@@ -462,6 +483,44 @@ if anywhere(text):
     fail(f"2: the message to the old address reached the model in the new session")
 ok(f"2: after /new {e1['address']} is gone and {e3['label']} has {e3['address']}")
 
+# 2, /resume (no plugin hook): the CLI moves back to an ended session. A message to the session
+# it left is never injected into the resumed one, and that address is released (pins the CLI's
+# `session_id`).
+type_line(f"/resume {s2}")
+time.sleep(4)
+text = f"after-resume-{uuid.uuid4().hex[:8]}"
+sent = recv.send(e3["address"], text)
+time.sleep(10)
+if anywhere(text):
+    fail(f"2 resume: after /resume {s2}, the message to {e3['label']}'s address reached the model")
+again = recv.send(e3["address"], "again")
+if again.get("error") != "gone":
+    fail(f"2 resume: after /resume {s2}, a send to {e3['address']} answers {again}, not gone")
+ok(f"2 resume: after /resume {s2}, {e3['address']} is gone and its message reached no session")
+
+# 2, a background delegate: it keeps running after /new, and its call acts as the ended
+# session: it answers gone, and the new session keeps its address.
+goal = f"CALL terminal {json.dumps({'command': 'sleep 12'})} THEN xmsg_list {{}}"
+n = len(requests)
+type_line(f"CALL delegate_task {json.dumps({'tasks': [{'goal': goal}]})}")
+wait_until(lambda: any(r["messages"] and goal in text_of(r["messages"][-1]) for r in requests[n:]), 60,
+           "the delegate's first request")
+time.sleep(1)
+type_line("/new now")
+time.sleep(3)
+turn("hello four")
+(e4,) = wait_until(lambda: [e for e in hermes_entries() if e["label"] != s2] or None, 20,
+                   "the session after the second /new listed")
+r = wait_until(lambda: next((r for r in requests[n:] if any(goal in text_of(m) for m in r["messages"])
+                             and sum(m.get("role") == "tool" for m in r["messages"]) >= 2), None), 60,
+               "the delegate's xmsg call")
+result = text_of(r["messages"][-1])
+now = [(e["label"], e["address"]) for e in hermes_entries()]
+if '"gone"' not in result.replace('\\"', '"') or now != [(e4["label"], e4["address"])]:
+    fail(f"2 delegate: after /new, {s2}'s delegate's xmsg_list answered {result[:300]!r}; "
+         f"the hermes entries are {now}, not only {e4['label']} at {e4['address']}")
+ok(f"2 delegate: {s2}'s delegate, running on after /new, is answered gone; {e4['label']} keeps {e4['address']}")
+
 os.kill(hermes_pid, signal.SIGKILL)
 hermes_pid = None
 
@@ -521,7 +580,7 @@ class Desktop:
         e = wait_until(lambda: entry(key), 60, f"the desktop session {key} listed")
         wait_until(lambda: any(x["done"] for x in seen(f"hello from {key}")), 60, "the desktop turn")
         time.sleep(2)
-        return key, e
+        return key, e, r["session_id"]
 
     def close(self):
         self.p.kill()
@@ -532,20 +591,34 @@ desktop_settings.update({k: settings[k] for k in ("model", "telemetry")})
 
 # The control: with the switch's settings, a push reaches the desktop session and is acked.
 d = Desktop("desktop-allowed", desktop_settings)
-key, e = d.session()
+key, e, sid = d.session()
 text = f"desktop-{uuid.uuid4().hex[:8]}"
 sent = recv.send(e["address"], text)
 wait_until(lambda: seen(text), 60, "the pushed message in the desktop session")
 wait_until(lambda: acked(sent["message_id"]), 20, "the desktop message acked")
-d.close()
 ok(f"desktop: with allow_gateway_injection a push to {key} runs in it and is acked")
+
+# 2, desktop close: a closed session's address is released (on_session_finalize), so a send to
+# it answers gone and nothing of it blocks another session of the same process.
+key2, e2, _ = d.session()
+d.rpc("session.close", {"session_id": sid})
+time.sleep(3)
+sent = recv.send(e["address"], f"to-closed-{uuid.uuid4().hex[:8]}")
+if sent.get("error") != "gone" or entry(key):
+    fail(f"2 close: after session.close of {key}, a send to {e['address']} answers {sent}; listed: {entry(key)}")
+text = f"desktop-live-{uuid.uuid4().hex[:8]}"
+sent = recv.send(e2["address"], text)
+wait_until(lambda: seen(text), 60, f"the message to the live desktop session {key2}")
+wait_until(lambda: acked(sent["message_id"]), 20, f"the message to {key2} acked")
+d.close()
+ok(f"2 close: closed {key} answers gone, and {key2} in the same process still receives")
 
 # 6. A refused injection stays pending: without allow_gateway_injection, inject_message returns
 # False on this host (plugins_injection.py), so the message is neither acked nor injected.
 refused = json.loads(json.dumps(desktop_settings))
 del refused["plugins"]["entries"]["xmsg"]["allow_gateway_injection"]
 d = Desktop("desktop-refused", refused)
-key, e = d.session()
+key, e, _ = d.session()
 text = f"refused-{uuid.uuid4().hex[:8]}"
 sent = recv.send(e["address"], text)
 time.sleep(6)  # several poll rounds

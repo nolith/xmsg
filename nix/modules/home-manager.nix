@@ -187,6 +187,22 @@ let
       ]
     );
 
+  # This module's own definitions, told apart from the user's (`definitionsWithLocations`).
+  thisFile = toString ./home-manager.nix;
+
+  # hermes's `settings` merges by `lib.recursiveUpdate` (hermes-agent's deepConfigType,
+  # nix/moduleCommon.nix), which replaces a list whole: of two `plugins.enabled` definitions the
+  # later one wins and the other's entries are dropped. So the switch's own `plugins.enabled` is
+  # every other definition's entries plus `xmsg`, defined last (`mkAfter`); a definition ordered
+  # after it would still replace it, which the switch refuses, naming what was lost.
+  hermesEnabled =
+    defs: lib.concatMap (d: if d.value ? plugins.enabled then d.value.plugins.enabled else [ ]) defs;
+  hermesEnabledElsewhere = lib.optionals (options ? services.hermes-agent.settings) (
+    hermesEnabled (
+      lib.filter (d: d.file != thisFile) options.services.hermes-agent.settings.definitionsWithLocations
+    )
+  );
+
   # A switch whose harness module is off would install nothing; refuse it, naming the option.
   requireHarness = switch: option: enabled: {
     assertion = enabled;
@@ -194,6 +210,8 @@ let
   };
 in
 {
+  _file = thisFile;
+
   options.programs.xmsg = {
     enable = mkEnableOption "xmsg, the bridge into running agent sessions";
 
@@ -321,7 +339,18 @@ in
         ++ lib.optional cfg.harnesses.agy.enable {
           assertion = config.home.file.".gemini/config/hooks.json".text == null;
           message = "programs.xmsg.harnesses.agy.enable owns ~/.gemini/config/hooks.json; remove the other home.file.\".gemini/config/hooks.json\".text definition.";
-        };
+        }
+        ++ lib.optional (cfg.harnesses.hermes.enable && options ? services.hermes-agent.settings) (
+          let
+            lost = lib.subtractLists (config.services.hermes-agent.settings.plugins.enabled or [ ]) (
+              hermesEnabled options.services.hermes-agent.settings.definitionsWithLocations
+            );
+          in
+          {
+            assertion = lost == [ ];
+            message = "programs.xmsg.harnesses.hermes.enable: services.hermes-agent.settings.plugins.enabled lost ${builtins.toJSON lost}. hermes merges `settings` by lib.recursiveUpdate, which replaces a list, and a definition ordered after the switch's (lib.mkAfter) replaced its list; define that one without the later order.";
+          }
+        );
     }
 
     # Runs as the sessions' own user: the inbox sockets live in 0700 dirs. Its HTTP API is
@@ -404,18 +433,17 @@ in
     })
 
     # hermes-agent's own home-manager module (`services.hermes-agent`) installs the plugin and
-    # writes config.yaml. `settings` merges by `lib.recursiveUpdate`, so a `plugins.enabled`
-    # list defined elsewhere replaces this one rather than joining it. Defined only where that
-    # module is imported; elsewhere the switch's assertion names the option.
+    # writes config.yaml; `plugins.enabled` joins the user's own (`hermesEnabledElsewhere`).
+    # Defined only where that module is imported; elsewhere the switch's assertion names the option.
     (lib.optionalAttrs (options ? services.hermes-agent) (
       mkIf cfg.harnesses.hermes.enable {
         services.hermes-agent = {
           extraPlugins = [ hermesPlugin ];
-          settings.plugins = {
-            enabled = [ "xmsg" ];
+          settings = mkMerge [
             # Without it the TUI and desktop host refuses every injection (hermes_cli/plugins_injection.py).
-            entries.xmsg.allow_gateway_injection = true;
-          };
+            { plugins.entries.xmsg.allow_gateway_injection = true; }
+            (lib.mkAfter { plugins.enabled = lib.unique (hermesEnabledElsewhere ++ [ "xmsg" ]); })
+          ];
           hermesHomeFiles."skills/xmsg/SKILL.md" = skill + "/SKILL.md";
         };
       }
