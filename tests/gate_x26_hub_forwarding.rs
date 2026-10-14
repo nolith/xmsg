@@ -329,7 +329,6 @@ where
 // Line: test_oracle_1_relay_and_reply
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "H6: re-armed when H6 routing originates hop envelopes (owner design A3/B4; plan §7)"]
 async fn test_oracle_1_relay_and_reply() {
     run_test_with_port_retry("test_oracle_1_relay_and_reply", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -345,33 +344,40 @@ async fn test_oracle_1_relay_and_reply() {
 
         // Node A knows Hub
         let peers_a = serde_json::json!({
-            "hub": {
-                "address": format!("127.0.0.1:{port_h}"),
-                "pin": normalize_pin(&pin_h),
-                "allow": ["send", "reply"]
+            "peers": {
+                "hub": {
+                    "address": format!("127.0.0.1:{port_h}"),
+                    "pin": normalize_pin(&pin_h),
+                    "allow": ["send", "reply"],
+                    "default_route": true
+                }
             }
         });
 
         // Hub knows A (with "forward") and B (with "send", "reply")
         let peers_h = serde_json::json!({
-            "node-a": {
-                "address": format!("127.0.0.1:{port_a}"),
-                "pin": normalize_pin(&pin_a),
-                "allow": ["send", "reply", "forward"]
-            },
-            "node-b": {
-                "address": format!("127.0.0.1:{port_b}"),
-                "pin": normalize_pin(&pin_b),
-                "allow": ["send", "reply"]
+            "peers": {
+                "node-a": {
+                    "address": format!("127.0.0.1:{port_a}"),
+                    "pin": normalize_pin(&pin_a),
+                    "allow": ["send", "reply", "forward"]
+                },
+                "node-b": {
+                    "address": format!("127.0.0.1:{port_b}"),
+                    "pin": normalize_pin(&pin_b),
+                    "allow": ["send", "reply"]
+                }
             }
         });
 
         // Node B knows Hub (with "relayed" capability)
         let peers_b = serde_json::json!({
-            "hub": {
-                "address": format!("127.0.0.1:{port_h}"),
-                "pin": normalize_pin(&pin_h),
-                "allow": ["send", "reply", "relayed"]
+            "peers": {
+                "hub": {
+                    "address": format!("127.0.0.1:{port_h}"),
+                    "pin": normalize_pin(&pin_h),
+                    "allow": ["send", "reply", "relayed"]
+                }
             }
         });
 
@@ -383,10 +389,10 @@ async fn test_oracle_1_relay_and_reply() {
         let (_sock_a, rx_a) = create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
         let (_sock_b, rx_b) = create_claude_session_fixture(&node_b.sessions_dir, "bob", "Bob");
 
-        // Alice on A sends to bob@node-b@hub
+        // Alice on A sends to Bob@node-b
         let send_resp = send_via_agent_sock(
             &node_a.agent_sock,
-            "bob@node-b@hub",
+            "Bob@node-b",
             "Hello Bob from Alice via Hub!",
         )
         .await;
@@ -454,7 +460,6 @@ async fn test_oracle_1_relay_and_reply() {
 // Line: test_oracle_2_polling_sender
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "H6: re-armed when H6 routing originates hop envelopes (owner design A3/B4; plan §7)"]
 async fn test_oracle_2_polling_sender() {
     run_test_with_port_retry("test_oracle_2_polling_sender", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -469,31 +474,38 @@ async fn test_oracle_2_polling_sender() {
         let http_b = get_free_port();
 
         let peers_a = serde_json::json!({
-            "hub": {
-                "address": format!("127.0.0.1:{port_h}"),
-                "pin": normalize_pin(&pin_h),
-                "allow": ["send", "reply"]
+            "peers": {
+                "hub": {
+                    "address": format!("127.0.0.1:{port_h}"),
+                    "pin": normalize_pin(&pin_h),
+                    "allow": ["send", "reply"],
+                    "default_route": true
+                }
             }
         });
 
         let peers_h = serde_json::json!({
-            "node-a": {
-                "address": format!("127.0.0.1:{port_a}"),
-                "pin": normalize_pin(&pin_a),
-                "allow": ["send", "reply", "forward"]
-            },
-            "node-b": {
-                "address": format!("127.0.0.1:{port_b}"),
-                "pin": normalize_pin(&pin_b),
-                "allow": ["send", "reply"]
+            "peers": {
+                "node-a": {
+                    "address": format!("127.0.0.1:{port_a}"),
+                    "pin": normalize_pin(&pin_a),
+                    "allow": ["send", "reply", "forward"]
+                },
+                "node-b": {
+                    "address": format!("127.0.0.1:{port_b}"),
+                    "pin": normalize_pin(&pin_b),
+                    "allow": ["send", "reply"]
+                }
             }
         });
 
         let peers_b = serde_json::json!({
-            "hub": {
-                "address": format!("127.0.0.1:{port_h}"),
-                "pin": normalize_pin(&pin_h),
-                "allow": ["send", "reply", "relayed"]
+            "peers": {
+                "hub": {
+                    "address": format!("127.0.0.1:{port_h}"),
+                    "pin": normalize_pin(&pin_h),
+                    "allow": ["send", "reply", "relayed"]
+                }
             }
         });
 
@@ -501,19 +513,20 @@ async fn test_oracle_2_polling_sender() {
         let _hub = spawn_test_node("hub", port_h, http_h, &cert_h, &key_h, peers_h).await;
         let node_a = spawn_test_node("node-a", port_a, http_a, &cert_a, &key_a, peers_a).await;
 
-        let (_sock_a, rx_a) = create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
+        let (sock_a, rx_a) = create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
         let (_sock_b, rx_b) = create_claude_session_fixture(&node_b.sessions_dir, "bob", "Bob");
 
         // Alice sends with push_replies: false
         let send_resp = send_via_agent_sock(
             &node_a.agent_sock,
-            "bob@node-b@hub",
+            "Bob@node-b",
             "Polling sender test message",
         )
         .await;
 
         assert_eq!(send_resp["status"], "ok");
         let sent_msg_id = send_resp["message_id"].as_str().unwrap();
+        let _ = fs::remove_file(&sock_a);
 
         let b_msg = wait_for_inbox_message(&rx_b, Duration::from_secs(5))
             .await
@@ -571,7 +584,6 @@ async fn test_oracle_2_polling_sender() {
 // Line: test_oracle_3_undialable_client
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "H6: re-armed when H6 routing originates hop envelopes (owner design A3/B4; plan §7)"]
 async fn test_oracle_3_undialable_client() {
     run_test_with_port_retry("test_oracle_3_undialable_client", || async move {
         let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
@@ -587,35 +599,42 @@ async fn test_oracle_3_undialable_client() {
 
         // Node A is outbound-linked to Hub
         let peers_a = serde_json::json!({
-            "hub": {
-                "address": format!("127.0.0.1:{port_h}"),
-                "pin": normalize_pin(&pin_h),
-                "dial": "outbound",
-                "allow": ["send", "reply", "inbox"]
+            "peers": {
+                "hub": {
+                    "address": format!("127.0.0.1:{port_h}"),
+                    "pin": normalize_pin(&pin_h),
+                    "dial": "outbound",
+                    "allow": ["send", "reply", "inbox"],
+                    "default_route": true
+                }
             }
         });
 
         // Hub marks A as leaf and allows forward; B is dialable
         let peers_h = serde_json::json!({
-            "node-a": {
-                "address": format!("127.0.0.1:{port_a}"),
-                "pin": normalize_pin(&pin_a),
-                "leaf": true,
-                "allow": ["send", "reply", "inbox", "forward"]
-            },
-            "node-b": {
-                "address": format!("127.0.0.1:{port_b}"),
-                "pin": normalize_pin(&pin_b),
-                "allow": ["send", "reply"]
+            "peers": {
+                "node-a": {
+                    "address": format!("127.0.0.1:{port_a}"),
+                    "pin": normalize_pin(&pin_a),
+                    "leaf": true,
+                    "allow": ["send", "reply", "inbox", "forward"]
+                },
+                "node-b": {
+                    "address": format!("127.0.0.1:{port_b}"),
+                    "pin": normalize_pin(&pin_b),
+                    "allow": ["send", "reply"]
+                }
             }
         });
 
         // Node B allows relayed from hub
         let peers_b = serde_json::json!({
-            "hub": {
-                "address": format!("127.0.0.1:{port_h}"),
-                "pin": normalize_pin(&pin_h),
-                "allow": ["send", "reply", "relayed"]
+            "peers": {
+                "hub": {
+                    "address": format!("127.0.0.1:{port_h}"),
+                    "pin": normalize_pin(&pin_h),
+                    "allow": ["send", "reply", "relayed"]
+                }
             }
         });
 
@@ -629,7 +648,7 @@ async fn test_oracle_3_undialable_client() {
         // Alice on outbound-linked node A sends to Bob on B via Hub
         let send_resp = send_via_agent_sock(
             &node_a.agent_sock,
-            "bob@node-b@hub",
+            "Bob@node-b",
             "Outbound client send to Bob",
         )
         .await;

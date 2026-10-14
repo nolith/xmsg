@@ -572,7 +572,6 @@ async fn test_oracle_2_ca_entry_keyed_by_other_name_refused() {
 // Mutant M3: put the nickname on the wire (the hub's forward mark) => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "H6: re-armed when H6 routing originates hop envelopes (owner design A3/B4; plan §7)"]
 async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
     run_with_port_retry(|| async {
         let l_creds = pinned_creds("laptop-host");
@@ -590,8 +589,12 @@ async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
             NodeSpec {
                 creds: Some(c_creds.clone()),
                 peers: Some(
-                    json!({ "hub": pin_entry(&addr(h_fed), &h_creds.pin, &["send", "reply", "relayed"]) })
-                        .to_string(),
+                    json!({
+                        "peers": {
+                            "hub": pin_entry(&addr(h_fed), &h_creds.pin, &["send", "reply", "relayed"])
+                        }
+                    })
+                    .to_string(),
                 ),
                 fed: true,
                 ..Default::default()
@@ -604,8 +607,15 @@ async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
                 creds: Some(l_creds.clone()),
                 peers: Some(
                     json!({
-                        "hub": pin_entry(&addr(h_fed), &h_creds.pin, &["send", "reply"]),
-                        "cee": pin_entry(&addr(c.fed_port), &c_creds.pin, &["send", "reply"]),
+                        "peers": {
+                            "hub": json!({
+                                "address": addr(h_fed),
+                                "pin": normalize_pin(&h_creds.pin),
+                                "allow": ["send", "reply"],
+                                "default_route": true
+                            }),
+                            "cee": pin_entry("", &c_creds.pin, &["send", "reply"])
+                        }
                     })
                     .to_string(),
                 ),
@@ -616,8 +626,10 @@ async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
         )
         .await;
         let h_peers = json!({
-            "laptop": pin_entry(&addr(l.fed_port), &l_creds.pin, &["send", "reply", "forward"]),
-            "cnode": pin_entry(&addr(c.fed_port), &c_creds.pin, &["send", "reply"]),
+            "peers": {
+                "laptop": pin_entry(&addr(l.fed_port), &l_creds.pin, &["send", "reply", "forward"]),
+                "cnode": pin_entry(&addr(c.fed_port), &c_creds.pin, &["send", "reply"]),
+            }
         })
         .to_string();
         let mut h_spec = NodeSpec {
@@ -634,7 +646,7 @@ async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
         let bob = claude_session(&c.sessions_dir, "bob", "Bob");
 
         // L -> H -> C, the destination typed by its canonical name.
-        let (status, body) = http_send(&l, &format!("bob@{c_name}@hub"), "via the hub").await;
+        let (status, body) = http_send(&l, &format!("Bob@{c_name}"), "via the hub").await;
         assert_eq!(status, 202, "relay through the hub: {body}");
         let line = wait_line(&bob).await.expect("bob on C receives the relay");
         assert!(
@@ -648,7 +660,7 @@ async fn test_oracle_3_pinned_names_cross_the_wire_canonical() {
 
         // L types its own nickname for C in a hop destination: the hub, which has no
         // `cee`, receives C's canonical name (verifier P1).
-        let (status, body) = http_send(&l, "bob@cee@hub", "by L's nickname").await;
+        let (status, body) = http_send(&l, "Bob@cee", "by L's nickname").await;
         assert_eq!(status, 202, "L's nickname for C goes on the wire canonical: {body}");
         let mut got = false;
         for _ in 0..100 {

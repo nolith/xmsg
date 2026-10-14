@@ -43,6 +43,7 @@ pub const LIVE_ONLY_HEADER: &str = "xmsg-live-only";
 pub struct PeerConfig {
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<String>,
@@ -392,6 +393,7 @@ pub struct PeersMap {
     name_by_canonical: HashMap<String, String>,
     pub hub: Option<HubConfig>,
     pub admitted_clients: Arc<std::sync::RwLock<HashMap<String, AdmittedClient>>>,
+    pub default_route_peer: Option<String>,
 }
 
 /// This node's own identity, for the peers loader's namespace checks.
@@ -490,6 +492,29 @@ impl PeersMap {
         self.ca_bundles_by_name.insert(peer.name.clone(), anchors);
         self.peers_by_name.insert(peer.name.clone(), peer);
         Ok(())
+    }
+
+    pub fn set_default_route(&mut self, peer_name: &str) -> Result<(), String> {
+        if !self.peers_by_name.contains_key(peer_name) {
+            return Err(format!("unknown peer '{peer_name}'"));
+        }
+        if self.default_route_peer.is_some()
+            && self.default_route_peer.as_deref() != Some(peer_name)
+        {
+            return Err(format!(
+                "at most one peer may be marked 'default_route' (default route): found duplicate on '{peer_name}'"
+            ));
+        }
+        self.default_route_peer = Some(peer_name.to_string());
+        Ok(())
+    }
+
+    pub fn default_route_peer(&self) -> Option<&str> {
+        self.default_route_peer.as_deref()
+    }
+
+    pub fn default_route_link(&self) -> Option<&PeerConfig> {
+        self.default_route_peer.as_deref().and_then(|p| self.get(p))
     }
 
     /// A peer by its entry key, or by its canonical node name.
@@ -788,6 +813,7 @@ impl PeersMap {
             String,
             String,
         )> = Vec::new();
+        let mut default_routes: Vec<String> = Vec::new();
         for (key_name, obj) in entries {
             if !is_wrapped
                 && key_name == "hub"
@@ -816,7 +842,7 @@ impl PeersMap {
             for k in obj.keys() {
                 match k.as_str() {
                     "name" | "address" | "pin" | "ca" | "identities" | "allow" | "from"
-                    | "leaf" | "principals" | "targets" | "dial" => {}
+                    | "leaf" | "principals" | "targets" | "dial" | "default_route" => {}
                     other => {
                         return Err(format!(
                             "unknown field '{other}' in peer config for '{name}'"
@@ -828,7 +854,7 @@ impl PeersMap {
             let address = obj
                 .get("address")
                 .and_then(|a| a.as_str())
-                .ok_or_else(|| format!("peer '{name}' missing required field 'address'"))?
+                .unwrap_or("")
                 .to_string();
 
             let has_pin = obj.contains_key("pin");
@@ -1052,6 +1078,14 @@ impl PeersMap {
                 (canonical, uri)
             };
 
+            let is_default_route: bool = if let Some(v) = obj.get("default_route") {
+                v.as_bool().ok_or_else(|| {
+                    format!("peer '{name}': 'default_route' must be a boolean")
+                })?
+            } else {
+                false
+            };
+
             let peer_config = PeerConfig {
                 name: name.clone(),
                 address,
@@ -1066,9 +1100,19 @@ impl PeersMap {
                 dial,
             };
             parsed.push((peer_config, ca_anchors, canonical, source));
+            if is_default_route {
+                default_routes.push(name.clone());
+            }
         }
 
         check_node_namespace(&parsed, own)?;
+
+        if default_routes.len() > 1 {
+            return Err(format!(
+                "at most one peer may be marked 'default_route' (default route): found {}",
+                default_routes.len()
+            ));
+        }
 
         if let Some(ref hub) = hub_config {
             let total_ca_anchors: usize = parsed
@@ -1110,6 +1154,7 @@ impl PeersMap {
                 map.insert(peer_config)?;
             }
         }
+        map.default_route_peer = default_routes.into_iter().next();
         if let Some(hub) = hub_config {
             map.hub = Some(hub);
         }
@@ -2426,14 +2471,14 @@ async fn fed_send_message_handler(
         None => (raw_target_ref.as_str(), None),
     };
     // The canonical name this node knows the sender by; it is what crosses the wire.
-    let sender_node = fed_state
-        .peers
+    let peers = fed_state.current_peers();
+    let sender_node = peers
         .canonical_name(&peer.name)
         .unwrap_or(&peer.name)
         .to_string();
 
     if let Some(dest) = dest_host {
-        let dest = fed_state.peers.key_for(dest).unwrap_or(dest);
+        let dest = peers.key_for(dest).unwrap_or(dest);
         // One-hop rule: cannot forward an already forwarded message
         if envelope.forwarded.is_some() {
             return Err(AppError::NoForward(
@@ -2449,7 +2494,7 @@ async fn fed_send_message_handler(
         }
 
         // Dest must be a known peer other than the sender
-        let dest_cfg = match fed_state.peers.get_peer_config(dest) {
+        let dest_cfg = match peers.get_peer_config(dest) {
             Some(cfg) if dest != peer.name => cfg,
             _ => return Err(AppError::UnknownPeer(dest.to_string())),
         };
@@ -2576,7 +2621,7 @@ async fn fed_send_message_handler(
                 outcome: outcome.to_string(),
                 recipient_harness: "fed".to_string(),
                 return_harness: None,
-                return_session_id: None,
+                return_session_id: origin.key().map(str::to_string),
                 return_host: Some(peer.name.clone()),
                 thread_id: envelope.thread_id.clone(),
             };
@@ -2595,7 +2640,7 @@ async fn fed_send_message_handler(
     // N-2: the origin's node is attested here, from the authenticated peer or, for a
     // forwarded envelope, its forwarder; it is shown by its local nickname, if any.
     let origin = attested_origin(&envelope.origin, &sender_node, envelope.forwarded.as_ref())?;
-    let from_name = origin.render(fed_state.peers.display_name(&origin.node));
+    let from_name = origin.render(fed_state.current_peers().display_name(&origin.node));
     let principal_key = origin_filter_key(&origin);
     // Replies always return to the origin node, which decides how they reach the sender
     // (A-2); here the sender is only its key, or anonymous.
@@ -2901,8 +2946,8 @@ async fn fed_reply_handler(
     }
 
     // 1. Check peer config and allow list
-    let peer_cfg = fed_state
-        .peers
+    let peers = fed_state.current_peers();
+    let peer_cfg = peers
         .get_peer_config(&peer.name)
         .ok_or_else(|| AppError::UnknownPeer(peer.name.clone()))?;
 
@@ -2913,8 +2958,7 @@ async fn fed_reply_handler(
     }
 
     // The replier, its node attested here (N-2).
-    let node = fed_state
-        .peers
+    let node = peers
         .canonical_name(&peer.name)
         .unwrap_or(&peer.name)
         .to_string();
@@ -2982,14 +3026,61 @@ async fn fed_reply_handler(
     };
 
     if let Some(fwd) = forwarded {
-        let origin_peer_cfg = fed_state
-            .peers
+        let origin_peer_cfg = peers
             .get(&fwd.origin_peer)
             .ok_or_else(|| AppError::UnknownPeer(fwd.origin_peer.clone()))?;
+
+        let orig_msg = {
+            let db = fed_state
+                .db
+                .lock()
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            storage::get_message(&db, &reply.in_reply_to)
+                .map_err(|e| AppError::Internal(e.to_string()))?
+        };
+
+        let origin_target_ref = orig_msg
+            .as_ref()
+            .and_then(|m| m.return_session_id.clone())
+            .unwrap_or_default();
 
         if !origin_peer_cfg.leaf && !origin_peer_cfg.is_outbound() {
             // Dialable origin: send federated reply to origin peer
             let _ = send_federated_reply(&fed_state, &fwd.origin_peer, &reply).await?;
+            {
+                let db = fed_state
+                    .db
+                    .lock()
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                let _ = storage::insert_forwarded_message(
+                    &db,
+                    &reply.id,
+                    &peer.name,
+                    reply.created_at,
+                );
+                let _ = storage::insert_outbound(
+                    &db,
+                    &reply.id,
+                    &fwd.origin_peer,
+                    &origin_target_ref,
+                    "pending",
+                    reply.created_at,
+                );
+                let fwd_reply_record = storage::MessageRecord {
+                    id: reply.id.clone(),
+                    created_at: reply.created_at,
+                    session_id: origin_target_ref,
+                    from_name: replier.render(&peer.name),
+                    bytes: reply.text.len(),
+                    outcome: "relayed".to_string(),
+                    recipient_harness: "fed".to_string(),
+                    return_harness: None,
+                    return_session_id: Some(replier_key.clone()),
+                    return_host: Some(peer.name.clone()),
+                    thread_id: reply.in_reply_to.clone(),
+                };
+                let _ = storage::insert_message(&db, &fwd_reply_record);
+            }
             return Ok((
                 StatusCode::OK,
                 Json(json!({
@@ -3017,6 +3108,34 @@ async fn fed_reply_handler(
                     Some(&reply.id),
                 )
                 .map_err(|e| AppError::Internal(e.to_string()))?;
+                let _ = storage::insert_forwarded_message(
+                    &db,
+                    &reply.id,
+                    &peer.name,
+                    reply.created_at,
+                );
+                let _ = storage::insert_outbound(
+                    &db,
+                    &reply.id,
+                    &fwd.origin_peer,
+                    &origin_target_ref,
+                    "pending",
+                    reply.created_at,
+                );
+                let fwd_reply_record = storage::MessageRecord {
+                    id: reply.id.clone(),
+                    created_at: reply.created_at,
+                    session_id: origin_target_ref,
+                    from_name: replier.render(&peer.name),
+                    bytes: reply.text.len(),
+                    outcome: "stored".to_string(),
+                    recipient_harness: "fed".to_string(),
+                    return_harness: None,
+                    return_session_id: Some(replier_key.clone()),
+                    return_host: Some(peer.name.clone()),
+                    thread_id: reply.in_reply_to.clone(),
+                };
+                let _ = storage::insert_message(&db, &fwd_reply_record);
             }
             let _ = fed_state.notify_tx.send(reply.in_reply_to.clone());
 
@@ -4165,10 +4284,11 @@ pub fn spawn_outbound_reply_poller(
 
                         if let Some(orig) = orig_msg {
                             if let (Some(ret_harness), Some(ret_session_id)) =
-                                (orig.return_harness, orig.return_session_id)
+                                (&orig.return_harness, &orig.return_session_id)
                             {
                                 let reply_id = r
                                     .pushed_message_id
+                                    .clone()
                                     .unwrap_or_else(|| format!("{}-{}", message_id, r.seq));
                                 let replier_badge = inbox::sender_label(
                                     &peer_name,
@@ -4178,11 +4298,11 @@ pub fn spawn_outbound_reply_poller(
                                 );
 
                                 let node = fed_state
-                                    .peers
+                                    .current_peers()
                                     .canonical_name(&peer_name)
                                     .unwrap_or(&peer_name)
                                     .to_string();
-                                if let Ok("sender_gone") = deliver_federated_reply_locally(
+                                match deliver_federated_reply_locally(
                                     &fed_state,
                                     &peer_name,
                                     &message_id,
@@ -4190,12 +4310,28 @@ pub fn spawn_outbound_reply_poller(
                                     &replier_badge,
                                     storage::Origin::instance(&r.replier_session_id, &node, None),
                                     &r.text,
-                                    &ret_harness,
-                                    &ret_session_id,
+                                    ret_harness,
+                                    ret_session_id,
                                 )
                                 .await
                                 {
-                                    should_stop = true;
+                                    Ok("sender_gone") => {
+                                        should_stop = true;
+                                    }
+                                    Ok("pushed") => {
+                                        if let Ok(db) = fed_state.db.lock() {
+                                            crate::surface::record_pushed_reply(
+                                                &db,
+                                                &orig,
+                                                &reply_id,
+                                                &replier_badge,
+                                                &r.text,
+                                                ("fed", &r.replier_session_id),
+                                                Some(&peer_name),
+                                            );
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -4224,6 +4360,15 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
     let wait_secs = 30u64;
 
     loop {
+        if !fed_state
+            .current_peers()
+            .get(&peer_name)
+            .is_some_and(|p| p.is_outbound())
+        {
+            info!(peer = %peer_name, "outbound peer removed or no longer outbound, exiting pull loop");
+            break;
+        }
+
         match get_federated_inbox(&fed_state, &peer_name, wait_secs).await {
             Ok(Some(FedInboxItem::List { query })) => {
                 backoff_millis = 100;
@@ -4268,7 +4413,7 @@ pub async fn run_outbound_peer_pull_loop(fed_state: Arc<FedState>, peer_name: St
                 let ret_host = peer_name.clone();
                 let from_name = msg
                     .origin
-                    .render(fed_state.peers.display_name(&msg.origin.node));
+                    .render(fed_state.current_peers().display_name(&msg.origin.node));
 
                 let resolved = resolve_target_session_fed(&fed_state, target_ref).await;
 
@@ -5020,10 +5165,14 @@ impl rustls::client::danger::ServerCertVerifier for DummyServerCertVerifier {
 pub struct CredentialReloader {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
-    pub ca_paths: HashMap<String, PathBuf>,
+    pub peers_path: Option<PathBuf>,
+    pub own: Option<OwnNode>,
+    pub ca_paths: Mutex<HashMap<String, PathBuf>>,
     pub file_hashes: Mutex<HashMap<PathBuf, Vec<u8>>>,
     pub dynamic_tls: Arc<std::sync::RwLock<Option<DynamicTls>>>,
-    pub peers: Arc<PeersMap>,
+    pub peers: Mutex<Arc<PeersMap>>,
+    pub fed_state: Option<Arc<FedState>>,
+    pub active_pull_loops: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl CredentialReloader {
@@ -5032,6 +5181,28 @@ impl CredentialReloader {
         key_path: PathBuf,
         peers: Arc<PeersMap>,
         dynamic_tls: Arc<std::sync::RwLock<Option<DynamicTls>>>,
+    ) -> Result<Self, AppError> {
+        Self::new_full(
+            cert_path,
+            key_path,
+            None,
+            None,
+            peers,
+            dynamic_tls,
+            None,
+            Arc::new(Mutex::new(std::collections::HashSet::new())),
+        )
+    }
+
+    pub fn new_full(
+        cert_path: PathBuf,
+        key_path: PathBuf,
+        peers_path: Option<PathBuf>,
+        own: Option<OwnNode>,
+        peers: Arc<PeersMap>,
+        dynamic_tls: Arc<std::sync::RwLock<Option<DynamicTls>>>,
+        fed_state: Option<Arc<FedState>>,
+        active_pull_loops: Arc<Mutex<std::collections::HashSet<String>>>,
     ) -> Result<Self, AppError> {
         let mut ca_paths = HashMap::new();
         for peer in peers.ca_peers() {
@@ -5043,10 +5214,14 @@ impl CredentialReloader {
         let reloader = Self {
             cert_path,
             key_path,
-            ca_paths,
+            peers_path,
+            own,
+            ca_paths: Mutex::new(ca_paths),
             file_hashes: Mutex::new(HashMap::new()),
             dynamic_tls,
-            peers,
+            peers: Mutex::new(peers),
+            fed_state,
+            active_pull_loops,
         };
 
         // Populate initial configuration and hashes
@@ -5081,7 +5256,19 @@ impl CredentialReloader {
         };
         current_hashes.insert(self.key_path.clone(), key_hash);
 
-        for (peer_name, ca_path) in &self.ca_paths {
+        if let Some(ref peers_path) = self.peers_path {
+            let peers_hash = match Self::compute_file_hash(peers_path) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!("failed to read peers file {}: {e}", peers_path.display());
+                    return Err(AppError::Internal(format!("failed to read peers file: {e}")));
+                }
+            };
+            current_hashes.insert(peers_path.clone(), peers_hash);
+        }
+
+        let ca_paths = self.ca_paths.lock().unwrap().clone();
+        for (peer_name, ca_path) in &ca_paths {
             let ca_hash = match Self::compute_file_hash(ca_path) {
                 Ok(h) => h,
                 Err(e) => {
@@ -5104,11 +5291,62 @@ impl CredentialReloader {
             return Ok(false);
         }
 
-        match self.build_tls_config() {
+        // If peers file is configured, reload it
+        let new_peers_map = if let Some(ref peers_path) = self.peers_path {
+            match PeersMap::load_from_file_for(peers_path, self.own.as_ref()) {
+                Ok(mut pm) => {
+                    // Preserve admitted_clients Arc across reload swap!
+                    let current_pm = self.peers.lock().unwrap().clone();
+                    pm.admitted_clients = current_pm.admitted_clients.clone();
+                    pm
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "invalid peers file '{}' during reload; keeping previous configuration: {e}",
+                        peers_path.display()
+                    );
+                    return Err(AppError::Internal(format!(
+                        "invalid peers file '{}': {e}",
+                        peers_path.display()
+                    )));
+                }
+            }
+        } else {
+            (*self.peers.lock().unwrap()).as_ref().clone()
+        };
+
+        match self.build_tls_config(&new_peers_map) {
             Ok(new_dyn_tls) => {
+                let mut new_ca_paths = HashMap::new();
+                for peer in new_peers_map.ca_peers() {
+                    if let Some(ref ca_path) = peer.ca {
+                        new_ca_paths.insert(peer.name.clone(), ca_path.clone());
+                    }
+                }
+                *self.ca_paths.lock().unwrap() = new_ca_paths;
+
+                *self.peers.lock().unwrap() = Arc::new(new_peers_map.clone());
                 *self.dynamic_tls.write().unwrap() = Some(new_dyn_tls);
                 *self.file_hashes.lock().unwrap() = current_hashes;
-                tracing::info!("successfully reloaded federation TLS credentials and CA bundles");
+
+                // Reconcile outbound pull loops
+                if let Some(ref fs) = self.fed_state {
+                    let mut active = self.active_pull_loops.lock().unwrap();
+                    for (peer_name, peer_cfg) in new_peers_map.iter() {
+                        if peer_cfg.is_outbound() && !active.contains(peer_name) {
+                            active.insert(peer_name.clone());
+                            let fs_clone = fs.clone();
+                            let peer_clone = peer_name.clone();
+                            let active_clone = self.active_pull_loops.clone();
+                            tokio::spawn(async move {
+                                run_outbound_peer_pull_loop(fs_clone, peer_clone.clone()).await;
+                                active_clone.lock().unwrap().remove(&peer_clone);
+                            });
+                        }
+                    }
+                }
+
+                tracing::info!("successfully reloaded federation TLS credentials and peers");
                 Ok(true)
             }
             Err(e) => {
@@ -5120,7 +5358,7 @@ impl CredentialReloader {
         }
     }
 
-    fn build_tls_config(&self) -> Result<DynamicTls, AppError> {
+    fn build_tls_config(&self, peers: &PeersMap) -> Result<DynamicTls, AppError> {
         let cert_pem = std::fs::read(&self.cert_path).map_err(|e| {
             AppError::Internal(format!(
                 "failed to read cert file {}: {e}",
@@ -5153,10 +5391,16 @@ impl CredentialReloader {
         let key_der = key.secret_der().to_vec();
 
         let mut ca_anchors = HashMap::new();
-        let mut new_peers = (*self.peers).clone();
+        let mut new_peers = peers.clone();
 
-        for (peer_name, ca_path) in &self.ca_paths {
-            let ca_pem = std::fs::read(ca_path).map_err(|e| {
+        let ca_peer_configs: Vec<(String, PathBuf)> = peers
+            .ca_peers()
+            .into_iter()
+            .filter_map(|p| p.ca.as_ref().map(|ca| (p.name.clone(), ca.clone())))
+            .collect();
+
+        for (peer_name, ca_path) in ca_peer_configs {
+            let ca_pem = std::fs::read(&ca_path).map_err(|e| {
                 AppError::Internal(format!("failed to read CA file {}: {e}", ca_path.display()))
             })?;
             let anchors = parse_ca_bundle_pem(&ca_pem).map_err(|e| {
@@ -5169,8 +5413,8 @@ impl CredentialReloader {
                     "CA bundle for peer '{peer_name}' contains 0 certificates"
                 )));
             }
-            new_peers.update_ca_anchors(peer_name, anchors.clone());
-            ca_anchors.insert(peer_name.clone(), anchors);
+            new_peers.update_ca_anchors(&peer_name, anchors.clone());
+            ca_anchors.insert(peer_name, anchors);
         }
 
         let new_peers_arc = Arc::new(new_peers);

@@ -706,10 +706,18 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let active_pull_loops = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
     let fed_state = if let Some(peers_file) = args.peers_file {
         let peers = xmsg::fed::PeersMap::load_from_file_for(&peers_file, own.as_ref())
             .map_err(|e| format!("failed to load peers file: {e}"))?;
         let peers_arc = Arc::new(peers);
+
+        for (peer_name, peer_cfg) in peers_arc.iter() {
+            if peer_cfg.is_outbound() {
+                active_pull_loops.lock().unwrap().insert(peer_name.clone());
+            }
+        }
 
         let fs = Arc::new(xmsg::fed::FedState {
             node_name: node_name.clone(),
@@ -737,11 +745,15 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         });
 
         if let (Some(cert_path), Some(key_path)) = (&args.fed_cert, &args.fed_key) {
-            let reloader = xmsg::fed::CredentialReloader::new(
+            let reloader = xmsg::fed::CredentialReloader::new_full(
                 cert_path.clone(),
                 key_path.clone(),
+                Some(peers_file.clone()),
+                own.clone(),
                 peers_arc.clone(),
                 fs.dynamic_tls.clone(),
+                Some(fs.clone()),
+                active_pull_loops.clone(),
             )
             .map_err(|e| format!("failed to initialize credential reloader: {e}"))?;
 
@@ -822,8 +834,10 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if peer_cfg.is_outbound() {
                     let fs_clone = fs.clone();
                     let peer_clone = peer_name.clone();
+                    let active_clone = active_pull_loops.clone();
                     bg_tasks.push(tokio::spawn(async move {
-                        xmsg::fed::run_outbound_peer_pull_loop(fs_clone, peer_clone).await;
+                        xmsg::fed::run_outbound_peer_pull_loop(fs_clone, peer_clone.clone()).await;
+                        active_clone.lock().unwrap().remove(&peer_clone);
                     }));
                 }
             }

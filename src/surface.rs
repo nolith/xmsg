@@ -896,12 +896,31 @@ async fn deliver_send(
     // `@node` scopes resolution to that node; a bare reference resolves over the view (XA6).
     let mut dest = match (node, state.fed_state.as_ref()) {
         (Some(n), _) if n == state.node_name => Dest::Local,
-        (Some(n), Some(fs)) if fs.peers.contains_name(n) => Dest::Peer {
-            node: fs.peers.key_for(n).unwrap_or(n).to_string(),
-            key: target_ref.to_string(),
-            cached: false,
-            id: false,
-        },
+        (Some(n), Some(fs)) => {
+            let peers = fs.current_peers();
+            let direct_peer = peers.get(n).filter(|p| !p.address.is_empty());
+            if let Some(peer) = direct_peer {
+                Dest::Peer {
+                    node: peer.name.clone(),
+                    key: target_ref.to_string(),
+                    cached: false,
+                    id: false,
+                }
+            } else if let Some(hub_peer) = peers.default_route_link() {
+                let wire_node = peers
+                    .key_for(n)
+                    .and_then(|k| peers.canonical_name(k))
+                    .unwrap_or(n);
+                Dest::Peer {
+                    node: hub_peer.name.clone(),
+                    key: format!("{target_ref}@{wire_node}"),
+                    cached: false,
+                    id: false,
+                }
+            } else {
+                return Err(AppError::UnknownPeer(n.to_string()));
+            }
+        }
         (Some(n), _) => return Err(AppError::UnknownPeer(n.to_string())),
         (None, Some(fs)) => crate::mesh::resolve(state, fs, target_ref).await?,
         (None, None) => Dest::Local,
@@ -1000,15 +1019,18 @@ async fn deliver_send(
             // A live listing that took the message is cached, whether delivered or held for
             // a live plugin or pi session's ack; a leaf's mailbox is not a live listing. Only
             // a fresh resolution is cached, so a location is at most the TTL old (A-12).
-            let leaf = fed_state.peers.get(&peer_key).is_some_and(|p| p.leaf);
+            let peers = fed_state.current_peers();
+            let leaf = peers.get(&peer_key).is_some_and(|p| p.leaf);
             if id && !cached && !leaf {
                 crate::mesh::remember(state, &key, &peer_key);
             }
-            let address = format!("{}@{peer_key}", resp.session_id);
+            let address = match node {
+                Some(n) => format!("{}@{n}", resp.session_id),
+                None => format!("{}@{peer_key}", resp.session_id),
+            };
             // A-2: the outbound reply poller is armed by the sender's kind.
             if ret_harness.is_some()
-                && fed_state
-                    .peers
+                && peers
                     .get(&peer_key)
                     .is_some_and(|p| p.is_outbound())
             {
@@ -1307,7 +1329,7 @@ async fn deliver_reply(
         state
             .fed_state
             .as_ref()
-            .and_then(|fs| fs.peers.get(h))
+            .and_then(|fs| fs.current_peers().get(h).cloned())
             .is_some_and(|p| p.leaf)
     });
     let has_inbox = msg.return_harness.is_some() && msg.return_session_id.is_some();
