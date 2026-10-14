@@ -2607,6 +2607,7 @@ async fn fed_reply_handler(
         .and_then(|m| Some((m.return_harness.clone()?, m.return_session_id.clone()?)))
     {
         let replier_badge = replier.render(&peer.name);
+        let replier_id = replier.key().map(str::to_string);
 
         let push_res = deliver_federated_reply_locally(
             &fed_state,
@@ -2620,6 +2621,21 @@ async fn fed_reply_handler(
             &ret_session_id,
         )
         .await?;
+        // The pushed reply is a message its receiver may answer, back across federation
+        // to the replier, as a message received from that peer is (A-2).
+        if let (Some(orig), Some(id), "pushed") = (&orig_msg, &replier_id, push_res) {
+            if let Ok(db) = fed_state.db.lock() {
+                crate::surface::record_pushed_reply(
+                    &db,
+                    orig,
+                    &reply.id,
+                    &replier_badge,
+                    &reply.text,
+                    ("fed", id),
+                    Some(&peer.name),
+                );
+            }
+        }
 
         return Ok((
             StatusCode::OK,

@@ -1441,3 +1441,184 @@ async fn test_idem_keyed_retry_after_peer_delivery_failure_delivers() {
     })
     .await;
 }
+
+// =============================================================================
+// Oracle 12: A reply that arrived over federation is itself answerable, in both directions
+// (A-2, A7). Alice on A sends X to B's `answerer`; its reply R is pushed to Alice; Alice
+// answers R, which reaches `answerer` on B attributed to Alice with `inReplyTo` R; and
+// `answerer` answers that, which reaches Alice: three hops, one thread.
+// A redelivered R (the same `/fed/v2/replies` envelope again) is recorded and pushed once.
+// Mutant: no message record for a reply pushed from a peer => RED, `not_found`.
+// =============================================================================
+
+struct Pair {
+    a: Node,
+    _b: Node,
+    ca_b: Creds,
+    pin_a: String,
+    alice: Arc<Mutex<Vec<String>>>,
+    r: BufReader<OwnedReadHalf>,
+    w: OwnedWriteHalf,
+    x: String,
+    reply: String,
+}
+
+/// The `message_id=` a pushed reply line carries for itself (the second one in it).
+fn pushed_id(line: &str) -> String {
+    let rest = line
+        .split("message_id=")
+        .nth(2)
+        .expect("a pushed reply's own ID");
+    rest.chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+/// Alice on A has sent X to `answerer@eve.b`, and its reply R has been pushed to her.
+async fn replied_pair() -> Pair {
+    let ca = Ca::new();
+    let (ca_a, ca_b) = (ca.issue(URI_A), ca.issue(URI_B));
+    let (pa, pb) = (prepare(&ca), prepare(&ca));
+    let peers_a =
+        json!({ "eve.b": ca_entry(pb.fed_port, &pa.ca_file(), URI_B, &["send", "reply"]) });
+    let peers_b =
+        json!({ "sini.a": ca_entry(pa.fed_port, &pb.ca_file(), URI_A, &["send", "reply"]) });
+    let b = start(pb, &ca_b, peers_b, None, Some("answerer")).await;
+    let a = start(pa, &ca_a, peers_a, None, None).await;
+    let alice = claude_session(&a.sessions_dir, "alice", "Alice");
+    let (mut r, mut w) = register_svc(&b.register_sock, "answerer").await;
+
+    let sent = agent_send(&a, "answerer@eve.b", "x from alice").await;
+    assert_eq!(sent["status"], "ok", "{sent}");
+    let x = sent["message_id"].as_str().unwrap().to_string();
+    let got = svc_poll(&mut r, &mut w).await;
+    assert_eq!(got["text"], "x from alice", "{got}");
+    let replied = svc_reply(
+        &mut r,
+        &mut w,
+        got["messageId"].as_str().unwrap(),
+        "r to alice",
+    )
+    .await;
+    assert_eq!(replied["status"], "ok", "{replied}");
+    let line = wait_line(&alice, "r to alice")
+        .await
+        .expect("B's reply is pushed into the Claude session on A");
+    let reply = pushed_id(&line);
+    assert_eq!(
+        replied["messageId"].as_str(),
+        Some(reply.as_str()),
+        "{replied} / {line}"
+    );
+    Pair {
+        a,
+        _b: b,
+        pin_a: ca_a.pin.clone(),
+        ca_b,
+        alice,
+        r,
+        w,
+        x,
+        reply,
+    }
+}
+
+/// A reply over `agent.sock` from this process, the Claude fake on that node.
+async fn agent_reply(node: &Node, message_id: &str, text: &str) -> Value {
+    let stream = UnixStream::connect(&node.agent_sock).await.unwrap();
+    let (r, mut w) = stream.into_split();
+    let mut r = BufReader::new(r);
+    let frame = json!({ "action": "reply", "message_id": message_id, "text": text });
+    w.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+    let mut line = String::new();
+    r.read_line(&mut line).await.unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_12_a_federated_reply_is_answerable() {
+    run_with_port_retry(|| async {
+        let Pair {
+            a,
+            _b,
+            alice,
+            mut r,
+            mut w,
+            reply,
+            ..
+        } = replied_pair().await;
+
+        // Alice answers R: it reaches `answerer` on B, from Alice, in reply to R.
+        let answered = agent_reply(&a, &reply, "a2 to answerer").await;
+        assert_eq!(answered["status"], "ok", "Alice answers R: {answered}");
+        assert_eq!(answered["reply"]["pushOutcome"], "pushed", "{answered}");
+        let got = svc_poll(&mut r, &mut w).await;
+        assert_eq!(got["action"], "deliver", "{got}");
+        assert_eq!(got["text"], "a2 to answerer", "{got}");
+        assert_eq!(got["inReplyTo"], reply.as_str(), "{got}");
+        assert_eq!(got["origin"]["id"], "alice", "attributed to Alice: {got}");
+        assert_eq!(got["origin"]["node"], "sini.a", "attested to A: {got}");
+
+        // `answerer` answers Alice's reply: it reaches Alice on A.
+        let a2 = got["messageId"].as_str().unwrap().to_string();
+        let replied = svc_reply(&mut r, &mut w, &a2, "b3 to alice").await;
+        assert_eq!(replied["status"], "ok", "answerer answers A2: {replied}");
+        let line = wait_line(&alice, "b3 to alice")
+            .await
+            .expect("the third hop is pushed into the Claude session on A");
+        assert!(line.contains(&format!("message_id={a2}")), "{line}");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_12b_a_redelivered_federated_reply_is_recorded_once() {
+    run_with_port_retry(|| async {
+        let p = replied_pair().await;
+        // B delivers R again: the same envelope, as a retry after a lost answer would.
+        let b = Origin {
+            cert_der: &p.ca_b.cert_der,
+            key_der: &p.ca_b.key_der,
+        };
+        let env = json!({
+            "v": 2, "id": p.reply, "in_reply_to": p.x,
+            "replier": { "service": "answerer", "node": "x" },
+            "text": "r to alice", "created_at": 1000,
+        });
+        let (status, body) = hop_client::request(
+            &b,
+            &p.pin_a,
+            p.a.fed_port,
+            "POST",
+            "/fed/v2/replies",
+            Some(env),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        {
+            let db = rusqlite::Connection::open(p.a.tmp.path().join("node.db")).unwrap();
+            let count =
+                |sql: &str| -> i64 { db.query_row(sql, [&p.reply], |row| row.get(0)).unwrap() };
+            assert_eq!(count("SELECT COUNT(*) FROM messages WHERE id = ?1"), 1);
+            assert_eq!(
+                count("SELECT COUNT(*) FROM replies WHERE pushed_message_id = ?1"),
+                1
+            );
+            let pushes = p
+                .alice
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.contains("r to alice"))
+                .count();
+            assert_eq!(pushes, 1, "R is pushed to Alice once");
+        }
+
+        // And it is still answerable.
+        let answered = agent_reply(&p.a, &p.reply, "after redelivery").await;
+        assert_eq!(answered["status"], "ok", "{answered}");
+    })
+    .await;
+}

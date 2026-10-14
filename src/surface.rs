@@ -1252,6 +1252,42 @@ pub async fn reply(
     task.await.map_err(|e| AppError::Internal(e.to_string()))?
 }
 
+/// Records `reply_id`, a reply to `msg` pushed to its sender, as a message that sender
+/// may answer in turn: to `replier` (harness, ID), through `return_host` when the replier
+/// is on another node, in `msg`'s thread. An anonymous sender has no reply rights, so
+/// nothing is recorded; an ID already recorded (a redelivered reply) is kept.
+pub(crate) fn record_pushed_reply(
+    db: &rusqlite::Connection,
+    msg: &MessageRecord,
+    reply_id: &str,
+    from_name: &str,
+    text: &str,
+    replier: (&str, &str),
+    return_host: Option<&str>,
+) {
+    let (Some(harness), Some(session_id)) = (&msg.return_harness, &msg.return_session_id) else {
+        return;
+    };
+    let pushed = MessageRecord {
+        id: reply_id.to_string(),
+        created_at: storage::now_epoch_secs(),
+        session_id: session_id.clone(),
+        from_name: from_name.to_string(),
+        bytes: text.len(),
+        outcome: "delivered".to_string(),
+        recipient_harness: harness.clone(),
+        return_harness: Some(replier.0.to_string()),
+        return_session_id: Some(replier.1.to_string()),
+        thread_id: if msg.thread_id.is_empty() {
+            msg.id.clone()
+        } else {
+            msg.thread_id.clone()
+        },
+        return_host: return_host.map(str::to_string),
+    };
+    let _ = storage::insert_message(db, &pushed);
+}
+
 /// `reply`'s push and record, under its reserved `reply_id`.
 async fn deliver_reply(
     state: &AppState,
@@ -1306,31 +1342,54 @@ async fn deliver_reply(
             )
             .await;
             if outcome == "pushed" {
-                // The pushed reply is itself a message its receiver may answer.
-                let pushed = MessageRecord {
-                    id: reply_id.clone(),
-                    created_at: storage::now_epoch_secs(),
-                    session_id: ret_session_id.to_string(),
-                    from_name: replier_label,
-                    bytes: text.len(),
-                    outcome: "delivered".to_string(),
-                    recipient_harness: ret_harness.to_string(),
-                    return_harness: Some(caller.harness.clone()),
-                    return_session_id: Some(caller.session_id.clone()),
-                    thread_id: if msg.thread_id.is_empty() {
-                        msg.id.clone()
-                    } else {
-                        msg.thread_id.clone()
-                    },
-                    return_host: None,
-                };
                 if let Ok(db) = state.db.lock() {
-                    let _ = storage::insert_message(&db, &pushed);
+                    record_pushed_reply(
+                        &db,
+                        &msg,
+                        &reply_id,
+                        &replier_label,
+                        text,
+                        (&caller.harness, &caller.session_id),
+                        None,
+                    );
                 }
             }
             Some(outcome)
         }
     };
+    // A reply pushed to a remote origin is a message sent there, which its receiver may
+    // answer: recorded as sent, with its recipient in `outbound` (A7's reply rule).
+    if let (Some(host), Some("pushed"), Some(to)) =
+        (remote_host, push_outcome, msg.return_session_id.as_deref())
+    {
+        if let Ok(db) = state.db.lock() {
+            let label = inbox::sender_label(
+                &state.node_name,
+                &caller.harness,
+                &caller.session_id,
+                caller.name.as_deref(),
+            );
+            record_pushed_reply(
+                &db,
+                &msg,
+                &reply_id,
+                &label,
+                text,
+                (&caller.harness, &caller.session_id),
+                None,
+            );
+            let now = storage::now_epoch_secs();
+            let _ = storage::insert_outbound(
+                &db,
+                &reply_id,
+                host,
+                &format!("{to}@{host}"),
+                "delivered",
+                now,
+            );
+            let _ = storage::mark_outbound_resolved(&db, &reply_id);
+        }
+    }
     // The pushed copy's ID: a local push that landed, or the envelope a remote origin
     // received (which deduplicates by it).
     let pushed_id = match (remote_host, push_outcome) {
