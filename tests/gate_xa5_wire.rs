@@ -238,6 +238,7 @@ async fn start(
             Some(_) => register_sock.exists() && http_up,
             None => {
                 agent_sock.exists()
+                    && register_sock.exists()
                     && http_up
                     && tokio::net::TcpStream::connect(("127.0.0.1", fed_port))
                         .await

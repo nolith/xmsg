@@ -50,7 +50,12 @@ async fn start_harness(db_path: Option<PathBuf>) -> X10Harness {
     let (base_url, db, server_task, agent_server_task) =
         start_server(sess_dir.path(), Some(agent_sock_path.clone()), db_path).await;
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..600 {
+        if agent_sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     X10Harness {
         _sess_dir: Some(sess_dir),

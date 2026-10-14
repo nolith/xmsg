@@ -220,7 +220,9 @@ async fn start_with(
 impl Node {
     async fn spawn(&mut self, fed_port: u16) {
         let agent_sock = self.run_dir.join("agent.sock");
+        let http_sock = self.run_dir.join("http.sock");
         let _ = fs::remove_file(&agent_sock);
+        let _ = fs::remove_file(&http_sock);
         let mut child = tokio::process::Command::new(BIN)
             .env("XDG_RUNTIME_DIR", &self.run_dir)
             .env("HOME", &self.run_dir)
@@ -239,6 +241,7 @@ impl Node {
                 panic!("node exited at start (failed to bind?): {err}");
             }
             let up = agent_sock.exists()
+                && http_sock.exists()
                 && tokio::net::TcpStream::connect(("127.0.0.1", self.http_port))
                     .await
                     .is_ok()

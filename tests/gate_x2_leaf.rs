@@ -129,7 +129,14 @@ async fn test_oracle_1_leaf_binds_no_harness_sockets_or_fed_listener() {
         panic!("Leaf HTTP server should respond on --listen (exit: {exited:?}): {stderr}");
     };
 
-    // In X19, leaf mode additionally serves register.sock (mode 0600) for its svc daemon
+    // In X19, leaf mode additionally serves register.sock (mode 0600) for its svc daemon. Its
+    // bind and chmod run in a spawned task, so they can trail the HTTP listener.
+    for _ in 0..600 {
+        if fs::metadata(&register_sock).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o600) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
         register_sock.exists(),
         "X19: leaf mode additionally serves register.sock (expected: {})",
