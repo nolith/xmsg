@@ -270,6 +270,118 @@ pub fn uri_matches_any_identity(uri: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|p| uri_matches_identity(uri, p))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubRule {
+    pub pattern: String,
+    pub allow: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubConfig {
+    pub patterns: Vec<String>,
+    pub rules: Vec<HubRule>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdmittedClient {
+    pub canonical_name: String,
+    pub uri: String,
+    pub pin: String,
+    pub config: PeerConfig,
+}
+
+/// Matches a SPIFFE URI against an identity pattern.
+/// Pattern matching is on the full SPIFFE URI with '*' matching exactly one path segment (no '/' inside).
+/// Names compare exactly.
+pub fn spiffe_uri_matches_pattern(uri: &str, pattern: &str) -> bool {
+    let (Some(uri_body), Some(pat_body)) = (
+        uri.strip_prefix("spiffe://"),
+        pattern.strip_prefix("spiffe://"),
+    ) else {
+        return false;
+    };
+    if uri.contains('?') || uri.contains('#') {
+        return false;
+    }
+    let u_segs: Vec<&str> = uri_body.split('/').collect();
+    let p_segs: Vec<&str> = pat_body.split('/').collect();
+    if u_segs.len() != p_segs.len() {
+        return false;
+    }
+    for (u, p) in u_segs.iter().zip(p_segs.iter()) {
+        if u.is_empty() || *u == "." || *u == ".." {
+            return false;
+        }
+        if *p == "*" {
+            continue;
+        }
+        if u != p {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validates a SPIFFE URI pattern at configuration load time.
+/// Wildcards are only supported as a single, entire path segment '*'.
+pub fn validate_spiffe_pattern(pattern: &str) -> Result<(), String> {
+    let Some(body) = pattern.strip_prefix("spiffe://") else {
+        return Err(format!(
+            "identity pattern '{pattern}' must start with 'spiffe://'"
+        ));
+    };
+    if pattern.contains('?') || pattern.contains('#') {
+        return Err(format!(
+            "identity pattern '{pattern}' contains forbidden query/fragment"
+        ));
+    }
+    let segs: Vec<&str> = body.split('/').collect();
+    if segs.len() < 2 {
+        return Err(format!(
+            "identity pattern '{pattern}' must contain an authority and a path"
+        ));
+    }
+    for seg in segs {
+        if seg.is_empty() {
+            return Err(format!(
+                "identity pattern '{pattern}' contains an empty path segment"
+            ));
+        }
+        if seg == "." || seg == ".." {
+            return Err(format!(
+                "identity pattern '{pattern}' contains relative path segments"
+            ));
+        }
+        if seg.contains('*') && seg != "*" {
+            return Err(format!("invalid identity pattern '{pattern}': wildcards only supported as a full segment '*'"));
+        }
+    }
+    Ok(())
+}
+
+/// Returns true if an admission pattern and a rule pattern could match a common URI.
+/// "Orphaned rule": defined as no admission pattern that could match any URI
+/// the rule matches (segment-wise, where '*' meets a literal or '*').
+pub fn patterns_compatible(admission: &str, rule: &str) -> bool {
+    let (Some(adm_body), Some(rule_body)) = (
+        admission.strip_prefix("spiffe://"),
+        rule.strip_prefix("spiffe://"),
+    ) else {
+        return false;
+    };
+    let adm_segs: Vec<&str> = adm_body.split('/').collect();
+    let rule_segs: Vec<&str> = rule_body.split('/').collect();
+    if adm_segs.len() != rule_segs.len() {
+        return false;
+    }
+    for (a, r) in adm_segs.iter().zip(rule_segs.iter()) {
+        if *a != "*" && *r != "*" && a != r {
+            return false;
+        }
+    }
+    true
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PeersMap {
     peers_by_name: HashMap<String, PeerConfig>,
@@ -278,6 +390,8 @@ pub struct PeersMap {
     /// Entry key -> canonical node name, and back (B5's nickname translation).
     canonical_by_name: HashMap<String, String>,
     name_by_canonical: HashMap<String, String>,
+    pub hub: Option<HubConfig>,
+    pub admitted_clients: Arc<std::sync::RwLock<HashMap<String, AdmittedClient>>>,
 }
 
 /// This node's own identity, for the peers loader's namespace checks.
@@ -432,8 +546,37 @@ impl PeersMap {
         self.ca_bundles_by_name.insert(name.to_string(), anchors);
     }
 
+    pub fn all_ca_anchors(&self) -> Vec<rustls::pki_types::TrustAnchor<'static>> {
+        let mut anchors = Vec::new();
+        for bundle in self.ca_bundles_by_name.values() {
+            anchors.extend(bundle.iter().cloned());
+        }
+        anchors
+    }
+
+    pub fn contains_concrete_name(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    pub fn get_peer_config(&self, name: &str) -> Option<PeerConfig> {
+        if let Some(p) = self.get(name) {
+            return Some(p.clone());
+        }
+        if let Ok(admitted) = self.admitted_clients.read() {
+            if let Some(adm) = admitted.get(name) {
+                return Some(adm.config.clone());
+            }
+        }
+        None
+    }
+
     pub fn contains_name(&self, name: &str) -> bool {
         self.get(name).is_some()
+            || self
+                .admitted_clients
+                .read()
+                .ok()
+                .is_some_and(|adm| adm.contains_key(name))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -464,7 +607,106 @@ impl PeersMap {
             .filter_map(|p| p.pin.as_ref().map(|pin| (pin.clone(), p.name.clone())))
             .collect()
     }
+}
 
+fn parse_hub_config(hub_val: &serde_json::Value) -> Result<HubConfig, String> {
+    let hub_obj = hub_val
+        .as_object()
+        .ok_or_else(|| "'hub' field must be an object".to_string())?;
+
+    for k in hub_obj.keys() {
+        match k.as_str() {
+            "patterns" | "rules" => {}
+            other => return Err(format!("unknown field '{other}' in hub config")),
+        }
+    }
+
+    let pat_arr = hub_obj
+        .get("patterns")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "hub config missing required 'patterns' array".to_string())?;
+    if pat_arr.is_empty() {
+        return Err("hub 'patterns' array must not be empty".to_string());
+    }
+
+    let mut patterns = Vec::new();
+    for p_val in pat_arr {
+        let p_str = p_val
+            .as_str()
+            .ok_or_else(|| "hub 'patterns' elements must be strings".to_string())?;
+        validate_spiffe_pattern(p_str)?;
+        patterns.push(p_str.to_string());
+    }
+
+    let mut rules = Vec::new();
+    if let Some(r_val) = hub_obj.get("rules") {
+        let r_arr = r_val
+            .as_array()
+            .ok_or_else(|| "hub 'rules' must be an array".to_string())?;
+        let mut seen_rule_patterns = std::collections::HashSet::new();
+        for item in r_arr {
+            let r_obj = item
+                .as_object()
+                .ok_or_else(|| "hub rule must be an object".to_string())?;
+            for k in r_obj.keys() {
+                match k.as_str() {
+                    "pattern" | "allow" => {}
+                    other => return Err(format!("unknown field '{other}' in hub rule")),
+                }
+            }
+            let pat = r_obj
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "hub rule missing 'pattern'".to_string())?;
+            validate_spiffe_pattern(pat)?;
+            if !seen_rule_patterns.insert(pat.to_string()) {
+                return Err(format!("duplicate hub rule pattern '{pat}'"));
+            }
+
+            let allow_arr = r_obj
+                .get("allow")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| format!("hub rule for pattern '{pat}' missing 'allow' array"))?;
+            if allow_arr.is_empty() {
+                return Err(format!(
+                    "hub rule for pattern '{pat}' has empty 'allow' list"
+                ));
+            }
+            let mut allow = Vec::new();
+            for op_val in allow_arr {
+                let op = op_val.as_str().ok_or_else(|| {
+                    format!("hub rule for pattern '{pat}': 'allow' items must be strings")
+                })?;
+                match op {
+                    "send" | "reply" | "list" | "forward" => allow.push(op.to_string()),
+                    other => {
+                        return Err(format!(
+                            "unknown operation '{other}' in hub rule for pattern '{pat}'"
+                        ))
+                    }
+                }
+            }
+
+            // Orphaned rule check (Amendment 7):
+            // "Orphaned rule": define it as no admission pattern that could match any URI
+            // the rule matches (segment-wise, where * meets literal or *).
+            if !patterns.iter().any(|adm| patterns_compatible(adm, pat)) {
+                return Err(format!(
+                    "orphaned hub rule for pattern '{pat}': no admission pattern matches it"
+                ));
+            }
+
+            rules.push(HubRule {
+                pattern: pat.to_string(),
+                allow,
+            });
+        }
+    }
+
+    Ok(HubConfig { patterns, rules })
+}
+
+impl PeersMap {
     pub fn load_from_json(json_str: &str) -> Result<Self, String> {
         Self::load_from_json_for(json_str, None)
     }
@@ -489,9 +731,26 @@ impl PeersMap {
                 })
                 .collect()
         };
+        let mut hub_config: Option<HubConfig> = None;
+        let mut is_wrapped = false;
         let owned_entries: PeerObjects = match &val {
             serde_json::Value::Object(map) => {
-                if map.contains_key("peers") {
+                is_wrapped = map.contains_key("peers");
+
+                if is_wrapped {
+                    for k in map.keys() {
+                        match k.as_str() {
+                            "peers" | "hub" => {}
+                            other => {
+                                return Err(format!("unknown field '{other}' in peers config"));
+                            }
+                        }
+                    }
+
+                    if let Some(hub_val) = map.get("hub") {
+                        hub_config = Some(parse_hub_config(hub_val)?);
+                    }
+
                     #[derive(Deserialize)]
                     struct Wrapped {
                         peers: Members,
@@ -530,6 +789,16 @@ impl PeersMap {
             String,
         )> = Vec::new();
         for (key_name, obj) in entries {
+            if !is_wrapped
+                && key_name == "hub"
+                && (obj.contains_key("patterns") || obj.contains_key("rules"))
+            {
+                return Err(
+                    "hub block is only permitted in wrapped form: expected {\"peers\": {...}, \"hub\": {...}}"
+                        .to_string(),
+                );
+            }
+
             let name = obj
                 .get("name")
                 .and_then(|n| n.as_str())
@@ -801,6 +1070,38 @@ impl PeersMap {
 
         check_node_namespace(&parsed, own)?;
 
+        if let Some(ref hub) = hub_config {
+            let total_ca_anchors: usize = parsed
+                .iter()
+                .filter_map(|(_, a, _, _)| a.as_ref())
+                .map(|v| v.len())
+                .sum();
+            if total_ca_anchors == 0 {
+                return Err(
+                    "hub configuration requires at least one CA trust anchor from peers; no CA peer configured".to_string(),
+                );
+            }
+
+            for pattern in &hub.patterns {
+                if !pattern.contains('*') {
+                    if let Ok(canonical) = crate::node::node_name_from_uri(pattern) {
+                        if let Some(own) = own {
+                            if canonical == own.name {
+                                return Err(format!(
+                                    "hub pattern '{pattern}' derives this node's own name '{canonical}'"
+                                ));
+                            }
+                        }
+                        if parsed.iter().any(|(_, _, c, _)| c == &canonical) {
+                            return Err(format!(
+                                "hub pattern '{pattern}' derives node name '{canonical}', colliding with concrete peer"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         let mut map = Self::empty();
         for (peer_config, ca_anchors, _, _) in parsed {
             if let Some(anchors) = ca_anchors {
@@ -808,6 +1109,9 @@ impl PeersMap {
             } else {
                 map.insert(peer_config)?;
             }
+        }
+        if let Some(hub) = hub_config {
+            map.hub = Some(hub);
         }
         Ok(map)
     }
@@ -901,6 +1205,93 @@ impl PeersMap {
         if ca_matches.len() == 1 {
             let (peer, uri) = ca_matches.remove(0);
             return Ok((peer.clone(), Some(uri)));
+        }
+
+        if let Some(ref hub) = self.hub {
+            let uris = extract_uri_sans(leaf.as_ref()).unwrap_or_default();
+            if uris.len() == 1 {
+                let uri = &uris[0];
+                let matches_pattern = hub
+                    .patterns
+                    .iter()
+                    .any(|pat| spiffe_uri_matches_pattern(uri, pat));
+                if matches_pattern {
+                    let all_anchors = self.all_ca_anchors();
+                    if verify_cert_chain(
+                        leaf,
+                        intermediates,
+                        &all_anchors,
+                        UnixTime::now(),
+                        webpki::KeyUsage::client_auth(),
+                    )
+                    .is_ok()
+                    {
+                        let canonical =
+                            crate::node::node_name_from_uri(uri).map_err(AppError::PeerRejected)?;
+
+                        // Amendment 3: A pattern-derived name equal to a concrete peer's name is refused
+                        if self.contains_concrete_name(&canonical) {
+                            let msg = format!(
+                                "hub admitted identity '{uri}' derives name '{canonical}', colliding with concrete peer"
+                            );
+                            tracing::warn!("{msg}");
+                            return Err(AppError::PeerRejected(msg));
+                        }
+
+                        // Rules table: find matching rule (closed by default if none)
+                        let allow = hub
+                            .rules
+                            .iter()
+                            .find(|r| spiffe_uri_matches_pattern(uri, &r.pattern))
+                            .map(|r| r.allow.clone())
+                            .unwrap_or_default();
+
+                        let peer_config = PeerConfig {
+                            name: canonical.clone(),
+                            address: String::new(),
+                            pin: Some(norm_pin.clone()),
+                            ca: None,
+                            identities: Some(vec![uri.clone()]),
+                            allow,
+                            from: None,
+                            leaf: false,
+                            principals: Vec::new(),
+                            targets: None,
+                            dial: None,
+                        };
+
+                        // Amendment 4 / Oracle 6: collision check and insert under single write lock
+                        {
+                            let mut admitted = self
+                                .admitted_clients
+                                .write()
+                                .map_err(|e| AppError::Internal(e.to_string()))?;
+                            if let Some(existing) = admitted.get(&canonical) {
+                                if existing.uri != *uri {
+                                    let msg = format!(
+                                        "node name '{canonical}' collision: existing client URI '{}' vs incoming '{uri}'",
+                                        existing.uri
+                                    );
+                                    tracing::warn!("{msg}");
+                                    return Err(AppError::PeerRejected(msg));
+                                }
+                            } else {
+                                admitted.insert(
+                                    canonical.clone(),
+                                    AdmittedClient {
+                                        canonical_name: canonical.clone(),
+                                        uri: uri.clone(),
+                                        pin: norm_pin,
+                                        config: peer_config.clone(),
+                                    },
+                                );
+                            }
+                        }
+
+                        return Ok((peer_config, Some(uri.clone())));
+                    }
+                }
+            }
         }
 
         Err(AppError::PeerRejected(
@@ -1335,6 +1726,55 @@ impl rustls::server::danger::ClientCertVerifier for CombinedClientCertVerifier {
 
         if ca_matches.len() == 1 {
             return Ok(rustls::server::danger::ClientCertVerified::assertion());
+        }
+
+        if let Some(ref hub) = self.peers.hub {
+            let uris = extract_uri_sans(end_entity.as_ref()).map_err(|_| {
+                rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+            })?;
+            if uris.len() == 1 {
+                let uri = &uris[0];
+                if hub
+                    .patterns
+                    .iter()
+                    .any(|pat| spiffe_uri_matches_pattern(uri, pat))
+                {
+                    let all_anchors = self.peers.all_ca_anchors();
+                    verify_cert_chain(
+                        end_entity,
+                        intermediates,
+                        &all_anchors,
+                        now,
+                        webpki::KeyUsage::client_auth(),
+                    )?;
+
+                    let canonical = crate::node::node_name_from_uri(uri).map_err(|_| {
+                        rustls::Error::InvalidCertificate(
+                            rustls::CertificateError::ApplicationVerificationFailure,
+                        )
+                    })?;
+
+                    // Check collision with concrete peer
+                    if self.peers.contains_concrete_name(&canonical) {
+                        return Err(rustls::Error::InvalidCertificate(
+                            rustls::CertificateError::ApplicationVerificationFailure,
+                        ));
+                    }
+
+                    // Check collision with already admitted client
+                    if let Ok(admitted) = self.peers.admitted_clients.read() {
+                        if let Some(existing) = admitted.get(&canonical) {
+                            if existing.uri != *uri {
+                                return Err(rustls::Error::InvalidCertificate(
+                                    rustls::CertificateError::ApplicationVerificationFailure,
+                                ));
+                            }
+                        }
+                    }
+
+                    return Ok(rustls::server::danger::ClientCertVerified::assertion());
+                }
+            }
         }
 
         Err(rustls::Error::InvalidCertificate(
@@ -1948,7 +2388,7 @@ async fn fed_send_message_handler(
     // 1. Check peer config and allow list
     let peer_cfg = fed_state
         .peers
-        .get(&peer.name)
+        .get_peer_config(&peer.name)
         .ok_or_else(|| AppError::UnknownPeer(peer.name.clone()))?;
 
     if !peer_cfg.allow.iter().any(|op| op == "send") {
@@ -2009,10 +2449,10 @@ async fn fed_send_message_handler(
         }
 
         // Dest must be a known peer other than the sender
-        if dest == peer.name || !fed_state.peers.contains_name(dest) {
-            return Err(AppError::UnknownPeer(dest.to_string()));
-        }
-        let dest_cfg = fed_state.peers.get(dest).unwrap();
+        let dest_cfg = match fed_state.peers.get_peer_config(dest) {
+            Some(cfg) if dest != peer.name => cfg,
+            _ => return Err(AppError::UnknownPeer(dest.to_string())),
+        };
 
         // Dest's targets must allow target_ref
         if let Some(ref allowed_targets) = dest_cfg.targets {
@@ -2463,7 +2903,7 @@ async fn fed_reply_handler(
     // 1. Check peer config and allow list
     let peer_cfg = fed_state
         .peers
-        .get(&peer.name)
+        .get_peer_config(&peer.name)
         .ok_or_else(|| AppError::UnknownPeer(peer.name.clone()))?;
 
     if !peer_cfg.allow.iter().any(|op| op == "reply") {
@@ -2684,7 +3124,7 @@ async fn fed_get_replies_handler(
 ) -> Result<Response, AppError> {
     let _peer_cfg = fed_state
         .peers
-        .get(&peer.name)
+        .get_peer_config(&peer.name)
         .ok_or_else(|| AppError::UnknownPeer(peer.name.clone()))?;
 
     // Check rate limiter
@@ -2777,8 +3217,7 @@ async fn fed_list_sessions_handler(
 ) -> Result<Response, AppError> {
     let peer_cfg = fed_state
         .current_peers()
-        .get(&peer.name)
-        .cloned()
+        .get_peer_config(&peer.name)
         .ok_or_else(|| AppError::UnknownPeer(peer.name.clone()))?;
 
     // Refused with 403 op_denied unless peer's allow contains "list"
@@ -2864,7 +3303,7 @@ async fn fed_get_inbox_handler(
 ) -> Result<Response, AppError> {
     let peer_cfg = fed_state
         .peers
-        .get(&peer.name)
+        .get_peer_config(&peer.name)
         .ok_or_else(|| AppError::UnknownPeer(peer.name.clone()))?;
 
     if !peer_cfg.leaf {
@@ -2939,7 +3378,7 @@ async fn fed_ack_inbox_handler(
 ) -> Result<Response, AppError> {
     let peer_cfg = fed_state
         .peers
-        .get(&peer.name)
+        .get_peer_config(&peer.name)
         .ok_or_else(|| AppError::UnknownPeer(peer.name.clone()))?;
 
     if !peer_cfg.leaf {
@@ -4114,7 +4553,7 @@ async fn list_dial_out_client(
         .map_err(|_| AppError::PeerUnreachable(format!("'{peer_key}' dropped the list query")))
 }
 
-async fn list_direct_peer(
+pub async fn list_direct_peer(
     fed_state: &FedState,
     peer: &PeerConfig,
 ) -> Result<(FedListAnswer, String), AppError> {
