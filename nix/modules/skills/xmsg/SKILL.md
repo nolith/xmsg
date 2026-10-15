@@ -43,7 +43,7 @@ A node that is not `ok` lists nothing, so its recipients are missing from the li
 
 Call **`send`** with:
 
-- `to`: an instance ID, a service name or an instance label, optionally followed by `@node`;
+- `to`: an instance ID, a service name or an instance label, optionally followed by `@node` (never pass `ref=`, and do not use a label containing `' · '`; use the header's `ref=` address);
 - `text`: your message.
 
 A name resolves among services first. An instance label resolves only when exactly one live instance carries it.
@@ -65,13 +65,15 @@ as a new message, so you do not need to wait or poll.
 A message from another session or service carries a line like:
 
 ```
-[xmsg] from=planner · 2f6c1e0a-8d3b-4c7e-9a41-0b5d2e7f9c13@alice.example message_id=01J9XYZ... — reply with the xmsg reply tool
+[xmsg] ref=2f6c1e0a-8d3b-4c7e-9a41-0b5d2e7f9c13@alice.example message_id=01J9XYZ... — reply with the xmsg reply tool (tools: send, reply, list, replies)
 ```
 
 To answer, call **`reply`** with:
 
 - `message_id`: the ID from that line, copied exactly;
 - `text`: your answer.
+
+`reply` answers the exchange's other party symmetrically: if you received the message, it goes to the sender; if you sent it, it goes to the recipient as a follow-up. It returns `{bytes, messageId, inReplyTo, outcome}`, where `messageId` is the new reply's ID and `inReplyTo` is the answered ID.
 
 Reply only when an answer is useful. Do not reply just to thank or to acknowledge.
 

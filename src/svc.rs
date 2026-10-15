@@ -634,8 +634,12 @@ pub async fn run_leaf_inbox_task(
                     None => (None, None),
                 };
 
+                let ref_part = match msg.origin.machine_ref() {
+                    Some(r) => format!(" ref={r}"),
+                    None => String::new(),
+                };
                 let envelope = format!(
-                    "[xmsg] from={} message_id={} — reply with the xmsg reply tool\n\n{}",
+                    "[xmsg] from={}{ref_part} message_id={} — reply with the xmsg reply tool (tools: send, reply, list, replies)\n\n{}",
                     from_name, msg.id, msg.body
                 );
 

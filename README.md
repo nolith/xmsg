@@ -43,10 +43,7 @@ All local IPC in `xmsg` relies on Unix domain sockets located in `$XDG_RUNTIME_D
   ```
   `id@node` is attested by `xmsg`: `id` is the sender's instance address, a fork's `~n` included (so the `X~2` fork of a conversation sends as `X~2`, never as plain `X`), and `node` is the node's own name (Section 7.0), or the reader's nickname for a peer it has one for. The label is the sender's own description (a Claude session's name, a pi session's name) and is shown apart from it. The harness is not shown. A label containing `@` or `·` is dropped whole, so it can never imitate the attested part; the session stays listed and addressable by its ID, with no label. Only the label is bounded (64 characters); the attested part is always emitted whole, however long the node's name is.
 - **Ancestor Process Walk:** For calls to `agent.sock` (such as MCP tools spawned in child shells) and to `http.sock` (A15), `xmsg` traverses parent PIDs upwards through `/proc/<pid>/stat` (`proc_pidinfo` on macOS) to identify the originating session or service, reading the claim table, so a fork acts as `X~n`. A caller on `http.sock` that traces to none is anonymous. A caller on the TCP `--listen` listener carries no peer credentials and is anonymous, except in leaf mode, where it is the leaf principal (AM-2).
-- **Harness-Bound Reply Authorization:** All stored messages record the recipient harness (`claude`, `agy`, or `pi`). A reply is accepted only when:
-  ```text
-  caller.harness == msg.recipient_harness && caller.session_id == msg.session_id
-  ```
+- **Symmetric Reply Authorization (XU1 Gate 3):** `reply(message_id=m)` answers $m$'s other party. If the caller is $m$'s recipient, the reply goes to $m$'s sender; if the caller is $m$'s sender, it goes to $m$'s recipient as a follow-up in the same exchange (`in_reply_to = m`). A caller who is neither party is refused with `not_recipient` (`denied`). Every envelope footer carries `[xmsg] ref=<id>@<node> message_id=... — reply with the xmsg reply tool (tools: send, reply, list, replies)`.
 - **Principal-Scoped Idempotency:** Idempotency keys are partitioned by sender principal: an attested caller's instance address (a fork's `~n` included) or service name, and an anonymous HTTP caller's `anon:<from>`, from the caller-declared `from` field. Anonymous callers choosing the same `from` share that key namespace.
 
 ### 1.4 Envelope Sanitization & Breakout Protection
@@ -191,9 +188,9 @@ anonymous (A15, HA2).
 
 Exposes four tools (A13; all execute autonomously without user interaction prompts):
 
-- **`list(name?, node?, kind?)`:** the recipients the caller may see: each entry's address (`id@node` for an instance, `name@node` for a service), kind (`service` or `instance`), label and status. `node` lists a federated peer.
-- **`send(to, text)`:** `to` is an instance ID (a UUID, optionally `~n`), a service name or an instance label, optionally followed by `@node` (one `@` at most). Returns the message ID, the resolved address and the outcome; follow-ups to the address cannot drift to another instance. The caller's identity is derived; a `from` argument is refused. MCP carries no `idempotency_key` on `send` or `reply`: agents do not retry by accident, and programs that retry use HTTP, `agent.sock` or `register.sock`.
-- **`reply(message_id, text)`:** reply to a message the caller received.
+- **`list(name?, node?, kind?)`:** the recipients the caller may see: each entry's address (`id@node` for an instance, `name@node` for a service), kind (`service` or `instance`), label and status. `node` lists a federated peer. (Passing `host` is refused with a migration hint to use `node`).
+- **`send(to, text)`:** `to` is an instance ID (a UUID, optionally `~n`), a service name or an instance label, optionally followed by `@node` (one `@` at most). Returns the message ID, the resolved address and the outcome; follow-ups to the address cannot drift to another instance. The caller's identity is derived; passing `ref` or `from` is refused with a migration hint (`use 'to' instead`). Passing a label containing `' · '` in `to` is refused with a hint to use the header's `ref=` address. MCP carries no `idempotency_key` on `send` or `reply`: agents do not retry by accident, and programs that retry use HTTP, `agent.sock` or `register.sock`.
+- **`reply(message_id, text)`:** answers the exchange's other party symmetrically (if received, answers the sender; if sent, follow-up to the recipient). Reshaped for MCP callers to return `{bytes, messageId, inReplyTo, outcome}`, where `messageId` is the new reply's ID and `inReplyTo` is the answered ID.
 - **`replies(message_id, wait?)`:** the stored replies to a message the caller sent, waiting up to `wait` seconds (at most 60) for the first.
 
 #### Reply-Only Mode (`--reply-only`)

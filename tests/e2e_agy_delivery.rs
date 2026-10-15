@@ -148,7 +148,7 @@ exit 0
     let captured_argv = fs::read_to_string(&argv_log).unwrap();
     assert!(captured_argv.contains("agentapi send-message --title claude-orch · anon@test-host"));
     assert!(captured_argv.contains(conv_id));
-    assert!(captured_argv.contains(&format!("[xmsg] from=claude-orch · anon@test-host message_id={msg_id} — reply with the xmsg reply tool\n\nHello Antigravity session!")));
+    assert!(captured_argv.contains(&format!("[xmsg] from=claude-orch · anon@test-host message_id={msg_id} — reply with the xmsg reply tool (tools: send, reply, list, replies)\n\nHello Antigravity session!")));
     assert!(
         !captured_argv.contains("super-secret-token-xyz"),
         "Security Invariant: CSRF token MUST NOT appear in argv"

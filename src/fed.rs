@@ -3007,20 +3007,31 @@ async fn fed_reply_handler(
         }
     }
 
-    // 2. Authorization: in_reply_to MUST exist in outbound table AND peer must match!
-    let outbound = {
+    // 2. Authorization: in_reply_to MUST exist in outbound table (normal reply)
+    // OR in messages table with return_host == peer.name (sender follow-up, XU1 Gate 3).
+    let (outbound, orig_msg) = {
         let db = fed_state
             .db
             .lock()
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        storage::get_outbound(&db, &reply.in_reply_to)
-            .map_err(|e| AppError::Internal(e.to_string()))?
+        let out = storage::get_outbound(&db, &reply.in_reply_to)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let msg = storage::get_message(&db, &reply.in_reply_to)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        (out, msg)
     };
 
-    if !outbound
+    let is_outbound_reply = outbound
         .as_ref()
-        .is_some_and(|o| o.peer == peer.name && replier_is_recipient(o, &replier, &reply.text))
-    {
+        .is_some_and(|o| o.peer == peer.name && replier_is_recipient(o, &replier, &reply.text));
+
+    let is_sender_followup = !is_outbound_reply
+        && orig_msg.as_ref().is_some_and(|m| {
+            m.return_host.as_deref() == Some(&peer.name)
+                && m.return_session_id.as_deref() == replier.key()
+        });
+
+    if !is_outbound_reply && !is_sender_followup {
         return Err(AppError::NotRecipient(format!(
             "in_reply_to '{}' not authorized for replier '{}' of peer '{}'",
             reply.in_reply_to,
@@ -3175,10 +3186,17 @@ async fn fed_reply_handler(
             .map_err(|e| AppError::Internal(e.to_string()))?
     };
 
-    if let Some((ret_harness, ret_session_id)) = orig_msg
-        .as_ref()
-        .and_then(|m| Some((m.return_harness.clone()?, m.return_session_id.clone()?)))
-    {
+    let target = if is_sender_followup {
+        orig_msg
+            .as_ref()
+            .map(|m| (m.recipient_harness.clone(), m.session_id.clone()))
+    } else {
+        orig_msg
+            .as_ref()
+            .and_then(|m| Some((m.return_harness.clone()?, m.return_session_id.clone()?)))
+    };
+
+    if let Some((ret_harness, ret_session_id)) = target {
         let replier_badge = replier.render(&peer.name);
         let replier_id = replier.key().map(str::to_string);
 
@@ -3198,15 +3216,36 @@ async fn fed_reply_handler(
         // to the replier, as a message received from that peer is (A-2).
         if let (Some(orig), Some(id), "pushed") = (&orig_msg, &replier_id, push_res) {
             if let Ok(db) = fed_state.db.lock() {
-                crate::surface::record_pushed_reply(
-                    &db,
-                    orig,
-                    &reply.id,
-                    &replier_badge,
-                    &reply.text,
-                    ("fed", id),
-                    Some(&peer.name),
-                );
+                if is_sender_followup {
+                    let pushed = storage::MessageRecord {
+                        id: reply.id.clone(),
+                        created_at: storage::now_epoch_secs(),
+                        session_id: orig.session_id.clone(),
+                        from_name: replier_badge.clone(),
+                        bytes: reply.text.len(),
+                        outcome: "delivered".to_string(),
+                        recipient_harness: orig.recipient_harness.clone(),
+                        return_harness: Some("fed".to_string()),
+                        return_session_id: Some(id.clone()),
+                        thread_id: if orig.thread_id.is_empty() {
+                            orig.id.clone()
+                        } else {
+                            orig.thread_id.clone()
+                        },
+                        return_host: Some(peer.name.clone()),
+                    };
+                    let _ = storage::insert_message(&db, &pushed);
+                } else {
+                    crate::surface::record_pushed_reply(
+                        &db,
+                        orig,
+                        &reply.id,
+                        &replier_badge,
+                        &reply.text,
+                        ("fed", id),
+                        Some(&peer.name),
+                    );
+                }
             }
         }
 

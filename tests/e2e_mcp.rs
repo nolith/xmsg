@@ -122,7 +122,7 @@ async fn start_mcp_harness() -> McpHarness {
     });
 
     let target_pid = 5000;
-    let target_proc_start = "start_5000";
+    let target_proc_start = "100";
     write_proc_stat(proc_dir.path(), target_pid, 1, target_proc_start);
     write_session_file(
         sess_dir.path(),
@@ -376,6 +376,7 @@ async fn test_mcp_send_and_reply_with_derived_caller() {
     let my_pid = std::process::id();
     let caller_pid = 6000;
     let dummy_sock = harness.proc_root.join("caller.sock");
+    let _caller_listener = tokio::net::UnixListener::bind(&dummy_sock).unwrap();
 
     // Configure ancestor hierarchy for current process:
     // PID my_pid -> PPID caller_pid (6000) -> PPID 1
@@ -432,24 +433,14 @@ async fn test_mcp_send_and_reply_with_derived_caller() {
         .content
         .contains("Please report status on milestone 2"));
     let expected_footer = format!(
-        "[xmsg] message_id={} — reply with the xmsg reply tool",
-        message_id
+        "[xmsg] ref=sess-caller-6000@test-host message_id={message_id} — reply with the xmsg reply tool (tools: send, reply, list, replies)"
     );
     assert!(inbox_line.message.content.contains(&expected_footer));
     drop(lines);
 
     // 2. reply to the message via MCP
-    // Reconfigure ancestor for target-agent (session_id = sess-target-5000)
-    let _ = fs::remove_file(harness.sessions_dir.join("5000.json"));
-    let target_sock = harness.proc_root.join("target.sock");
-    write_session_file(
-        &harness.sessions_dir,
-        caller_pid,
-        "sess-target-5000",
-        "target-agent",
-        "100",
-        &target_sock,
-    );
+    // Reconfigure ancestor for target-agent (session_id = sess-target-5000, pid = 5000)
+    write_proc_stat(&harness.proc_root, my_pid, 5000, "200");
 
     let reply_req = serde_json::json!({
         "jsonrpc": "2.0",
@@ -472,12 +463,14 @@ async fn test_mcp_send_and_reply_with_derived_caller() {
     assert_eq!(result["isError"], false);
     let reply_text = result["content"][0]["text"].as_str().unwrap();
     let reply_json: serde_json::Value = serde_json::from_str(reply_text).unwrap();
-    assert_eq!(reply_json["messageId"], message_id);
-    assert_eq!(reply_json["replierSessionId"], "sess-target-5000");
+    assert_eq!(reply_json["inReplyTo"], message_id);
+    assert_ne!(reply_json["messageId"], message_id);
     assert_eq!(
-        reply_json["text"],
-        "Milestone 2 status: green, all tests passing."
+        reply_json["bytes"],
+        "Milestone 2 status: green, all tests passing.".len()
     );
+    assert_eq!(reply_json["outcome"], "pushed");
+    assert!(reply_json.get("text").is_none());
 }
 
 #[tokio::test]

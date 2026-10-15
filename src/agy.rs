@@ -808,13 +808,17 @@ pub async fn deliver_agy(
     store: &AgyStore,
     session: &Session,
     from_name: &str,
+    ref_address: Option<&str>,
     message_id: &str,
     body_text: &str,
 ) -> Result<DeliveryResponse, AppError> {
+    let ref_part = match ref_address {
+        Some(r) => format!(" ref={r}"),
+        None => String::new(),
+    };
     // Format envelope (§9.4)
     let envelope = format!(
-        "[xmsg] from={} message_id={} — reply with the xmsg reply tool\n\n{}",
-        from_name, message_id, body_text
+        "[xmsg] from={from_name}{ref_part} message_id={message_id} — reply with the xmsg reply tool (tools: send, reply, list, replies)\n\n{body_text}"
     );
     deliver_agy_envelope(config, store, session, from_name, &envelope).await?;
 

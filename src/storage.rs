@@ -134,6 +134,12 @@ impl Origin {
     pub fn key(&self) -> Option<&str> {
         self.service.as_deref().or(self.id.as_deref())
     }
+
+    /// The literal machine address `id@node` or `service@node`, built only from the
+    /// attested identifier and node, never from the label (XU1 Gate 2).
+    pub fn machine_ref(&self) -> Option<String> {
+        self.key().map(|k| format!("{k}@{}", self.node))
+    }
 }
 
 fn origin_from_sql(s: String) -> Result<Origin> {

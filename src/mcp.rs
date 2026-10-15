@@ -493,6 +493,8 @@ fn check_args(name: &str, args: &Value) -> Result<(), String> {
         Some(obj) => match obj.keys().find(|k| !allowed.contains(k)) {
             // Invariant: a caller-supplied sender is refused (§8.3a).
             Some(k) if k == "from" => Err("error: 'from' argument is forbidden; sender identity is automatically derived from the calling session".to_string()),
+            Some(k) if name == "send" && k == "ref" => Err("error: unknown argument 'ref' for tool 'send'; use 'to' instead".to_string()),
+            Some(k) if name == "list" && k == "host" => Err("error: unknown argument 'host' for tool 'list'; use 'node' instead (or omit it to list all nodes)".to_string()),
             Some(k) => Err(format!("error: unknown argument '{k}' for tool '{name}'")),
             None => Ok(()),
         },
@@ -599,7 +601,44 @@ pub fn execute_tool(
                 );
             };
             let payload = json!({ "action": "reply", "message_id": message_id, "text": text });
-            agent_tool(config, &payload, Some("reply"), Duration::from_secs(5))
+            // NOTE (XU1 Gate 4 / Amendment 6): MCP tool result is reshaped to
+            // {bytes, messageId, inReplyTo, outcome} to save model context and unify
+            // messageId meaning ("the id of what I just sent"). The agent-socket and
+            // HTTP reply frames retain ReplyRecord (with pushedMessageId and text)
+            // so external callers (such as matrix-xmsg) continue reading pushedMessageId.
+            match call_agent_sock_within(&config.agent_sock, &payload, Duration::from_secs(5)) {
+                Ok(resp) => {
+                    let reply_val = resp.get("reply").cloned().unwrap_or(Value::Null);
+                    let new_id = match reply_val
+                        .get("pushedMessageId")
+                        .and_then(Value::as_str)
+                    {
+                        Some(id) => id,
+                        None => {
+                            return tool_err(
+                                "reply failed: missing 'pushedMessageId' in socket response"
+                                    .to_string(),
+                            );
+                        }
+                    };
+                    let outcome = match reply_val.get("pushOutcome").and_then(Value::as_str) {
+                        Some(o) => o,
+                        None => {
+                            return tool_err(
+                                "reply failed: missing 'pushOutcome' in socket response".to_string(),
+                            );
+                        }
+                    };
+                    let mcp_res = json!({
+                        "bytes": text.len(),
+                        "messageId": new_id,
+                        "inReplyTo": message_id,
+                        "outcome": outcome,
+                    });
+                    tool_ok(mcp_res.to_string())
+                }
+                Err(e) => tool_err(e),
+            }
         }
         "replies" => {
             let Some(message_id) = str_arg("message_id") else {

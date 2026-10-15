@@ -223,6 +223,11 @@ pub fn parse_to(to: &str) -> Result<(&str, Option<&str>), AppError> {
     if to.is_empty() {
         return Err(AppError::BadRequest("'to' must not be empty".to_string()));
     }
+    if to.contains(" · ") || to.contains('·') {
+        return Err(AppError::BadRequest(
+            "'to' contains ' · '; a label is not an address. Use the header's 'ref=' address instead".to_string(),
+        ));
+    }
     match to.matches('@').count() {
         0 => Ok((to, None)),
         1 => {
@@ -275,6 +280,8 @@ pub struct ListQuery {
     pub node: Option<String>,
     #[serde(default)]
     pub kind: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 fn entry(id: &str, service: bool, label: Option<String>, status: &str, user: &str) -> FedListEntry {
@@ -308,6 +315,11 @@ fn recipient(e: FedListEntry, node: &str) -> Recipient {
 /// The recipients the caller may see (A4): this node's and every peer's, each peer asked
 /// concurrently and bounded by the list timeout (A-1, D14). `node` asks only that node.
 pub async fn list(state: &AppState, query: &ListQuery) -> Result<ListResult, AppError> {
+    if query.host.is_some() {
+        return Err(AppError::BadRequest(
+            "unknown parameter 'host'; use 'node' instead (or omit it to list all nodes)".to_string(),
+        ));
+    }
     if let Some(kind) = query.kind.as_deref() {
         if kind != "service" && kind != "instance" {
             return Err(AppError::BadRequest(format!(
@@ -447,9 +459,13 @@ pub(crate) async fn deliver(
     body: &str,
     origin: Origin,
 ) -> Result<(String, &'static str, &'static str), AppError> {
+    let ref_part = match origin.machine_ref() {
+        Some(r) => format!(" ref={r}"),
+        None => String::new(),
+    };
     let envelope_text = || {
         format!(
-            "[xmsg] from={from_name} message_id={message_id} — reply with the xmsg reply tool\n\n{body}"
+            "[xmsg] from={from_name}{ref_part} message_id={message_id} — reply with the xmsg reply tool (tools: send, reply, list, replies)\n\n{body}"
         )
     };
     // A queued message shows when it was sent (A14).
@@ -466,7 +482,7 @@ pub(crate) async fn deliver(
                 expires_at: *expires_at,
                 from_name: from_name.to_string(),
                 body: format!(
-                    "{body}\n\n[xmsg] message_id={message_id} sent={sent} — reply with the xmsg reply tool"
+                    "{body}\n\n[xmsg]{ref_part} message_id={message_id} sent={sent} — reply with the xmsg reply tool (tools: send, reply, list, replies)"
                 ),
             };
             let db = local.db.lock().map_err(db_err)?;
@@ -475,7 +491,7 @@ pub(crate) async fn deliver(
         }
         ResolvedTarget::Claude(session, socket_path) => {
             let body_with_footer = format!(
-                "{body}\n\n[xmsg] message_id={message_id} — reply with the xmsg reply tool"
+                "{body}\n\n[xmsg]{ref_part} message_id={message_id} — reply with the xmsg reply tool (tools: send, reply, list, replies)"
             );
             let line = inbox::encode_transport_line(from_name, &body_with_footer)?;
             inbox::deliver_to_socket(socket_path, &line).await?;
@@ -488,6 +504,7 @@ pub(crate) async fn deliver(
                     local.agy_store,
                     session,
                     from_name,
+                    origin.machine_ref().as_deref(),
                     message_id,
                     body,
                 )
@@ -502,7 +519,7 @@ pub(crate) async fn deliver(
                 bytes: body.len(),
                 text: body.to_string(),
                 envelope: format!(
-                    "[xmsg] from={from_name} message_id={message_id} sent={sent} — reply with the xmsg reply tool\n\n{body}"
+                    "[xmsg] from={from_name}{ref_part} message_id={message_id} sent={sent} — reply with the xmsg reply tool (tools: send, reply, list, replies)\n\n{body}"
                 ),
                 delivered_at: None,
             };
@@ -577,7 +594,7 @@ pub async fn push_reply(
     text: &str,
 ) -> &'static str {
     let envelope = format!(
-        "[xmsg] reply to message_id={in_reply_to} — message_id={reply_id}; reply with the xmsg reply tool\n\n{text}"
+        "[xmsg] reply to message_id={in_reply_to} — message_id={reply_id}; reply with the xmsg reply tool (tools: send, reply, list, replies)\n\n{text}"
     );
     match ret_harness {
         "claude" => {
@@ -1190,7 +1207,15 @@ pub async fn reply(
         (msg, fwd)
     };
     // Reply rights are keyed on the receiving instance ID (A5).
-    if caller.harness != msg.recipient_harness || caller.session_id != msg.session_id {
+    // Reply rights are symmetric (XU1 Gate 3, Ruled Option b):
+    // caller is either the recipient answering the sender, or the sender answering the recipient.
+    let caller_is_recipient =
+        caller.harness == msg.recipient_harness && caller.session_id == msg.session_id;
+    let caller_is_sender = msg.return_session_id.as_deref() == Some(&caller.session_id)
+        && (msg.return_harness.as_deref() == Some(&caller.harness)
+            || msg.return_harness.as_deref() == Some("fed"));
+
+    if !caller_is_recipient && !caller_is_sender {
         return Err(AppError::NotRecipient(format!(
             "'{}' is not the recipient of message '{message_id}'",
             caller.session_id
@@ -1260,6 +1285,7 @@ pub async fn reply(
                 &caller,
                 msg,
                 is_forwarded,
+                caller_is_sender,
                 &message_id,
                 &text,
                 reply_id,
@@ -1325,35 +1351,54 @@ async fn deliver_reply(
     caller: &Session,
     msg: MessageRecord,
     is_forwarded: bool,
+    caller_is_sender: bool,
     message_id: &str,
     text: &str,
     reply_id: String,
 ) -> Result<ReplyRecord, AppError> {
-    let remote_host = msg
-        .return_host
-        .as_deref()
-        .filter(|h| !h.is_empty() && *h != state.node_name);
+    let (remote_host, has_inbox, ret_harness, ret_session_id) = if caller_is_sender {
+        if msg.recipient_harness == "fed" {
+            let db = state.db.lock().map_err(db_err)?;
+            let outbound = storage::get_outbound(&db, message_id).map_err(db_err)?;
+            let host = outbound.map(|o| o.peer);
+            (host, false, String::new(), String::new())
+        } else {
+            (
+                None,
+                true,
+                msg.recipient_harness.clone(),
+                msg.session_id.clone(),
+            )
+        }
+    } else {
+        let remote_host = msg
+            .return_host
+            .as_deref()
+            .filter(|h| !h.is_empty() && *h != state.node_name)
+            .map(str::to_string);
+        let has_inbox = msg.return_harness.is_some() && msg.return_session_id.is_some();
+        let ret_harness = msg.return_harness.clone().unwrap_or_default();
+        let ret_session_id = msg.return_session_id.clone().unwrap_or_default();
+        (remote_host, has_inbox, ret_harness, ret_session_id)
+    };
     // A leaf (or other undialable) origin pulls its replies; nothing is pushed to it.
-    let to_leaf = remote_host.is_some_and(|h| {
+    let to_leaf = remote_host.as_deref().is_some_and(|h| {
         state
             .fed_state
             .as_ref()
             .and_then(|fs| fs.current_peers().get(h).cloned())
             .is_some_and(|p| p.leaf)
     });
-    let has_inbox = msg.return_harness.is_some() && msg.return_session_id.is_some();
 
     // A reply always travels back to a remote origin node, which decides how it reaches
     // the sender (A-2); a local one is pushed when the sender has an inbox (A10).
-    let push_outcome = match remote_host {
+    let push_outcome = match remote_host.as_deref() {
         Some(_) if to_leaf => Some("stored"),
         Some(host) => {
             Some(push_federated_reply(state, caller, host, message_id, &reply_id, text).await)
         }
         None if !has_inbox || is_forwarded => None,
         None => {
-            let ret_harness = msg.return_harness.as_deref().unwrap_or_default();
-            let ret_session_id = msg.return_session_id.as_deref().unwrap_or_default();
             let replier_label = inbox::sender_label(
                 &state.node_name,
                 &caller.harness,
@@ -1363,8 +1408,8 @@ async fn deliver_reply(
             let replier_origin = Sender::Session(caller.clone()).origin(&state.node_name);
             let outcome = push_reply(
                 &state.local(),
-                ret_harness,
-                ret_session_id,
+                &ret_harness,
+                &ret_session_id,
                 message_id,
                 &reply_id,
                 &replier_label,
@@ -1374,15 +1419,36 @@ async fn deliver_reply(
             .await;
             if outcome == "pushed" {
                 if let Ok(db) = state.db.lock() {
-                    record_pushed_reply(
-                        &db,
-                        &msg,
-                        &reply_id,
-                        &replier_label,
-                        text,
-                        (&caller.harness, &caller.session_id),
-                        None,
-                    );
+                    if caller_is_sender {
+                        let pushed = MessageRecord {
+                            id: reply_id.to_string(),
+                            created_at: storage::now_epoch_secs(),
+                            session_id: msg.session_id.clone(),
+                            from_name: replier_label.clone(),
+                            bytes: text.len(),
+                            outcome: "delivered".to_string(),
+                            recipient_harness: msg.recipient_harness.clone(),
+                            return_harness: Some(caller.harness.clone()),
+                            return_session_id: Some(caller.session_id.clone()),
+                            thread_id: if msg.thread_id.is_empty() {
+                                msg.id.clone()
+                            } else {
+                                msg.thread_id.clone()
+                            },
+                            return_host: None,
+                        };
+                        let _ = storage::insert_message(&db, &pushed);
+                    } else {
+                        record_pushed_reply(
+                            &db,
+                            &msg,
+                            &reply_id,
+                            &replier_label,
+                            text,
+                            (&caller.harness, &caller.session_id),
+                            None,
+                        );
+                    }
                 }
             }
             Some(outcome)
@@ -1390,8 +1456,13 @@ async fn deliver_reply(
     };
     // A reply pushed to a remote origin is a message sent there, which its receiver may
     // answer: recorded as sent, with its recipient in `outbound` (A7's reply rule).
+    let dest_session_id = if caller_is_sender {
+        Some(msg.session_id.clone())
+    } else {
+        msg.return_session_id.clone()
+    };
     if let (Some(host), Some("pushed"), Some(to)) =
-        (remote_host, push_outcome, msg.return_session_id.as_deref())
+        (remote_host.as_deref(), push_outcome, dest_session_id.as_deref())
     {
         if let Ok(db) = state.db.lock() {
             let label = inbox::sender_label(
@@ -1400,15 +1471,36 @@ async fn deliver_reply(
                 &caller.session_id,
                 caller.name.as_deref(),
             );
-            record_pushed_reply(
-                &db,
-                &msg,
-                &reply_id,
-                &label,
-                text,
-                (&caller.harness, &caller.session_id),
-                None,
-            );
+            if caller_is_sender {
+                let pushed = MessageRecord {
+                    id: reply_id.to_string(),
+                    created_at: storage::now_epoch_secs(),
+                    session_id: msg.session_id.clone(),
+                    from_name: label,
+                    bytes: text.len(),
+                    outcome: "delivered".to_string(),
+                    recipient_harness: msg.recipient_harness.clone(),
+                    return_harness: Some(caller.harness.clone()),
+                    return_session_id: Some(caller.session_id.clone()),
+                    thread_id: if msg.thread_id.is_empty() {
+                        msg.id.clone()
+                    } else {
+                        msg.thread_id.clone()
+                    },
+                    return_host: Some(state.node_name.clone()),
+                };
+                let _ = storage::insert_message(&db, &pushed);
+            } else {
+                record_pushed_reply(
+                    &db,
+                    &msg,
+                    &reply_id,
+                    &label,
+                    text,
+                    (&caller.harness, &caller.session_id),
+                    None,
+                );
+            }
             let now = storage::now_epoch_secs();
             let _ = storage::insert_outbound(
                 &db,

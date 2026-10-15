@@ -403,7 +403,16 @@ async fn send_handler(
     peer: PeerInfo,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let req: SendRequest = parse_json(&state, &body)?;
+    let raw: serde_json::Value = parse_json(&state, &body)?;
+    if let Some(obj) = raw.as_object() {
+        if obj.contains_key("ref") && !obj.contains_key("to") {
+            return Err(AppError::BadRequest(
+                "unknown field 'ref'; use 'to' instead".to_string(),
+            ));
+        }
+    }
+    let req: SendRequest =
+        serde_json::from_value(raw).map_err(|e| AppError::BadRequest(e.to_string()))?;
     let sender = http_sender(&state, &peer, req.from.as_deref()).await;
     let res = surface::send(
         &state,

@@ -409,7 +409,7 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         content_a.contains("from-name=\"bob · 2fe5d26e-eb6c-50c0-8c91-3919fb271081@test-host\"")
     );
     let expected_header = format!(
-        "[xmsg] reply to message_id={orig_msg_id} — message_id={pushed_msg_id}; reply with the xmsg reply tool\n\nHi Alice, loud and clear!"
+        "[xmsg] reply to message_id={orig_msg_id} — message_id={pushed_msg_id}; reply with the xmsg reply tool (tools: send, reply, list, replies)\n\nHi Alice, loud and clear!"
     );
     assert!(content_a.contains(&expected_header));
 
@@ -466,7 +466,7 @@ async fn test_u8_attested_claude_round_trip_push_and_threading() {
         content_b2.contains("from-name=\"alice · af14358a-9385-5e4f-bc3f-e7ddb31f987b@test-host\"")
     );
     let expected_b_header = format!(
-        "[xmsg] reply to message_id={pushed_msg_id} — message_id={second_pushed_id}; reply with the xmsg reply tool\n\nGreat, conversation complete."
+        "[xmsg] reply to message_id={pushed_msg_id} — message_id={second_pushed_id}; reply with the xmsg reply tool (tools: send, reply, list, replies)\n\nGreat, conversation complete."
     );
     assert!(content_b2.contains(&expected_b_header));
 }

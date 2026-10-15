@@ -539,7 +539,12 @@ where
                 };
                 let (state, tx) = (state.clone(), tx.clone());
                 tasks.spawn(async move {
-                    let query = surface::ListQuery { name, node, kind };
+                    let query = surface::ListQuery {
+                        name,
+                        node,
+                        kind,
+                        host: None,
+                    };
                     let res = surface::list(&state, &query).await.map(
                         |r| json!({ "status": "ok", "recipients": r.recipients, "nodes": r.nodes }),
                     );
