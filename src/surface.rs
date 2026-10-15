@@ -898,10 +898,19 @@ async fn deliver_send(
         (Some(n), _) if n == state.node_name => Dest::Local,
         (Some(n), Some(fs)) => {
             let peers = fs.current_peers();
-            let direct_peer = peers.get(n).filter(|p| !p.address.is_empty());
-            if let Some(peer) = direct_peer {
+            let is_direct = if let Some(p) = peers.get(n) {
+                p.leaf || !p.address.is_empty()
+            } else {
+                peers
+                    .admitted_clients
+                    .read()
+                    .ok()
+                    .is_some_and(|adm| adm.contains_key(n))
+            };
+
+            if is_direct {
                 Dest::Peer {
-                    node: peer.name.clone(),
+                    node: peers.key_for(n).unwrap_or(n).to_string(),
                     key: target_ref.to_string(),
                     cached: false,
                     id: false,

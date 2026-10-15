@@ -814,6 +814,9 @@ impl PeersMap {
             String,
         )> = Vec::new();
         let mut default_routes: Vec<String> = Vec::new();
+        let has_default_route = owned_entries.iter().any(|(_, obj)| {
+            obj.get("default_route").and_then(|v| v.as_bool()).unwrap_or(false)
+        });
         for (key_name, obj) in entries {
             if !is_wrapped
                 && key_name == "hub"
@@ -1008,6 +1011,17 @@ impl PeersMap {
                 return Err(format!(
                     "peer '{name}': cannot specify both 'leaf' and 'dial'"
                 ));
+            }
+
+            let is_default_route = obj
+                .get("default_route")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if is_default_route && address.is_empty() {
+                return Err(format!("peer '{name}' marked 'default_route' missing required field 'address'"));
+            }
+            if !leaf && address.is_empty() && !has_default_route {
+                return Err(format!("peer '{name}' missing required field 'address'"));
             }
 
             let principals: Vec<String> = if let Some(pr) = obj.get("principals") {

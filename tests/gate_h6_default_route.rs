@@ -1342,7 +1342,8 @@ fn test_oracle_12_default_route_parsing_and_invariants() {
                 "default_route": true
             },
             "cee": {
-                "pin": DUMMY_PIN2
+                "pin": DUMMY_PIN2,
+                "leaf": true
             }
         }
     });
@@ -1351,6 +1352,7 @@ fn test_oracle_12_default_route_parsing_and_invariants() {
     let dr = pm.default_route_link().expect("default_route_link must be Some");
     assert_eq!(dr.name, "hub");
     assert_eq!(pm.get("cee").unwrap().address, "");
+    assert!(pm.get("cee").unwrap().leaf);
 
     // 2. Unwrapped fixture with default_route
     let unwrapped = json!({
@@ -1398,4 +1400,352 @@ fn test_oracle_12_default_route_parsing_and_invariants() {
     });
     let pm_none = PeersMap::load_from_json_for(&no_default.to_string(), None).unwrap();
     assert!(pm_none.default_route_link().is_none());
+
+    // 5. Dialable peer without address refused, naming entry
+    let no_addr = json!({
+        "peers": {
+            "dialable-node": {
+                "pin": DUMMY_PIN
+            }
+        }
+    });
+    let err_no_addr = PeersMap::load_from_json_for(&no_addr.to_string(), None)
+        .expect_err("dialable peer without address must be refused");
+    assert!(
+        err_no_addr.contains("dialable-node") && err_no_addr.contains("address"),
+        "error must name entry and address, got: {err_no_addr}"
+    );
+}
+
+fn make_ca(name: &str) -> (rcgen::CertificateParams, rcgen::KeyPair, Vec<u8>, String) {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let mut params = rcgen::CertificateParams::default();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, name);
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
+    let cert = params.self_signed(&key).unwrap();
+    let der = cert.der().to_vec();
+    let pem = cert.pem();
+    (params, key, der, pem)
+}
+
+fn issue_cert(
+    ca_params: &rcgen::CertificateParams,
+    ca_key: &rcgen::KeyPair,
+    name: &str,
+    uri_sans: &[&str],
+) -> (Vec<u8>, Vec<u8>) {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let mut params = rcgen::CertificateParams::default();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, name);
+    params.subject_alt_names = uri_sans
+        .iter()
+        .map(|u| rcgen::SanType::URI(u.to_string().try_into().unwrap()))
+        .collect();
+    params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+    ];
+    let issuer = rcgen::Issuer::from_params(ca_params, ca_key);
+    let cert = params.signed_by(&key, &issuer).unwrap();
+    (cert.der().to_vec(), key.serialize_der())
+}
+
+// =============================================================================
+// Oracle 13: Leaf with default route queues locally, hub receives zero
+// Node A has both a default route to Hub and a leaf peer (with no address).
+// Sending to the leaf peer must queue in the leaf's mailbox locally on Node A;
+// Hub receives 0 messages.
+// Mutant: filtering direct links by !p.address.is_empty() in deliver_send => RED
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_13_leaf_with_default_route_queues_locally_hub_gets_zero() {
+    run_test_with_port_retry(
+        "test_oracle_13_leaf_with_default_route_queues_locally_hub_gets_zero",
+        || async move {
+            let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
+            let (cert_h, key_h, pin_h) = generate_self_signed_ed25519_pem("hub").unwrap();
+            let (_cert_c, _key_c, pin_c) = generate_self_signed_ed25519_pem("cee").unwrap();
+
+            let port_a = get_free_port();
+            let http_a = get_free_port();
+            let port_h = get_free_port();
+            let http_h = get_free_port();
+
+            // Node A has:
+            // 1. Hub with default_route: true
+            // 2. Leaf peer "cee" with NO address (leaf: true)
+            let peers_a = json!({
+                "peers": {
+                    "hub": {
+                        "address": format!("127.0.0.1:{port_h}"),
+                        "pin": normalize_pin(&pin_h),
+                        "allow": ["send", "reply", "forward"],
+                        "default_route": true
+                    },
+                    "cee": {
+                        "pin": normalize_pin(&pin_c),
+                        "allow": ["send", "reply"],
+                        "leaf": true
+                    }
+                }
+            });
+
+            // Hub knows node-a
+            let peers_h = json!({
+                "peers": {
+                    "node-a": {
+                        "address": format!("127.0.0.1:{port_a}"),
+                        "pin": normalize_pin(&pin_a),
+                        "allow": ["send", "reply", "forward"]
+                    }
+                }
+            });
+
+            let hub = spawn_test_node("hub", port_h, http_h, &cert_h, &key_h, peers_h).await;
+            let node_a = spawn_test_node("node-a", port_a, http_a, &cert_a, &key_a, peers_a).await;
+
+            let (_sock_a, _rx_a) = create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
+            let (_sock_h, rx_h) = create_claude_session_fixture(&hub.sessions_dir, "hub-sess", "HubSess");
+
+            // Alice on Node A sends to Bob@cee
+            let send_resp = send_via_agent_sock(
+                &node_a.agent_sock,
+                "Bob@cee",
+                "hello to leaf mailbox",
+            )
+            .await;
+
+            assert_eq!(send_resp["status"], "ok", "send to leaf must succeed: {send_resp}");
+            assert_eq!(send_resp["outcome"], "queued", "send to leaf must be queued: {send_resp}");
+
+            // Verify message queued in cee's mailbox locally on Node A
+            let conn = rusqlite::Connection::open(&node_a.db_path).expect("open node-a db");
+            let mailbox_count = storage::count_peer_mailbox_messages(&conn, "cee").expect("count mailbox messages");
+            assert_eq!(mailbox_count, 1, "message must be queued in local peer mailbox for cee");
+
+            // Wait 500ms and verify Hub receives 0 messages
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(
+                rx_h.lock().unwrap().len(),
+                0,
+                "Hub must receive 0 messages when sending to leaf peer (Mutant: address filter => RED)"
+            );
+        },
+    )
+    .await;
+}
+
+// =============================================================================
+// Oracle 14: Hub session sends to pattern-admitted client
+// Hub has a default route to Upstream and pattern-admission configured.
+// A client connects via mTLS, matches a pattern, and is admitted.
+// When a hub session sends to this pattern-admitted client, direct link wins:
+// it must not route to Upstream. Upstream receives 0 messages.
+// Mutant: peers.get(n) instead of admitted-aware lookup in deliver_send => RED
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_14_hub_session_sends_to_pattern_admitted_client() {
+    run_test_with_port_retry(
+        "test_oracle_14_hub_session_sends_to_pattern_admitted_client",
+        || async move {
+            let (cert_h, key_h, pin_h) = generate_self_signed_ed25519_pem("hub").unwrap();
+            let (_cert_u, _key_u, pin_u) = generate_self_signed_ed25519_pem("upstream").unwrap();
+
+            let port_h = get_free_port();
+            let http_h = get_free_port();
+            let port_u = get_free_port();
+
+            // Create CA and issue client cert with SPIFFE URI
+            let (ca_params, ca_key, _ca_der, ca_pem) = make_ca("test-ca");
+            let tmp_ca = tempdir().unwrap();
+            let ca_file = tmp_ca.path().join("ca.pem");
+            fs::write(&ca_file, &ca_pem).unwrap();
+
+            let client_uri = "spiffe://json64.dev/ns/genie/sa/worker";
+            let (client_cert_der, client_key_der) =
+                issue_cert(&ca_params, &ca_key, "worker.genie", &[client_uri]);
+
+            // Upstream knows hub
+            let listener_u = tokio::net::TcpListener::bind(("127.0.0.1", port_u)).await.unwrap();
+            let upstream_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let conns_clone = upstream_conns.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener_u.accept().await {
+                    conns_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = stream.shutdown().await;
+                }
+            });
+
+            // Hub has:
+            // 1. Default route to upstream
+            // 2. CA peer anchor
+            // 3. Hub pattern admission block
+            let peers_h = json!({
+                "peers": {
+                    "upstream": {
+                        "address": format!("127.0.0.1:{port_u}"),
+                        "pin": normalize_pin(&pin_u),
+                        "allow": ["send", "reply", "forward"],
+                        "default_route": true
+                    },
+                    "hub.hub": {
+                        "address": "127.0.0.1:0",
+                        "ca": ca_file.display().to_string(),
+                        "identities": ["spiffe://json64.dev/ns/hub/sa/hub"],
+                        "allow": ["send", "reply"]
+                    }
+                },
+                "hub": {
+                    "patterns": ["spiffe://json64.dev/ns/*/sa/*"],
+                    "rules": [
+                        {
+                            "pattern": "spiffe://json64.dev/ns/genie/sa/*",
+                            "allow": ["send", "reply"]
+                        }
+                    ]
+                }
+            });
+
+            let hub = spawn_test_node("hub", port_h, http_h, &cert_h, &key_h, peers_h).await;
+
+            let (_sock_h_target, _rx_h_target) = create_claude_session_fixture(&hub.sessions_dir, "target", "Target");
+            let (_sock_h, _rx_h) = create_claude_session_fixture(&hub.sessions_dir, "alice", "Alice");
+
+            // Client connects to Hub presenting client certificate to get admitted
+            let client_origin = Origin {
+                cert_der: &client_cert_der,
+                key_der: &client_key_der,
+            };
+            let (status, res) = hop_client::send_envelope(
+                &client_origin,
+                &pin_h,
+                port_h,
+                hop_client::envelope("sess-1", "Worker", "Target", "client hello"),
+            )
+            .await;
+            assert_eq!(status, 202, "client must be admitted by hub: {res}");
+
+            // Hub session sends to the admitted client worker.genie
+            let _send_resp = send_via_agent_sock(
+                &hub.agent_sock,
+                "Bob@worker.genie",
+                "direct link to admitted client",
+            )
+            .await;
+
+            // Direct link wins over default route: hub must NOT route to upstream!
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let dials_to_upstream = upstream_conns.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                dials_to_upstream, 0,
+                "Hub must NOT dial default route upstream for pattern-admitted client (Mutant: get instead of admitted-aware lookup => RED)"
+            );
+        },
+    )
+    .await;
+}
+
+// =============================================================================
+// Oracle 15: Nickname address routes direct
+// Node A has a default route to Hub and a direct peer by nickname "laptop".
+// Sending to Bob@laptop routes directly to Node B; Hub receives 0 messages.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oracle_15_nickname_address_routes_direct() {
+    run_test_with_port_retry(
+        "test_oracle_15_nickname_address_routes_direct",
+        || async move {
+            let (cert_a, key_a, pin_a) = generate_self_signed_ed25519_pem("node-a").unwrap();
+            let (cert_h, key_h, pin_h) = generate_self_signed_ed25519_pem("hub").unwrap();
+            let (cert_b, key_b, pin_b) = generate_self_signed_ed25519_pem("node-b").unwrap();
+
+            let port_a = get_free_port();
+            let http_a = get_free_port();
+            let port_h = get_free_port();
+            let http_h = get_free_port();
+            let port_b = get_free_port();
+            let http_b = get_free_port();
+
+            // Node A has:
+            // 1. Hub with default_route: true (Hub does NOT know node-b)
+            // 2. Peer with nickname "laptop" pointing directly to node-b
+            let peers_a = json!({
+                "peers": {
+                    "hub": {
+                        "address": format!("127.0.0.1:{port_h}"),
+                        "pin": normalize_pin(&pin_h),
+                        "allow": ["send", "reply"],
+                        "default_route": true
+                    },
+                    "laptop": {
+                        "address": format!("127.0.0.1:{port_b}"),
+                        "pin": normalize_pin(&pin_b),
+                        "allow": ["send", "reply"]
+                    }
+                }
+            });
+
+            // Hub only knows node-a
+            let peers_h = json!({
+                "peers": {
+                    "node-a": {
+                        "address": format!("127.0.0.1:{port_a}"),
+                        "pin": normalize_pin(&pin_a),
+                        "allow": ["send", "reply"]
+                    }
+                }
+            });
+
+            // Node B knows node-a
+            let peers_b = json!({
+                "peers": {
+                    "node-a": {
+                        "address": format!("127.0.0.1:{port_a}"),
+                        "pin": normalize_pin(&pin_a),
+                        "allow": ["send", "reply"]
+                    }
+                }
+            });
+
+            let hub = spawn_test_node("hub", port_h, http_h, &cert_h, &key_h, peers_h).await;
+            let node_b = spawn_test_node("node-b", port_b, http_b, &cert_b, &key_b, peers_b).await;
+            let node_a = spawn_test_node("node-a", port_a, http_a, &cert_a, &key_a, peers_a).await;
+
+            let (_sock_a, _rx_a) = create_claude_session_fixture(&node_a.sessions_dir, "alice", "Alice");
+            let (_sock_b, rx_b) = create_claude_session_fixture(&node_b.sessions_dir, "bob", "Bob");
+            let (_sock_h, rx_h) = create_claude_session_fixture(&hub.sessions_dir, "hub-sess", "HubSess");
+
+            let send_resp = send_via_agent_sock(
+                &node_a.agent_sock,
+                "Bob@laptop",
+                "hello laptop direct",
+            )
+            .await;
+
+            assert_eq!(send_resp["status"], "ok", "direct send to nickname must succeed: {send_resp}");
+
+            let b_msg = wait_for_inbox_message(&rx_b, Duration::from_secs(5))
+                .await
+                .expect("Bob on node-b must receive message via nickname directly");
+            assert!(b_msg.contains("hello laptop direct"));
+
+            // Hub must receive 0 messages
+            assert_eq!(
+                rx_h.lock().unwrap().len(),
+                0,
+                "Hub must receive 0 messages when nickname address routes direct"
+            );
+        },
+    )
+    .await;
 }
