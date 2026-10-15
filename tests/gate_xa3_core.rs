@@ -1016,8 +1016,13 @@ async fn test_oracle_10_mcp_four_tools_and_no_idempotency_key() {
     );
     assert_eq!(
         frames[0],
-        serde_json::json!({ "action": "send", "to": "x", "text": "hi" }),
-        "the MCP send frame carries no idempotency_key"
+        serde_json::json!({
+            "action": "send",
+            "schema_version": xmsg::surface::MCP_SCHEMA_VERSION,
+            "to": "x",
+            "text": "hi",
+        }),
+        "the MCP send frame carries schema_version and no idempotency_key"
     );
 }
 

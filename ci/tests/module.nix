@@ -156,10 +156,13 @@ let
 in
 {
   flake.tests.module = {
-    # Oracle 1: the Linux unit, each harness's pieces.
+    # Oracle 1: the Linux unit, restart triggers, startServices warning, and each harness's pieces.
     test-linux-unit = {
       expr = {
         exec = linux.systemd.user.services.xmsg.Service.ExecStart;
+        triggers = linux.systemd.user.services.xmsg.Unit.X-Restart-Triggers;
+        warnSuggest = (hmEval "x86_64-linux" { systemd.user.startServices = "suggest"; }).warnings;
+        warnSdSwitch = (hmEval "x86_64-linux" { systemd.user.startServices = "sd-switch"; }).warnings;
         launchd = linux.launchd.agents ? xmsg;
         failed = failedAssertions linux;
       };
@@ -167,6 +170,14 @@ in
         exec = [
           "${exe} serve --http-sock /run/user/1000/xmsg/http.sock --agy-exe ${agyAnchor} --svc-exe 'my-bot=/opt/my-bot/bin/my-bot' --fed-listen 0.0.0.0:7790 --fed-cert /run/secrets/xmsg.crt --fed-key /run/secrets/xmsg.key --peers-file ${pinLiteralPeers} --fed-reload-interval-secs 60"
         ];
+        triggers = [
+          "${xmsg.packages.x86_64-linux.default}"
+          "${pinLiteralPeers}"
+        ];
+        warnSuggest = [
+          "programs.xmsg.server.enable: systemd.user.startServices is not \"sd-switch\", so a home-manager switch will not restart xmsg.service."
+        ];
+        warnSdSwitch = [ ];
         launchd = false;
         failed = [ ];
       };
@@ -176,6 +187,10 @@ in
         mcp = linux.programs.claude-code.mcpServers.xmsg;
         skill = linux.programs.claude-code.skills.xmsg;
         allow = linux.programs.claude-code.settings.permissions.allow;
+        allowPluginOnly =
+          (hmEval "x86_64-linux" {
+            programs.xmsg.harnesses.claude.permissionPrefixes = [ "mcp__plugin_hm_xmsg" ];
+          }).programs.claude-code.settings.permissions.allow;
       };
       expected = {
         mcp = {
@@ -186,10 +201,20 @@ in
         };
         skill = ../../nix/modules/skills/xmsg;
         allow = [
+          "mcp__plugin_hm_xmsg__list"
+          "mcp__plugin_hm_xmsg__send"
+          "mcp__plugin_hm_xmsg__reply"
+          "mcp__plugin_hm_xmsg__replies"
           "mcp__xmsg__list"
           "mcp__xmsg__send"
           "mcp__xmsg__reply"
           "mcp__xmsg__replies"
+        ];
+        allowPluginOnly = [
+          "mcp__plugin_hm_xmsg__list"
+          "mcp__plugin_hm_xmsg__send"
+          "mcp__plugin_hm_xmsg__reply"
+          "mcp__plugin_hm_xmsg__replies"
         ];
       };
     };
@@ -226,20 +251,22 @@ in
         skill = builtins.readFile ../../nix/modules/skills/xmsg/SKILL.md;
       };
     };
-    # XH2 oracle 12: the opencode switch writes the plugin and the skill, and no opencode.json;
-    # `programs.opencode` stays off.
+    # XH2 oracle 12 + XH1.1: the opencode switch writes the plugin and the skill, no opencode.json,
+    # orders legacy store-symlink cleanup before `linkGeneration`, and keeps `programs.opencode` off.
     test-opencode = {
       expr = {
         plugin = builtins.readFile linux.xdg.configFile."opencode/plugin/xmsg.ts".source;
         skill = builtins.readFile linux.xdg.configFile."opencode/skills/xmsg/SKILL.md".source;
         opencodeJson = linux.xdg.configFile ? "opencode/opencode.json";
         programsOpencode = linux.programs.opencode.enable;
+        cleanupBefore = linux.home.activation.xmsgCleanupLegacyOpencodeSkill.before;
       };
       expected = {
         plugin = builtins.readFile ../../extensions/opencode/xmsg.ts;
         skill = builtins.readFile ../../nix/modules/skills/xmsg/SKILL.md;
         opencodeJson = false;
         programsOpencode = false;
+        cleanupBefore = [ "linkGeneration" ];
       };
     };
     # XH3: the hermes switch adds its plugin (linked as `nix-managed-xmsg`), enables it by its

@@ -166,6 +166,26 @@
         };
       };
       xmsgExe = lib.getExe xmsg.packages.${system}.default;
+      opencodeCleanupScript =
+        (home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            xmsg.homeManagerModules.xmsg
+            {
+              home = {
+                username = "alice";
+                homeDirectory = "/home/alice";
+                stateVersion = "25.11";
+                enableNixpkgsReleaseCheck = false;
+              };
+              programs.xmsg = {
+                enable = true;
+                package = pkgs.hello;
+                harnesses.opencode.enable = true;
+              };
+            }
+          ];
+        }).config.home.activation.xmsgCleanupLegacyOpencodeSkill.data;
     in
     {
       checks.peers-render =
@@ -197,6 +217,40 @@
             loads hub ${mineHub}
             same CA ${mineCa} ${refCa}
             same pin ${minePin} ${refPin}
+
+            # XH1.1 (1) oracle: legacy opencode skill cleanup removes a /nix/store symlink
+            # and leaves a non-store directory or non-store symlink untouched.
+            export HOME="$TMPDIR/home"
+            unset XDG_CONFIG_HOME
+            mkdir -p "$HOME/.config/opencode/skills"
+
+            # Case 1: symlink into /nix/store -> removed
+            ln -s "${pkgs.hello}" "$HOME/.config/opencode/skills/xmsg"
+            ( ${opencodeCleanupScript} )
+            if [ -e "$HOME/.config/opencode/skills/xmsg" ] || [ -L "$HOME/.config/opencode/skills/xmsg" ]; then
+              echo "opencode-cleanup: expected /nix/store symlink to be removed" >&2
+              exit 1
+            fi
+
+            # Case 2: real non-store directory -> left alone
+            mkdir -p "$HOME/.config/opencode/skills/xmsg"
+            touch "$HOME/.config/opencode/skills/xmsg/user-file.md"
+            ( ${opencodeCleanupScript} )
+            if [ ! -f "$HOME/.config/opencode/skills/xmsg/user-file.md" ]; then
+              echo "opencode-cleanup: expected non-store directory and its contents to be preserved" >&2
+              exit 1
+            fi
+            rm -rf "$HOME/.config/opencode/skills/xmsg"
+
+            # Case 3: symlink to non-store path -> left alone
+            mkdir -p "$TMPDIR/custom-skill"
+            ln -s "$TMPDIR/custom-skill" "$HOME/.config/opencode/skills/xmsg"
+            ( ${opencodeCleanupScript} )
+            if [ ! -L "$HOME/.config/opencode/skills/xmsg" ]; then
+              echo "opencode-cleanup: expected non-store symlink to be preserved" >&2
+              exit 1
+            fi
+
             touch $out
           '';
     };

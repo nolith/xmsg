@@ -117,7 +117,10 @@ fn connect_and_register(config: &McpConfig, stop: &AtomicBool) -> RegResult {
         return RegResult::Io;
     }
 
-    let payload = json!({ "action": "mcp_start" });
+    let payload = json!({
+        "action": "mcp_start",
+        "schema_version": crate::surface::MCP_SCHEMA_VERSION,
+    });
     let line = format!("{payload}\n");
     let mut writer = &stream;
     if writer.write_all(line.as_bytes()).is_err() || writer.flush().is_err() {
@@ -217,7 +220,13 @@ pub fn run_mcp_loop<R: BufRead, W: Write>(
     mut writer: W,
 ) -> io::Result<()> {
     // Attempt to register caller identity with agent server at MCP startup
-    let _ = call_agent_sock(&config.agent_sock, &json!({ "action": "mcp_start" }));
+    let _ = call_agent_sock(
+        &config.agent_sock,
+        &json!({
+            "action": "mcp_start",
+            "schema_version": crate::surface::MCP_SCHEMA_VERSION,
+        }),
+    );
 
     // Spawn background worker to hold connection and re-register if server restarts
     let stop = Arc::new(AtomicBool::new(false));
@@ -591,7 +600,12 @@ pub fn execute_tool(
             let (Some(to), Some(text)) = (str_arg("to"), str_arg("text")) else {
                 return tool_err("missing required string arguments 'to' and 'text'".to_string());
             };
-            let payload = json!({ "action": "send", "to": to, "text": text });
+            let payload = json!({
+                "action": "send",
+                "schema_version": crate::surface::MCP_SCHEMA_VERSION,
+                "to": to,
+                "text": text,
+            });
             agent_tool(config, &payload, None, Duration::from_secs(5))
         }
         "reply" => {
@@ -600,7 +614,12 @@ pub fn execute_tool(
                     "missing required string arguments 'message_id' and 'text'".to_string(),
                 );
             };
-            let payload = json!({ "action": "reply", "message_id": message_id, "text": text });
+            let payload = json!({
+                "action": "reply",
+                "schema_version": crate::surface::MCP_SCHEMA_VERSION,
+                "message_id": message_id,
+                "text": text,
+            });
             // NOTE (XU1 Gate 4 / Amendment 6): MCP tool result is reshaped to
             // {bytes, messageId, inReplyTo, outcome} to save model context and unify
             // messageId meaning ("the id of what I just sent"). The agent-socket and
@@ -649,7 +668,12 @@ pub fn execute_tool(
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
                 .min(crate::surface::MAX_WAIT_SECS);
-            let payload = json!({ "action": "replies", "message_id": message_id, "wait": wait });
+            let payload = json!({
+                "action": "replies",
+                "schema_version": crate::surface::MCP_SCHEMA_VERSION,
+                "message_id": message_id,
+                "wait": wait,
+            });
             agent_tool(
                 config,
                 &payload,

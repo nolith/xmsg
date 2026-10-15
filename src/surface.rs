@@ -18,6 +18,9 @@ use crate::storage::{self, MessageRecord, Origin, ReplyRecord, Reservation};
 /// The longest `replies` wait, in seconds (A-12).
 pub const MAX_WAIT_SECS: u64 = 60;
 
+/// Wire schema version spoken between `xmsg mcp` and `xmsg serve` on `agent.sock`.
+pub const MCP_SCHEMA_VERSION: u32 = 2;
+
 /// What local delivery reads, borrowed from an `AppState` or a `FedState`.
 pub struct Local<'a> {
     pub db: &'a Arc<Mutex<rusqlite::Connection>>,

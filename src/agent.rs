@@ -20,8 +20,13 @@ use crate::surface;
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentFrame {
-    McpStart {},
+    McpStart {
+        #[serde(default)]
+        schema_version: Option<u32>,
+    },
     List {
+        #[serde(default)]
+        schema_version: Option<u32>,
         #[serde(default)]
         name: Option<String>,
         #[serde(default)]
@@ -30,24 +35,85 @@ pub enum AgentFrame {
         kind: Option<String>,
     },
     Send {
+        #[serde(default)]
+        schema_version: Option<u32>,
         to: String,
         text: String,
         #[serde(default)]
         idempotency_key: Option<String>,
     },
     Reply {
+        #[serde(default)]
+        schema_version: Option<u32>,
         message_id: String,
         text: String,
         #[serde(default)]
         idempotency_key: Option<String>,
     },
     Replies {
+        #[serde(default)]
+        schema_version: Option<u32>,
         message_id: String,
         #[serde(default)]
         wait: Option<u64>,
         #[serde(default)]
         after: Option<i64>,
     },
+}
+
+/// Parses one `agent.sock` frame, refusing mismatched `schema_version` or retired v1 fields
+/// with an actionable stale-client diagnostic naming the session restart.
+pub fn parse_agent_frame(line: &str) -> Result<AgentFrame, AppError> {
+    let raw: Option<serde_json::Value> = serde_json::from_str(line).ok();
+    if let Some(obj) = raw.as_ref().and_then(serde_json::Value::as_object) {
+        if let Some(ver_val) = obj.get("schema_version") {
+            match ver_val.as_u64() {
+                Some(v) if v == u64::from(surface::MCP_SCHEMA_VERSION) => {}
+                Some(v) => {
+                    return Err(AppError::BadRequest(format!(
+                        "stale xmsg mcp client (schema_version {v}, server expects {}): restart the session to load the current xmsg mcp binary",
+                        surface::MCP_SCHEMA_VERSION
+                    )));
+                }
+                None => {
+                    return Err(AppError::BadRequest(
+                        "schema_version must be an integer".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    match surface::parse_frame::<AgentFrame>(line) {
+        Ok(frame) => Ok(frame),
+        Err(AppError::BadRequest(detail)) => {
+            if let Some(obj) = raw.as_ref().and_then(serde_json::Value::as_object) {
+                let is_stale_v1 = obj
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(u64::from(surface::MCP_SCHEMA_VERSION));
+                if is_stale_v1 {
+                    let hint = if obj.contains_key("ref") || obj.contains_key("push_replies") {
+                        Some("use 'to' instead of 'ref'")
+                    } else if obj.contains_key("messageId") {
+                        Some("use 'message_id' instead of 'messageId'")
+                    } else if obj.contains_key("host") {
+                        Some("use 'node' instead of 'host'")
+                    } else {
+                        None
+                    };
+                    if let Some(hint) = hint {
+                        return Err(AppError::BadRequest(format!(
+                            "{detail}; stale xmsg mcp client (schema v1 talking to server v{}): {hint}, and restart the session to load the current xmsg mcp binary",
+                            surface::MCP_SCHEMA_VERSION
+                        )));
+                    }
+                }
+            }
+            Err(AppError::BadRequest(detail))
+        }
+        Err(other) => Err(other),
+    }
 }
 
 pub fn current_uid() -> u32 {
@@ -420,7 +486,7 @@ pub async fn run_agent_server(
                     continue;
                 }
 
-                let frame: AgentFrame = match surface::parse_frame(trimmed) {
+                let frame: AgentFrame = match parse_agent_frame(trimmed) {
                     Ok(f) => f,
                     Err(e) => {
                         let err = e.frame();
@@ -444,7 +510,7 @@ pub async fn run_agent_server(
                 };
 
                 let resp: Result<serde_json::Value, AppError> = match frame {
-                    AgentFrame::McpStart {} => {
+                    AgentFrame::McpStart { .. } => {
                     match crate::agy::attest_mcp_caller(
                         &state_clone.agy_config.proc_root,
                         &state_clone.agy_config.proc_locks_path,
@@ -545,7 +611,7 @@ pub async fn run_agent_server(
                     }
                         continue;
                     }
-                    AgentFrame::List { name, node, kind } => {
+                    AgentFrame::List { name, node, kind, .. } => {
                         let query = surface::ListQuery {
                 name,
                 node,
@@ -556,7 +622,7 @@ pub async fn run_agent_server(
                             .await
                             .map(|r| serde_json::json!({ "status": "ok", "recipients": r.recipients, "nodes": r.nodes }))
                     }
-                    AgentFrame::Send { to, text, idempotency_key } => {
+                    AgentFrame::Send { to, text, idempotency_key, .. } => {
                         let sender = surface::Sender::Session(caller.expect("caller resolved"));
                         surface::send(&state_clone, &sender, &to, &text, idempotency_key.as_deref())
                             .await
@@ -569,13 +635,13 @@ pub async fn run_agent_server(
                                 })
                             })
                     }
-                    AgentFrame::Reply { message_id, text, idempotency_key } => {
+                    AgentFrame::Reply { message_id, text, idempotency_key, .. } => {
                         let caller = caller.expect("caller resolved");
                         surface::reply(&state_clone, &caller, &message_id, &text, idempotency_key.as_deref())
                             .await
                             .map(|r| serde_json::json!({ "status": "ok", "reply": r }))
                     }
-                    AgentFrame::Replies { message_id, wait, after } => {
+                    AgentFrame::Replies { message_id, wait, after, .. } => {
                         surface::replies(&state_clone, &message_id, after.unwrap_or(0), wait.unwrap_or(0))
                             .await
                             .map(|r| serde_json::json!({ "status": "ok", "replies": r }))

@@ -38,6 +38,31 @@ let
     args = [ "mcp" ];
   };
 
+  claudeTools = [
+    "list"
+    "send"
+    "reply"
+    "replies"
+  ];
+
+  # Prior to XH2, opencode's skill was linked as the directory symlink
+  # `$XDG_CONFIG_HOME/opencode/skills/xmsg -> /nix/store/...`. Now that `SKILL.md` is linked
+  # inside it, `linkGeneration` aborts on `mkdir` through the read-only store directory
+  # symlink (preventing `reloadSystemd` from running). Remove it before `linkGeneration`
+  # only when it is a symlink whose target is under `/nix/store`; leave any real directory
+  # or non-store symlink untouched for home-manager's collision check.
+  cleanupLegacyOpencodeSkill = ''
+    legacy_skill="''${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/xmsg"
+    if [ -L "$legacy_skill" ]; then
+      target=$(readlink "$legacy_skill" || true)
+      case "$target" in
+        ${builtins.storeDir}/*)
+          ''${DRY_RUN_CMD:-} rm -f "$legacy_skill"
+          ;;
+      esac
+    fi
+  '';
+
   peerType = types.submodule {
     options = {
       address = mkOption {
@@ -281,7 +306,17 @@ in
     };
 
     harnesses = {
-      claude.enable = mkEnableOption "the xmsg MCP server, skill and tool permissions in Claude Code (`programs.claude-code`)";
+      claude = {
+        enable = mkEnableOption "the xmsg MCP server, skill and tool permissions in Claude Code (`programs.claude-code`)";
+        permissionPrefixes = mkOption {
+          type = types.listOf types.str;
+          default = [
+            "mcp__plugin_hm_xmsg"
+            "mcp__xmsg"
+          ];
+          description = "Tool-name prefixes allowed in `programs.claude-code.settings.permissions.allow` for `{list,send,reply,replies}`. Home Manager packages `programs.claude-code.mcpServers.xmsg` into its `hm` plugin (`mcp__plugin_hm_xmsg__*`), while a server registered outside that plugin uses `mcp__xmsg__*`.";
+        };
+      };
       agy.enable = mkEnableOption "the xmsg MCP server, skill and PreInvocation hook in Antigravity (`programs.antigravity-cli`); the module owns `~/.gemini/config/hooks.json`";
       pi.enable = mkEnableOption "the xmsg pi extension and skill (`~/.pi/agent`)";
       opencode.enable = mkEnableOption "the xmsg opencode plugin and skill (`$XDG_CONFIG_HOME/opencode`); no MCP entry and no `opencode.json`";
@@ -292,6 +327,10 @@ in
   config = mkIf cfg.enable (mkMerge [
     {
       home.packages = [ cfg.package ];
+
+      warnings =
+        lib.optional (srv.enable && pkgs.stdenv.hostPlatform.isLinux && !config.systemd.user.startServices)
+          "programs.xmsg.server.enable: systemd.user.startServices is not \"sd-switch\", so a home-manager switch will not restart xmsg.service.";
 
       assertions =
         lib.optional cfg.harnesses.claude.enable (
@@ -357,7 +396,13 @@ in
     # a unix socket with the peer uid checked, and there is no TCP listener.
     (mkIf (srv.enable && pkgs.stdenv.hostPlatform.isLinux) {
       systemd.user.services.xmsg = {
-        Unit.Description = "xmsg: bridge into running agent sessions";
+        Unit = {
+          Description = "xmsg: bridge into running agent sessions";
+          X-Restart-Triggers = [
+            "${cfg.package}"
+          ]
+          ++ lib.optional fed.enable "${peersFile}";
+        };
         Service = {
           ExecStart = "${exe} serve ${lib.escapeShellArgs serveArgs}";
           Restart = "on-failure";
@@ -389,12 +434,11 @@ in
         };
         skills.xmsg = skill;
         # The tools are authorized explicitly: allowed calls skip the auto-mode classifier.
-        settings.permissions.allow = [
-          "mcp__xmsg__list"
-          "mcp__xmsg__send"
-          "mcp__xmsg__reply"
-          "mcp__xmsg__replies"
-        ];
+        # Home Manager wraps `mcpServers.xmsg` in its generated `hm` plugin
+        # (`mcp__plugin_hm_xmsg__*`); direct registrations use `mcp__xmsg__*`.
+        settings.permissions.allow = lib.concatMap (
+          prefix: map (tool: "${prefix}__${tool}") claudeTools
+        ) cfg.harnesses.claude.permissionPrefixes;
       };
     })
 
@@ -430,6 +474,9 @@ in
     (mkIf cfg.harnesses.opencode.enable {
       xdg.configFile."opencode/plugin/xmsg.ts".source = ../../extensions/opencode/xmsg.ts;
       xdg.configFile."opencode/skills/xmsg/SKILL.md".source = skill + "/SKILL.md";
+      home.activation.xmsgCleanupLegacyOpencodeSkill = lib.hm.dag.entryBefore [
+        "linkGeneration"
+      ] cleanupLegacyOpencodeSkill;
     })
 
     # hermes-agent's own home-manager module (`services.hermes-agent`) installs the plugin and

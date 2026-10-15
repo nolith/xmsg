@@ -949,3 +949,136 @@ async fn test_gate5_header_names_all_four_tools() {
         "header must preserve 'reply with the xmsg reply tool', got:\n{content}"
     );
 }
+
+// =============================================================================
+// XH1.1 (1b): Stale MCP Client Refusal & Schema Version Check
+// =============================================================================
+#[tokio::test]
+async fn test_xh1_1_stale_mcp_client_refusal() {
+    let node = create_node("stale-node", Vec::new(), None, None).await;
+    let my_pid = std::process::id();
+    let alice_pid = 7700;
+    let bob_pid = 7701;
+
+    write_proc_stat(&node.proc_root, my_pid, alice_pid, "200");
+    write_proc_stat(&node.proc_root, alice_pid, 1, "100");
+    write_proc_stat(&node.proc_root, bob_pid, 1, "100");
+
+    let alice_sock = node.proc_root.join("alice.sock");
+    let bob_sock = node.proc_root.join("bob.sock");
+    let _bob_listener = UnixListener::bind(&bob_sock).unwrap();
+
+    write_session_file(&node.sessions_dir, alice_pid, SESS_ALICE, "alice", "100", &alice_sock);
+    write_session_file(&node.sessions_dir, bob_pid, SESS_BOB, "bob", "100", &bob_sock);
+
+    // 1. Stale v1 send frame over agent.sock (`ref` and `push_replies`, no schema_version)
+    let stale_send = call_agent_sock(
+        &node.agent_sock,
+        &serde_json::json!({
+            "action": "send",
+            "ref": SESS_BOB,
+            "text": "from old mcp",
+            "push_replies": true,
+        }),
+    )
+    .await;
+    assert_eq!(stale_send["status"], "error", "{stale_send}");
+    assert_eq!(stale_send["error"], "bad_request", "{stale_send}");
+    let send_detail = stale_send["detail"].as_str().unwrap();
+    assert!(
+        send_detail.contains("`ref`")
+            && send_detail.contains("stale xmsg mcp client")
+            && send_detail.contains("use 'to' instead of 'ref'")
+            && send_detail.contains("restart the session"),
+        "expected stale-client diagnostic on v1 send frame, got: {send_detail}"
+    );
+
+    // 2. Stale v1 reply frame over agent.sock (`messageId`, no schema_version)
+    let stale_reply = call_agent_sock(
+        &node.agent_sock,
+        &serde_json::json!({
+            "action": "reply",
+            "messageId": "01M4YZHHVXXK1PDY6FE0FVJTC6",
+            "text": "from old mcp",
+        }),
+    )
+    .await;
+    assert_eq!(stale_reply["status"], "error", "{stale_reply}");
+    assert_eq!(stale_reply["error"], "bad_request", "{stale_reply}");
+    let reply_detail = stale_reply["detail"].as_str().unwrap();
+    assert!(
+        reply_detail.contains("`messageId`")
+            && reply_detail.contains("stale xmsg mcp client")
+            && reply_detail.contains("use 'message_id' instead of 'messageId'")
+            && reply_detail.contains("restart the session"),
+        "expected stale-client diagnostic on v1 reply frame, got: {reply_detail}"
+    );
+
+    // 3. Stale v1 list frame over agent.sock (`host`, no schema_version)
+    let stale_list = call_agent_sock(
+        &node.agent_sock,
+        &serde_json::json!({
+            "action": "list",
+            "host": "stale-node",
+        }),
+    )
+    .await;
+    assert_eq!(stale_list["status"], "error", "{stale_list}");
+    assert_eq!(stale_list["error"], "bad_request", "{stale_list}");
+    let list_detail = stale_list["detail"].as_str().unwrap();
+    assert!(
+        list_detail.contains("`host`")
+            && list_detail.contains("stale xmsg mcp client")
+            && list_detail.contains("use 'node' instead of 'host'")
+            && list_detail.contains("restart the session"),
+        "expected stale-client diagnostic on v1 list frame, got: {list_detail}"
+    );
+
+    // 4. Mismatched schema_version on mcp_start and send is refused
+    for action in [
+        serde_json::json!({ "action": "mcp_start", "schema_version": 1 }),
+        serde_json::json!({ "action": "send", "schema_version": 1, "to": SESS_BOB, "text": "v1" }),
+    ] {
+        let resp = call_agent_sock(&node.agent_sock, &action).await;
+        assert_eq!(resp["status"], "error", "{resp}");
+        assert_eq!(resp["error"], "bad_request", "{resp}");
+        let detail = resp["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("stale xmsg mcp client (schema_version 1, server expects 2)")
+                && detail.contains("restart the session"),
+            "expected schema_version mismatch refusal, got: {detail}"
+        );
+    }
+
+    // 5. Current schema_version = 2 succeeds on mcp_start and send
+    let ok_start = call_agent_sock(
+        &node.agent_sock,
+        &serde_json::json!({
+            "action": "mcp_start",
+            "schema_version": xmsg::surface::MCP_SCHEMA_VERSION,
+        }),
+    )
+    .await;
+    assert_eq!(ok_start["status"], "ok", "{ok_start}");
+
+    // 6. Retired GET /v1/sessions (used by v1 xmsg mcp list) returns 404 with stale-client detail
+    let client = reqwest::Client::new();
+    let sessions_resp = client
+        .get(format!("http://127.0.0.1:{}/v1/sessions", node.http_port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sessions_resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let sessions_body: Value = sessions_resp.json().await.unwrap();
+    assert!(
+        sessions_body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("GET /v1/sessions was replaced by GET /v1/recipients in schema v2")
+            && sessions_body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("stale xmsg mcp client"),
+        "expected retired /v1/sessions 404 diagnostic, got: {sessions_body}"
+    );
+}

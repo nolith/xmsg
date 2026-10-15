@@ -104,6 +104,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz_handler))
         .route("/v1/recipients", get(list_recipients_handler))
+        .route("/v1/sessions", get(retired_sessions_handler))
         .route("/v1/messages", post(send_handler))
         .route("/v1/messages/{id}", get(get_message_handler))
         .route(
@@ -111,6 +112,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(get_replies_handler).post(reply_handler),
         )
         .with_state(state)
+}
+
+async fn retired_sessions_handler() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "status": "error",
+            "error": "not_found",
+            "detail": format!(
+                "GET /v1/sessions was replaced by GET /v1/recipients in schema v{}; stale xmsg mcp client: restart the session to load the current xmsg mcp binary",
+                surface::MCP_SCHEMA_VERSION
+            ),
+        })),
+    )
 }
 
 async fn healthz_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
